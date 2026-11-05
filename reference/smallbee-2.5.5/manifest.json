@@ -1,0 +1,58 @@
+{
+    "manifest_version": 3,
+    "name": "小蜜蜂AMZ采购助手",
+    "version": "2.5.5",
+    "description": "小蜜蜂AMZ采购助手",
+    "permissions": [
+        "storage",
+        "tabs",
+        "scripting",
+        "cookies"
+    ],
+    "host_permissions": [
+        "*://*/*"
+    ],
+    "background": {
+        "service_worker": "js/background.js"
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": {
+            "16": "images/icon.png",
+            "48": "images/icon.png",
+            "128": "images/icon.png"
+        }
+    },
+    "icons": {
+        "16": "images/icon.png",
+        "48": "images/icon.png",
+        "128": "images/icon.png"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.amazon.com/your-orders/orders?*",
+                "*://*.amazon.com/gp/css/order-history?*",
+                "*://*.amazon.com/gp/your-account/order-history*",
+                "*://*.amazon.ca/your-orders/orders?*",
+                "*://*.amazon.ca/gp/css/order-history?*",
+                "*://*.amazon.ca/gp/your-account/order-history*",
+                "*://*.amazon.co.jp/your-orders/orders?*",
+                "*://*.amazon.co.jp/gp/css/order-history?*",
+                "*://*.amazon.co.jp/-/en/gp/css/order-history?*",
+                "*://*.amazon.co.jp/gp/your-account/order-history*"
+            ],
+            "css": [
+                "layer/theme/default/layer.css",
+                "css/popup.css"
+            ],
+            "js": [
+                "lib/jquery-3.3.1.min.js",
+                "layer/layer.js",
+                "js/popup.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": true
+        }
+    ]
+}

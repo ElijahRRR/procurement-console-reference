@@ -1,0 +1,314 @@
+#sb2-container {
+  width: 300px;
+  padding: 10px;
+}
+
+.sb2-container {
+  text-align: center;
+}
+
+h1 {
+  font-size: 18px;
+  color: #333;
+}
+
+/* 悬浮按钮样式 */
+.sb2-float-btn {
+  position: fixed;
+  right: 20px;
+  width: 60px;
+  height: 60px;
+  background-color: #ecac09;
+  color: white;
+  border-radius: 50%;
+  text-align: center;
+  box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.4);
+  font-weight: bold;
+  cursor: pointer;
+  border: none;
+  z-index: 2147483647 !important;
+  transition: all 0.3s;
+}
+
+/* 抽屉样式 */
+.sb2-drawer {
+  position: fixed;
+  top: 0;
+  right: -350px;
+  width: 350px;
+  height: 100vh;
+  background-color: white;
+  box-shadow: -2px 0 10px rgba(0, 0, 0, 0.2);
+  z-index: 2147483647 !important;
+  transition: right 0.3s ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.sb2-drawer.sb2-active {
+  right: 0;
+}
+
+/* 抽屉头部 */
+.sb2-drawer-header {
+  padding: 15px;
+  background-color: #f8f8f8;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+}
+
+.sb2-drawer-header h2 {
+  margin: 5px 0;
+  font-size: 18px;
+  color: #333;
+  text-align: center;
+}
+
+.sb2-drawer-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  color: #888;
+  position: absolute;
+  right: 15px;
+  top: 15px;
+}
+
+.sb2-drawer-close:hover {
+  color: #333;
+}
+
+/* 抽屉主体 */
+.sb2-drawer-body {
+  padding: 15px;
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.sb2-customer-id-display {
+  padding: 8px 10px;
+  border: 1px dashed #ccc;
+  border-radius: 4px;
+  color: #333;
+  font-size: 14px;
+}
+
+/* 同步按钮 */
+.sb2-sync-btn {
+  padding: 12px 20px;
+  background-color: #ecac09;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+
+.sb2-sync-btn:hover {
+  background-color: #45a049;
+}
+
+/* 拍单中按钮样式 */
+.sb2-sync-btn.sb2-purchasing {
+  background-color: #d32f2f !important;
+  cursor: not-allowed;
+}
+
+.sb2-sync-btn.sb2-purchasing:hover {
+  background-color: #d32f2f !important;
+}
+
+/* 同步中按钮样式 */
+.sb2-sync-btn.sb2-syncing {
+  background-color: #1976d2 !important;
+  cursor: not-allowed;
+}
+
+.sb2-sync-btn.sb2-syncing:hover {
+  background-color: #1976d2 !important;
+}
+
+/* 日志窗口 */
+.sb2-log-window {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  overflow: hidden;
+  min-height: 200px;
+}
+
+.sb2-log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 10px;
+  background-color: #f0f0f0;
+  border-bottom: 1px solid #ccc;
+  font-weight: bold;
+}
+
+.sb2-log-content {
+  flex-grow: 1;
+  padding: 10px;
+  background-color: #f5f5f5;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 14px;
+  height: 300px;
+}
+
+.sb2-log-entry {
+  margin-bottom: 5px;
+  padding: 3px 0;
+  border-bottom: 1px dotted #ddd;
+  color: #555;
+}
+
+.sb2-log-entry.error {
+  color: #d32f2f;
+  font-weight: bold;
+}
+
+/* layer遮罩层的z-index通常是19891014 */
+
+.sb2-clear-log-btn {
+  background-color: #f44336;
+  color: white;
+  border: none;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.sb2-clear-log-btn:hover {
+  background-color: #d32f2f;
+}
+
+/* 教程样式 */
+.sb2-tutorial-box {
+  background-color: #f8f8f8;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  padding: 10px 15px;
+  margin-bottom: 15px;
+}
+
+.sb2-tutorial-box h3 {
+  font-size: 16px;
+  margin: 0 0 10px 0;
+  color: #333;
+}
+
+.sb2-tutorial-box ol {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.sb2-tutorial-box li {
+  margin-bottom: 5px;
+  color: #555;
+  font-size: 14px;
+}
+
+/* 站点信息样式 */
+.sb2-site-info {
+  padding: 8px 12px;
+  background-color: #e3f2fd;
+  border: 1px solid #2196f3;
+  border-radius: 4px;
+  color: #1976d2;
+  font-size: 14px;
+  font-weight: bold;
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+/* 站点警告样式 */
+.sb2-site-warning {
+  padding: 8px 12px;
+  background-color: #ffebee;
+  border: 1px solid #f44336;
+  border-radius: 4px;
+  color: #d32f2f;
+  font-size: 14px;
+  font-weight: bold;
+  text-align: center;
+  margin-bottom: 10px;
+}
+
+/* 禁用按钮样式 */
+.sb2-sync-btn.sb2-disabled {
+  background-color: #ccc !important;
+  color: #666 !important;
+  cursor: not-allowed !important;
+  opacity: 0.6;
+}
+
+.sb2-sync-btn.sb2-disabled:hover {
+  background-color: #ccc !important;
+}
+
+/* 配置区域样式 */
+.sb2-config-section {
+  padding: 3px 8px;
+  background-color: #f8f8f8;
+  border: 1px solid #e0e0e0;
+  border-radius: 3px;
+  margin: 3px 0;
+  line-height: 1.2;
+}
+
+.sb2-config-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #555;
+  font-weight: normal;
+}
+
+.sb2-config-input {
+  width: 60px;
+  padding: 2px 4px;
+  border: 1px solid #ccc;
+  border-radius: 2px;
+  font-size: 11px;
+  text-align: center;
+  margin: 0 4px;
+  line-height: 1.2;
+}
+
+.sb2-config-input:focus {
+  outline: none;
+  border-color: #ecac09;
+}
+
+.sb2-config-unit {
+  font-size: 11px;
+  color: #555;
+}
+
+.sb2-config-checkbox-label {
+  margin: 5px 0;
+}
+
+.sb2-config-checkbox {
+  margin: 0 6px 0 0;
+}
+
+.sb2-card-input {
+  width: 52px;
+}
