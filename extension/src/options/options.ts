@@ -218,7 +218,7 @@ function simulationCard(s: StateSnapshot): HTMLElement {
   const hint = SIM_OUTCOMES.find((o) => o.value === s.settings.simulationOutcome)?.hint ?? "";
   return card(
     "模拟执行",
-    h("p", { class: "desc" }, "本版本只做模拟执行：插件领取服务端分配给本账号、已到采购日期的任务，按任务数据推出一份结算信息交给服务端护栏裁决，再走提交登记与结果上报。不打开、不点击、不修改任何亚马逊页面，不会产生真实订单；模拟单号形如 SIM-日期-尝试号，不写回飞书，可在控制台一键清除。"),
+    h("p", { class: "desc" }, "本版本只做模拟执行：插件领取服务端分配给本账号、已到采购日期的任务，按任务数据推出一份结算信息交给服务端护栏裁决，再走提交登记与结果上报。不打开、不点击、不修改任何亚马逊页面，不会产生真实订单；模拟单号形如 SIM-日期-尝试 ID，不写回飞书，可在控制台一键清除。"),
     h("div", { class: "pc-field" }, h("label", { class: "pc-label", for: "outcome" }, "模拟结局"), sel, h("div", { class: "hint" }, hint)),
   );
 }

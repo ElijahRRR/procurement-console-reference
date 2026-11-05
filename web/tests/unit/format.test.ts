@@ -45,6 +45,19 @@ describe('金额', () => {
     expect(parseAmount('US$3.10')).toBe(3.1)
     expect(parseAmount('1.2.3')).toBeNull()
   })
+  it('金额文本与服务端 models.money 同一规则：标记只在首尾，乱码读不出', () => {
+    for (const bad of ['12,5', '40$5', '1.234,50', '4 0', '1,2,3', '12US', '4US0', '40$', '-$-5', 'usd40usd', '1e3']) {
+      expect(parseAmount(bad)).toBeNull()
+    }
+    expect(parseAmount('52 usd')).toBe(52)
+    expect(parseAmount('USD 52')).toBe(52)
+    expect(parseAmount('$-5')).toBe(-5)
+    expect(parseAmount('-$5')).toBe(-5)
+    expect(parseAmount('US $25.50')).toBe(25.5)
+    expect(hasAtMostTwoDecimals('$1,234.50')).toBe(true)
+    expect(hasAtMostTwoDecimals('12.345')).toBe(false)
+    expect(hasAtMostTwoDecimals('40$5')).toBe(false)
+  })
   it('表单金额规范成两位小数字符串，空值为 null', () => {
     expect(normalizeMoneyInput('12.5')).toBe('12.50')
     expect(normalizeMoneyInput('$1,000')).toBe('1000.00')

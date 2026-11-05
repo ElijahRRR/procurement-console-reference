@@ -328,8 +328,20 @@ test("引擎因结果送不到而中断：后台接管批次 —— 续租、补
     assert.equal(srv.state.runs.get(runId).ended, false, "回执没送到之前不结束批次");
     assert.equal((await get(env.local, "pc.runView")).active, false, "界面上不再显示正在执行");
 
+    const key = String(attempt.attempt_id);
+    assert.equal((await get(env.local, "pc.receipts"))[key].tries, 1, "接管时立即补交过一次（没送到）");
+
     down = false; // 服务端恢复
     const beats0 = srv.state.runs.get(runId).beats;
+    // 补交按退避：下一次补交的时间还没到，这一次批次闹钟只续租
+    await env.fireAlarm("pc.runBeat");
+    await settleTicking(env, 10);
+    assert.equal(srv.state.runs.get(runId).beats, beats0 + 1, "续租");
+    assert.equal(srv.state.runs.get(runId).ended, false, "回执没送到之前不结束批次");
+    assert.equal(paths(srv, /\/result$/).length, 0, "退避没到不补交");
+    // 退避时间到了
+    const rcs = await get(env.local, "pc.receipts");
+    await env.local.set({ "pc.receipts": { ...rcs, [key]: { ...rcs[key], next_at: Date.now() - 1 } } });
     await env.fireAlarm("pc.runBeat");
     await settleTicking(env, 10);
     assert.equal(srv.state.attempts.get(attempt.attempt_id).status, "succeeded");
@@ -371,6 +383,66 @@ test("接管的批次在租约预算内一直送不到：放手（不再续租�
   }
 });
 
+test("接管的批次：续租一直成功、结果接口一直 5xx —— 接管满 10 分钟就放手（不再续租、不替它结束批次），回执保留；补交按退避，不是每 30 秒都发", async () => {
+  const T = Date.parse("2026-11-05T06:00:00Z");
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: T });
+  let orig = null;
+  try {
+    const { srv, env } = await paired();
+    orig = globalThis.fetch; // 假服务端（paired 装上的）
+    env.addTab(3, AMZ, () => ({ running: false, run_id: null }));
+    const { runId, attempt, body } = await driveToSubmitted(env, 3);
+    let posts = 0;
+    const fetch5xx = async (url, init) => {
+      if (/\/result$/.test(new URL(url).pathname)) {
+        posts++;
+        return new Response(JSON.stringify({ code: "INTERNAL", message: "服务器内部错误", detail: {} }), { status: 500, headers: { "content-type": "application/json" } });
+      }
+      return orig(url, init);
+    };
+    globalThis.fetch = fetch5xx;
+    await ticking(env, env.fromTab(3, { type: "pc.api", op: "result", args: [attempt.attempt_id, body] }));
+    await ticking(env, env.fromTab(3, { type: "pc.runView", view: { ...view(runId), phase: "ended" }, active: false }));
+    const ar0 = await get(env.session, "pc.activeRun");
+    assert.ok(ar0 && ar0.orphaned_at !== null, "后台接管");
+    const postsAtOrphan = posts;
+    const beats0 = srv.state.runs.get(runId).beats;
+
+    // 批次闹钟每 30 秒一次（假时钟）；服务端的批次心跳一直成功
+    let k = 0;
+    for (; k < 60 && (await get(env.session, "pc.activeRun")); k++) {
+      const fired = env.fireAlarm("pc.runBeat");
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setImmediate(r));
+        mock.timers.tick(1_000);
+      }
+      await fired;
+      await env.settle();
+    }
+    const elapsed = Date.now() - ar0.orphaned_at;
+    assert.equal(await get(env.session, "pc.activeRun"), undefined, "放手：不再续租");
+    assert.ok(elapsed > 10 * 60_000 && elapsed < 13 * 60_000, `接管满 10 分钟后不久放手（实际 ${Math.round(elapsed / 1000)} 秒）`);
+    assert.ok(srv.state.runs.get(runId).beats > beats0, "放手之前照常续租");
+    assert.equal(srv.state.runs.get(runId).ended, false, "不替它结束批次：已登记的尝试交给服务端清扫");
+    assert.equal(Object.keys(await get(env.local, "pc.receipts")).length, 1, "回执保留，之后继续补交");
+    const custodyPosts = posts - postsAtOrphan;
+    // 每轮补交客户端对 5xx 最多发 3 次；按 30 / 60 / 120 / 300 秒退避，10 分钟里只有 4 – 5 轮，
+    // 而不是每次批次闹钟（20 次）都发
+    assert.ok(k >= 20, `批次闹钟响了 ${k} 次`);
+    assert.ok(custodyPosts >= 6, `接管期间确实在补交（${custodyPosts} 次）`);
+    assert.ok(custodyPosts <= 3 * 6, `补交按退避（${custodyPosts} 次 /result，${k} 次批次闹钟）`);
+    assert.ok(env.logs().some((t) => /10 分钟内没有送到服务端.*不再续租/.test(t)), env.logs().slice(-3).join(" | "));
+
+    // 放手之后本设备不再占着批次：之后的批次闹钟什么都不发
+    const callsAfter = srv.calls.length;
+    await ticking(env, env.fireAlarm("pc.runBeat"));
+    assert.equal(paths({ calls: srv.calls.slice(callsAfter) }, /\/runs\/\d+\/heartbeat$/).length, 0);
+  } finally {
+    if (orig) globalThis.fetch = orig;
+    mock.timers.reset();
+  }
+});
+
 // ── 身份按页面加载先后对账（D6-02）──────────────────────────────────────
 
 test("两个标签页、两个买家号：旧标签页重读绑定账号也不能把服务端翻回「一致」；开始前对账有分歧就不开始；旧页面刷新后恢复", async () => {
@@ -403,6 +475,38 @@ test("两个标签页、两个买家号：旧标签页重读绑定账号也不�
   assert.equal(st2.identity.customer_id, BOUND);
   assert.equal(st2.identity.conflict, false);
   assert.equal(srv.state.identity.customer_id, BOUND);
+});
+
+test("显示另一个买家号的标签页跳到一张读不出 ID 的新页面（bye → hello → 身份）：服务端仍收到另一个买家号，开始前对账有分歧", async () => {
+  const { srv, env } = await paired();
+  const now = Date.now();
+  const id = (cid, loaded) => ({ signed_in: true, customer_id: cid, site: "US", page_url: AMZ, at: Date.now(), loaded_at: loaded });
+  const tab1 = id(BOUND, now - 3_600_000);
+  let tab2 = id(OTHER, now - 60_000);
+  env.addTab(1, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: tab1 } : { ok: true }));
+  env.addTab(2, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: tab2 } : { ok: true }));
+  await env.fromTab(1, { type: "pc.identity", identity: tab1, force: false });
+  await env.fromTab(2, { type: "pc.identity", identity: tab2, force: false });
+  assert.equal(srv.state.identity.customer_id, OTHER);
+  const n0 = srv.state.identityReports.length;
+  // 标签页 2 跳到新页面：旧页面 bye，新页面 hello，新页面读到「已登录」但读不出 customerId
+  await env.fromTab(2, { type: "pc.bye", loaded_at: tab2.loaded_at, run_id: null });
+  await env.settle();
+  const loaded = Date.now();
+  tab2 = id(null, loaded);
+  await env.fromTab(2, { type: "pc.hello", href: AMZ, loaded_at: loaded });
+  await env.settle();
+  await env.fromTab(2, { type: "pc.identity", identity: tab2, force: false });
+  const st = await env.fromPage({ type: "pc.getState" });
+  assert.equal(st.identity.conflict, true);
+  assert.equal(st.identity.customer_id, OTHER);
+  assert.equal(srv.state.identity.customer_id, OTHER, "读不出 ID 的新页面不能让服务端看到绑定账号");
+  const prep = await env.fromTab(1, { type: "pc.prepareStart" });
+  assert.equal(prep.conflict, true);
+  assert.equal(srv.state.identity.customer_id, OTHER);
+  const later = srv.state.identityReports.slice(n0);
+  assert.ok(later.length > 0, "开始前强制上报过");
+  assert.ok(later.every((r) => r.customer_id !== BOUND), "之后的每一次上报（心跳捎带或单独上报）都不是绑定账号");
 });
 
 test("身份读数：标签页跳到别的网站（不在亚马逊页面上了）就不再算开着的", async () => {

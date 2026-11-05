@@ -58,3 +58,21 @@ def test_process_env_wins_and_blank_text_settings_fall_back_to_defaults(clean_en
     assert s.port == 8792
     assert s.pg_dsn == "dbname=procurement"
     assert s.feishu_base_url == "https://open.feishu.cn"
+
+
+def test_dotenv_quoted_value_with_trailing_comment_drops_the_quotes(clean_env, tmp_path):
+    """引号括起的值后面跟行尾注释：取引号里的内容（不把引号当成值的一部分）；引号里的 # 照样原样保留。"""
+    env = tmp_path / ".env"
+    env.write_text(
+        "FEISHU_APP_SECRET=\"demo-not-real\"  # 注释\n"
+        "FEISHU_APP_ID='cli_demo_not_real'# 紧跟注释\n"
+        "PC_PG_DSN=\"dbname=demo_db # 引号里原样保留\"   # 行尾注释\n"
+        "PC_HOST=\"127.0.0.1\"x\n",                    # 收尾引号后不是注释：按不带引号的值处理（原样）
+        encoding="utf-8",
+    )
+    settings._load_dotenv(env)
+    s = settings.get()
+    assert s.feishu_app_secret == "demo-not-real"
+    assert s.feishu_app_id == "cli_demo_not_real"
+    assert s.pg_dsn == "dbname=demo_db # 引号里原样保留"
+    assert s.host == "\"127.0.0.1\"x"

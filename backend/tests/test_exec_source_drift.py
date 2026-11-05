@@ -248,9 +248,11 @@ def test_reset_after_sim_purchase_and_upstream_asin_change_goes_conflict(conn, w
     assert o["conflict"]["incoming"] == {"asin": "B0DEMO0X01"} and o["purchased_attempt_id"] is None
     fx.refresh_identity(conn, e["dev"], e["acc"])
     assert execution.next_attempt(conn, e["dev"], fx.start(conn, e["dev"]))["attempt"] is None
-    # 同一份第二批记录再导入一次：仍不会带着旧 ASIN 回到可领取
+    # 同样内容的文件再导入一次（又一个新批次）：仍不会带着旧 ASIN 回到可领取（开始前同种来源的新值直接采用，
+    # 冲突里过期的 ASIN 随之作废，或冲突保留）
     _reingest(conn, e, new_batch=True, asin="B0DEMO0X01")
-    assert fx.order_row(conn, e["order"]["id"])["status"] == "conflict"
+    o = fx.order_row(conn, e["order"]["id"])
+    assert o["status"] == "conflict" or (o["asin"] == "B0DEMO0X01" and o["conflict"] is None)
 
 
 def test_reset_after_sim_purchase_and_external_order_no_does_not_redispatch(conn, workspace):
@@ -323,3 +325,177 @@ def test_hold_on_executing_order_also_derived_by_lease_sweep(conn, workspace):
     clock.freeze(NOW + timedelta(seconds=181))
     execution.sweep(conn)
     assert fx.order_row(conn, e["order"]["id"])["status"] == "conflict"
+
+
+# ── 领取后才出现的来源关联按首次关联的规则比（NEW-D2-execution-safety-1）──────────────
+
+
+def _new_link_record(e, **kw):
+    """同一任务的记录，按「新关联只带部分列」去掉 kw 里给成 None 的列（make_record 的缺省值不带进来）。"""
+    return f.make_record(upstream_order_no=e["order"]["upstream_order_no"], **kw)
+
+
+NO_ADDRESS = {k: None for k in ("recipient_name", "address1", "address2", "city", "state", "postal_code", "phone",
+                                "country", "district")}
+
+
+def _assert_not_drift(conn, e):
+    p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
+    assert p == {"continue": True, "cancel_reason": None, "cancel_code": None}
+    assert execution.mark_submitting(conn, e["dev"], e["a"]["attempt_id"])["ok"] is True
+
+
+@pytest.mark.parametrize("missing", [
+    {"price_cap": None},                                  # 新一批文件没有「限价」列
+    {"asin": None, "quantity": None},                     # 没有 ASIN、数量列
+    NO_ADDRESS,                                           # 没有收件信息列
+    {"suggested_purchase_date": None},                    # 没有建议采购日期列（任务的日期来自来源）：算出的日期不算变化
+], ids=["no_price_cap", "no_asin_qty", "no_address", "no_suggested_date"])
+def test_new_file_batch_without_some_columns_is_not_drift(conn, workspace, missing):
+    e = _claimed(conn, workspace, f"PO-DEMO-NB{len(missing):02d}{sorted(missing)[0][:4].upper()}")
+    assert fx.order_row(conn, e["order"]["id"])["suggested_date_basis"] == "source"
+    out = orders.ingest(conn, e["ws"], _new_link_record(e, **missing), f.file_source(conn, e["ws"], 2))
+    assert out.verdict in ("unchanged", "update")
+    _assert_not_drift(conn, e)
+
+
+def test_new_feishu_record_without_address_columns_is_not_drift(conn, workspace):
+    e = _claimed(conn, workspace, "PO-DEMO-FSNA")
+    orders.ingest(conn, e["ws"], _new_link_record(e, **NO_ADDRESS), f.feishu_source(conn, e["ws"], "recDEMO0NA1"))
+    _assert_not_drift(conn, e)
+
+
+def test_partial_new_batch_with_a_real_change_conflicts_only_on_that_field(conn, workspace):
+    """新一批文件只带平台订单号与 ASIN（ASIN 改了）：只有 ASIN 算变化，conflict.incoming 里没有 None。"""
+    e = _claimed(conn, workspace, "PO-DEMO-NBX")
+    rec = _new_link_record(e, asin="B0DEMO0X02", quantity=None, unit_price=None, price_cap=None,
+                           suggested_purchase_date=None, order_time=None, ship_days=None, **NO_ADDRESS)
+    orders.ingest(conn, e["ws"], rec, f.file_source(conn, e["ws"], 2))
+    p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
+    assert p["cancel_code"] == "SOURCE_CHANGED" and p["cancel_reason"].count("、") == 0 and "ASIN" in p["cancel_reason"]
+    _abort(conn, e, p["cancel_reason"])
+    o = fx.order_row(conn, e["order"]["id"])
+    assert o["status"] == "conflict" and o["conflict"]["incoming"] == {"asin": "B0DEMO0X02"}
+    orders.resolve_conflict(conn, e["ws"], o["id"], "accept", actor_user_id=e["uid"])
+    o = fx.order_row(conn, o["id"])
+    assert o["asin"] == "B0DEMO0X02" and o["quantity"] == 1 and o["recipient_name"] == "Demo Buyer"
+    assert o["price_cap"] is not None and o["missing_fields"] == [] and o["status"] in ("queued", "assigned")
+
+
+def test_new_batch_with_a_different_asin_is_still_drift(conn, workspace):
+    e = _claimed(conn, workspace, "PO-DEMO-NBA")
+    orders.ingest(conn, e["ws"], _new_link_record(e, asin="B0DEMO0X03"), f.file_source(conn, e["ws"], 2))
+    p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
+    assert p["cancel_code"] == "SOURCE_CHANGED" and "ASIN" in p["cancel_reason"]
+    assert _err(execution.mark_submitting, conn, e["dev"], e["a"]["attempt_id"]).code == "SOURCE_CHANGED"
+
+
+def test_same_link_clearing_price_cap_is_still_drift(conn, workspace):
+    """同一条来源关联把限价清空是真的清空（与 ingest 在 prv 非空时一致）：仍算变化。"""
+    e = _claimed(conn, workspace, "PO-DEMO-CLR")
+    _reingest(conn, e, price_cap=None)
+    p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
+    assert p["cancel_code"] == "SOURCE_CHANGED" and "限价" in p["cancel_reason"]
+
+
+# ── 算出来的建议采购日期（下单时间 / 配送天数改了，指纹不变；NEW-RB-2）────────────────
+
+
+def test_ship_days_change_mid_attempt_is_drift_and_accept_writes_the_new_date(conn, workspace):
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws)
+    dev = fx.paired_device(conn, workspace, account=acc)
+    src = f.file_source(conn, ws, 2)
+    order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no="PO-DEMO-SHIP",
+                              suggested_purchase_date=None)        # 下单北京 10-27 + 6 − 4 = 10-29
+    assert order["suggested_date_basis"] == "computed" and order["suggested_purchase_date"].isoformat() == "2026-10-29"
+    run_id = fx.start(conn, dev)
+    a = fx.claim(conn, dev, run_id)
+    rec = f.make_record(upstream_order_no="PO-DEMO-SHIP", suggested_purchase_date=None, ship_days=0)
+    orders.ingest(conn, ws, rec, f.file_source(conn, ws, 2, batch_id=src.batch_id))
+    assert fx.order_row(conn, order["id"])["ship_days"] == 4                 # 执行中不改原值
+    p = execution.progress(conn, dev, a["attempt_id"], stage="before_submit")
+    assert p["continue"] is False and p["cancel_code"] == "SOURCE_CHANGED" and "建议采购日期" in p["cancel_reason"]
+    execution.report_result(conn, dev, a["attempt_id"], fx.failure_payload("ABORTED_BY_SERVER", p["cancel_reason"]))
+    o = fx.order_row(conn, order["id"])
+    assert o["status"] == "conflict" and o["conflict"]["kind"] == "fields"
+    inc = o["conflict"]["incoming"]
+    assert inc["suggested_purchase_date"] == "2026-11-02" and inc["suggested_date_basis"] == "computed"
+    assert inc["ship_days"] == 0 and "order_time" not in inc
+    orders.resolve_conflict(conn, ws, order["id"], "accept", actor_user_id=workspace["user_id"])
+    o = fx.order_row(conn, order["id"])
+    assert o["suggested_purchase_date"].isoformat() == "2026-11-02" and o["ship_days"] == 0
+    if o["status"] != "assigned":
+        orders.assign_manual(conn, ws, order["id"], acc["id"], actor_user_id=workspace["user_id"])
+    fx.refresh_identity(conn, dev, acc)
+    nxt = execution.next_attempt(conn, dev, fx.start(conn, dev) if fx.run_row(conn, run_id)["ended_at"] else run_id)
+    assert nxt["attempt"] is None and "未来" in nxt["reason"]                 # 新日期之前不领取
+
+
+def test_order_time_written_in_another_timezone_is_not_drift(conn, workspace):
+    """同一时刻换个时区写（来源改成北京时间写法）：算出的日期不变，不算变化。"""
+    from datetime import timezone as tz
+
+    from services.clock import BJ_TZ
+
+    e = _claimed(conn, workspace, "PO-DEMO-TZ")
+    t = datetime(2026, 10, 27, 5, 0, tzinfo=tz.utc).astimezone(BJ_TZ)
+    _reingest(conn, e, order_time=t)
+    _assert_not_drift(conn, e)
+
+
+# ── 已有暂停时的来源变化合并进冲突（NEW-RB-1）──────────────────────────────────
+
+
+def test_hold_plus_external_order_no_merges_into_one_conflict_and_accept_records_purchase(conn, workspace):
+    e = _claimed(conn, workspace, "PO-DEMO-HEX")
+    _reingest(conn, e, external_amz_order_no=EXT_NO, external_buyer_account="buyer-elsewhere")
+    orders.ingest(conn, e["ws"], _new_link_record(e, review="rejected", review_value="DEMO 拒绝"),
+                  f.feishu_source(conn, e["ws"], "recDEMO0HEX"))
+    p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
+    assert p["cancel_code"] == "SOURCE_HOLD"
+    execution.report_result(conn, e["dev"], e["a"]["attempt_id"],
+                            fx.failure_payload("ABORTED_BY_SERVER", p["cancel_reason"]))
+    o = fx.order_row(conn, e["order"]["id"])
+    c = o["conflict"]
+    assert o["status"] == "conflict" and c["kind"] == "external_order_no"
+    assert c["incoming"]["external_amz_order_no"] == EXT_NO and "review_status" in c["fields"]
+    assert EXT_NO in c["reason"] and "DEMO 拒绝" in c["reason"]
+    detail = orders.resolve_conflict(conn, e["ws"], o["id"], "accept", actor_user_id=e["uid"])
+    assert detail["status"] == "purchased"
+    assert f.count(conn, "purchase_attempts", "purchase_order_id = %s AND kind = 'external' AND amazon_order_no = %s",
+                   (o["id"], EXT_NO)) == 1
+
+
+def test_admission_hold_then_amz_no_from_the_same_feishu_record_keeps_both(conn, workspace):
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws)
+    dev = fx.paired_device(conn, workspace, account=acc)
+    rec_id = "recDEMO0ADM"
+    order = fx.assigned_order(conn, ws, acc, source=f.feishu_source(conn, ws, rec_id), upstream_order_no="PO-DEMO-ADM")
+    a = fx.claim(conn, dev, fx.start(conn, dev))
+    fx.to_guard_passed(conn, dev, a)
+    orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-ADM", purchase_status_value="已拍单"),
+                  f.feishu_source(conn, ws, rec_id), admission={})
+    assert fx.order_row(conn, order["id"])["conflict"]["kind"] == "admission"
+    orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-ADM", purchase_status_value="已拍单",
+                                          external_amz_order_no=EXT_NO),
+                  f.feishu_source(conn, ws, rec_id), admission={})
+    p = execution.progress(conn, dev, a["attempt_id"], stage="before_submit")
+    assert p["cancel_code"] == "SOURCE_HOLD"
+    execution.report_result(conn, dev, a["attempt_id"], fx.failure_payload("ABORTED_BY_SERVER", p["cancel_reason"]))
+    o = fx.order_row(conn, order["id"])
+    assert o["status"] == "conflict" and o["conflict"]["kind"] == "admission"
+    assert o["conflict"]["incoming"]["external_amz_order_no"] == EXT_NO and EXT_NO in o["conflict"]["reason"]
+
+
+def test_hold_plus_asin_change_keeps_the_new_asin_in_incoming(conn, workspace):
+    e = _claimed(conn, workspace, "PO-DEMO-HAS")
+    _reingest(conn, e, asin="B0DEMO0X99")
+    orders.ingest(conn, e["ws"], _new_link_record(e, review="rejected", review_value="DEMO 拒绝"),
+                  f.feishu_source(conn, e["ws"], "recDEMO0HAS"))
+    _abort(conn, e)
+    o = fx.order_row(conn, e["order"]["id"])
+    assert o["status"] == "conflict" and o["conflict"]["kind"] == "review"
+    assert o["conflict"]["incoming"]["asin"] == "B0DEMO0X99" and "asin" in o["conflict"]["fields"]
+    assert o["asin"] == "B0DEMO0001"

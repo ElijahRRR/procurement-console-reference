@@ -224,13 +224,22 @@ SIM_PREFIX = "SIM-"
 _CTX = Context(prec=28)
 #: 文本金额：可带正负号；整数部分是普通数字或按 3 位分组的千分位逗号；不认指数写法
 _MONEY_TEXT_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?$|^[+-]?\.\d+$")
+#: 文本金额的外层写法：只在**开头**认一个正负号、「US」/「USD」与「$」（标记后可留空白，「$」后还可再带一个
+#: 正负号，如 -$5、$-5），结尾只认「USD」（如 52 usd，不分大小写），开头的 US / USD 与结尾的 USD 不能同时出现；
+#: 别处出现的 $、US 或其他字母一律不认
+_MONEY_WRAP_RE = re.compile(
+    r"([+-]?)(USD?\s*)?(?:\$\s*)?([+-]?)((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(\s*USD)?",
+    re.IGNORECASE,
+)
 
 
 def money(v: Any) -> Decimal | None:
-    """输入：数字 / 字符串（可带 $、US 与千分位逗号）/ None → 输出：两位小数的 Decimal（四舍五入）或 None。
+    """输入：数字 / 字符串（开头可带 $、US、USD，结尾可带 USD，可有千分位逗号）/ None → 输出：两位小数的
+    Decimal（四舍五入）或 None。
 
     先按 6 位小数抹掉浮点噪声（78.68999999 → 78.690000），再取两位。读不出、指数写法、逗号不是千分位
-    （12,5、1.234,50）、绝对值 ≥ 10^10（numeric(12,2) 放不下）→ None。从不抛异常。
+    （12,5、1.234,50）、$ 或 US 出现在数字中间或末尾（40$5、4US0、12US）、绝对值 ≥ 10^10（numeric(12,2)
+    放不下）→ None。从不抛异常。
     """
     return _round(_parse_decimal(v), ROUND_HALF_UP)
 
@@ -254,8 +263,8 @@ def _round(d: Decimal | None, rounding: str) -> Decimal | None:
 def _parse_decimal(v: Any) -> Decimal | None:
     """输入：任意值 → 输出：有限且绝对值 < 10^10 的 Decimal；其他 → None（不抛异常）。
 
-    数字（int / float / Decimal）按数值换算（float 取最短十进制表示）；其他值按文本：去掉首尾空白、$ 与 US，
-    只认 _MONEY_TEXT_RE 的写法。
+    数字（int / float / Decimal）按数值换算（float 取最短十进制表示）；其他值按文本：去掉首尾空白后整段须是
+    _MONEY_WRAP_RE 的写法（标记只在开头 / 结尾，正负号最多一个，US 不能首尾都有），里面的数字只认 _MONEY_TEXT_RE 的写法。
     """
     if v is None or isinstance(v, bool):
         return None
@@ -267,10 +276,13 @@ def _parse_decimal(v: Any) -> Decimal | None:
         elif isinstance(v, float):
             d = Decimal(str(v))
         else:
-            s = str(v).strip().replace("$", "").replace("US", "").strip()
-            if not s or not _MONEY_TEXT_RE.match(s):
+            m = _MONEY_WRAP_RE.fullmatch(str(v).strip())
+            if m is None or (m.group(1) and m.group(3)) or (m.group(2) and m.group(5)):
                 return None
-            d = Decimal(s.replace(",", ""))
+            num = (m.group(1) or m.group(3)) + m.group(4)
+            if not _MONEY_TEXT_RE.match(num):
+                return None
+            d = Decimal(num.replace(",", ""))
     except (ArithmeticError, ValueError, TypeError):
         return None
     if not d.is_finite() or d.copy_abs() >= MONEY_LIMIT:

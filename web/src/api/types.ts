@@ -372,6 +372,8 @@ export interface OrderSource {
   row_no: number | null
   filename: string | null
   is_writeback_target: boolean
+  /** 这条来源最近一次记录说上游已取消（只由文件快照说取消、没有飞书来源仍说取消时，控制台可以撤销取消） */
+  upstream_cancelled?: boolean
   first_seen_at: Timestamp
   last_seen_at: Timestamp
   snapshot: Record<string, unknown>
@@ -874,9 +876,12 @@ export interface ImportTemplateRef {
   name: string
 }
 
+/** 工作区共用的导入模板（同名保存覆盖对应关系） */
 export interface ImportTemplate extends ImportTemplateRef {
   mapping: Record<string, string | null>
   created_at?: Timestamp
+  /** 最初创建它的人（显示名，没有显示名用用户名）；用户已删除时为 null */
+  created_by_name?: string | null
 }
 
 /** 同一工作区里内容完全相同的最近一次上传（未放弃的） */
@@ -895,7 +900,7 @@ export interface UploadResult {
   suggested_mapping: Record<string, string | null>
   system_fields: SystemField[]
   templates: ImportTemplateRef[]
-  /** 表头覆盖了模板全部对应列的个人模板（对应列最多的那个），没有为 null */
+  /** 表头覆盖了模板全部对应列的工作区模板（对应列最多的那个），没有为 null */
   matched_template_id?: number | null
   /** 这个文件已经上传过时的那次批次，没有为 null */
   previous_upload?: PreviousUpload | null

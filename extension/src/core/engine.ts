@@ -147,6 +147,8 @@ export interface EngineDeps {
 
 /** 契约 §5.4 的租约有效期默认值（服务端没给 lease_ttl_s 时用）。 */
 export const DEFAULT_LEASE_TTL_S = 180;
+/** 一笔结果最多重发多久（reportRetryMaxMs 的默认值）。后台接管批次之后续租补交的总时长也按它封顶（core/custody.ts）。 */
+export const REPORT_RETRY_MAX_MS = 10 * 60_000;
 /** 结果重发时给租约留的余量：离租约到期不到这么久就不再等下一次。 */
 const LEASE_MARGIN_MS = 10_000;
 /** 结果重发的退避节奏。 */
@@ -283,7 +285,7 @@ export class RunEngine {
     this.beatCap = deps.heartbeatEveryMs ?? 35_000;
     this.beatEvery = beatInterval(this.beatCap, DEFAULT_LEASE_TTL_S);
     this.maxAttempts = deps.maxAttempts ?? 200;
-    this.reportRetryMaxMs = deps.reportRetryMaxMs ?? 10 * 60_000;
+    this.reportRetryMaxMs = deps.reportRetryMaxMs ?? REPORT_RETRY_MAX_MS;
     this.identityEvery = deps.identityEveryMs ?? IDENTITY_EVERY_MS;
   }
 

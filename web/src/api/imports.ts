@@ -1,4 +1,4 @@
-/** 文件导入、个人模板与结果导出（契约 §7、§8、§10）。 */
+/** 文件导入、工作区模板与结果导出（契约 §7、§8、§10）。 */
 import { asPage, del, download, get, post, request } from './client'
 import type {
   ImportBatch,
@@ -13,7 +13,7 @@ import type {
   UploadResult,
 } from './types'
 
-/** 输入：.xlsx / .csv 文件 → 输出：批次 id、工作表、表头、建议对应、系统字段、个人模板 */
+/** 输入：.xlsx / .csv 文件 → 输出：批次 id、工作表、表头、建议对应、系统字段、工作区模板 */
 export function uploadImport(file: File): Promise<UploadResult> {
   const form = new FormData()
   form.append('file', file)
@@ -53,11 +53,11 @@ export const downloadProblems = (id: number) => download(`/imports/${id}/problem
 export const downloadOrdersExport = (query: { batch_id?: number; view?: OrderView }) =>
   download('/exports/orders.xlsx', { ...query }, '采购结果.xlsx')
 
-/** 输入：无 → 输出：个人模板 {total, rows} */
+/** 输入：无 → 输出：工作区模板 {total, rows}（含创建人 created_by_name） */
 export const listTemplates = async (): Promise<Page<ImportTemplate>> =>
   asPage(await get<Page<ImportTemplate>>('/import-templates'))
 
-/** 输入：模板名、{表头: 系统字段} → 输出：新模板 */
+/** 输入：模板名、{表头: 系统字段} → 输出：模板（工作区里已有同名模板时覆盖它的对应关系） */
 export const createTemplate = (name: string, mapping: Record<string, string | null>) =>
   post<ImportTemplate>('/import-templates', { name, mapping })
 

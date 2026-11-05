@@ -37,7 +37,7 @@ def create_pairing_code(ctx: deps.Console = Depends(deps.console)):
 
 @router.get("/{device_id}")
 def get_device(device_id: int, ctx: deps.Console = Depends(deps.console)):
-    """输入：设备 id → 输出：设备；别的工作区 → 404（契约 §8 之外的补充接口）。"""
+    """输入：设备 id → 输出：设备；别的工作区 → 404。"""
     return respond(devices.get_device(ctx.conn, ctx.workspace_id, device_id))
 
 

@@ -75,3 +75,21 @@ def test_tiny_values_round_to_zero_not_none():
 def test_aborted_by_server_is_an_abort_code():
     ec = ERROR_CODES["ABORTED_BY_SERVER"]
     assert ec.category == "abort" and "未提交前中止" in ec.zh
+
+
+@pytest.mark.parametrize("raw", [
+    "40$5", "4US0", "1$2$3", "12US", "40$", "5$", "$5$", "4 0", "52 US", "-$-5", "+$-5", "$+-5", "- 5", "1,2,3",
+    "USD", "US$", "$USD5", "5 USD USD", "4,0$", "12,5$", "usd40usd", "US$40 USD", "USD 5 USD",
+])
+def test_markers_only_at_the_edges(raw):
+    """$、US 只在开头认（USD 另可在结尾）：出现在数字中间或末尾的乱码金额按读不出（None），不会变成更大的值。"""
+    assert money(raw) is None and money_cap(raw) is None
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("$25.50", "25.50"), ("US$25.50", "25.50"), ("US $25.50", "25.50"), ("$ 25.50", "25.50"), ("-$5", "-5.00"),
+    ("$-5", "-5.00"), ("1,234.50", "1234.50"), ("USD 52", "52.00"), ("52 usd", "52.00"), ("52USD", "52.00"),
+    ("$5 USD", "5.00"), (" $1,041.9 ", "1041.90"),
+])
+def test_leading_markers_and_trailing_usd_still_parse(raw, expected):
+    assert money(raw) == Decimal(expected)

@@ -177,7 +177,9 @@ def grant_base(conn, workspace_id: int, app_token: str, *, transfer: bool = Fals
     previous_workspace_id}。部署所有者在服务器上用 CLI 授权（不经控制台）。
 
     工作区不存在 → NOT_FOUND；表格已授权给别的工作区且没有 transfer → VALIDATION（转授后原工作区在这个表格上的
-    连接被停用，读取、验收都会被拒绝）。
+    连接被停用，读取、验收、写回发送都会被拒绝）。一个表格同一时刻只归一个工作区：授权后**其他所有工作区**在这个
+    表格上仍启用的连接一律停用（含原授权工作区、表格尚未登记授权时部署所有者工作区的连接、迁移遗留的同表连接），
+    每个受影响的工作区记一条 'feishu.base_revoked' 事件，disabled_connections 列出全部被停用的连接。
     """
     if not isinstance(app_token, str) or not _TOKEN_RE.match(app_token):
         raise validation("多维表格标识（app_token）格式不对", field="app_token")
@@ -200,10 +202,16 @@ def grant_base(conn, workspace_id: int, app_token: str, *, transfer: bool = Fals
     events.record(conn, workspace_id, "settings", workspace_id, "feishu.base_granted", actor_kind="system",
                   detail={"app_token": app_token, "previous_workspace_id": prev, "granted_by": granted_by})
     disabled: list[int] = []
+    affected = {r["workspace_id"] for r in conn.execute(
+        "SELECT DISTINCT workspace_id FROM procure.feishu_connections WHERE app_token = %s AND enabled "
+        "AND workspace_id <> %s", (app_token, workspace_id)).fetchall()}
     if prev is not None and prev != workspace_id:
-        disabled = _disable_base_connections(conn, prev, app_token)
-        events.record(conn, prev, "settings", prev, "feishu.base_revoked", actor_kind="system",
-                      detail={"app_token": app_token, "reason": "转授给其他工作区", "disabled_connections": disabled})
+        affected.add(prev)
+    for other in sorted(affected):
+        ids = _disable_base_connections(conn, other, app_token)
+        disabled.extend(ids)
+        events.record(conn, other, "settings", other, "feishu.base_revoked", actor_kind="system",
+                      detail={"app_token": app_token, "reason": "转授给其他工作区", "disabled_connections": ids})
     return {"app_token": app_token, "workspace_id": workspace_id, "granted_by": granted_by,
             "previous_workspace_id": prev, "disabled_connections": disabled}
 
@@ -610,7 +618,9 @@ def update(conn, workspace_id: int, connection_id: int, patch: dict[str, Any], a
     map_given = "writeback_map" in patch
     field_map_given = "field_map" in patch
     if result_changed or map_given or field_map_given or upd.get("enabled") is True:
-        require_base_access(conn, workspace_id, row["app_token"])
+        # 部署所有者的工作区（重新）启用、改对应时登记授权：之后别的工作区要用这个表格须显式转授，
+        # 转授会停用这里的连接（写回发送也按授权把关，见 writeback）
+        require_base_access(conn, workspace_id, row["app_token"], claim=True)
     if result_changed or map_given or field_map_given:
         _check_ids(row["app_token"], new_result)
         with client_scope(client) as c:
@@ -841,7 +851,7 @@ def verify_writeback(conn, workspace_id: int, connection_id: int, record_id: str
     写入 / 读回时飞书报错不抛异常，结果为 ok=false 并带 error；读字段失败、写回对应为空 → 抛错。
     """
     row = get_row(conn, workspace_id, connection_id)
-    require_base_access(conn, workspace_id, row["app_token"])
+    require_base_access(conn, workspace_id, row["app_token"], claim=True)
     # 与读取互斥：验收写入测试值到恢复原值之间，不让同一连接的读取把测试值当成订单结果接收。
     # 先取读取锁、再锁连接行（与读取的加锁顺序一致，避免死锁）。
     conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (INTAKE_LOCK_NS, row["id"] % 2_147_483_647))

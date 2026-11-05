@@ -20,7 +20,7 @@ def list_writebacks(status: str | None = None, pg: deps.Paging = Depends(deps.pa
 
 @router.get("/{writeback_id}")
 def get_writeback(writeback_id: int, ctx: deps.Console = Depends(deps.console)):
-    """输入：写回 id → 输出：写回记录；别的工作区 → 404（契约 §8 之外的补充接口）。"""
+    """输入：写回 id → 输出：写回记录；别的工作区 → 404。"""
     return respond(writeback.get(ctx.conn, ctx.workspace_id, writeback_id))
 
 

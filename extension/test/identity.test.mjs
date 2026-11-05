@@ -200,6 +200,78 @@ test("已登录但没读到买家号 ID 的页面是弱证据：不和读到 ID 
   assert.equal(r.customer_id, BOUND, "有 ID 的读数优先");
 });
 
+// 「已登录、但没读到 ID」的读数（弱证据）不取代、也不作废读到 ID 或显示未登录的读数（强证据）
+const weak = (tab, loadedMin, readMin = loadedMin) => ({ ...obs(tab, BOUND, loadedMin, readMin), customer_id: null });
+
+test("同一标签页从另一个买家号的页面跳到读不出 ID 的页面：另一个买家号仍是证据，有分歧，不报绑定账号", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)), see(weak(2, 90)));
+  assert.equal(s.newest_gone?.customer_id, OTHER, "上一页的读数留作证据");
+  const r = reconcileIdentity(s, BOUND, T0 + 91 * 60_000);
+  assert.equal(r.conflict, true);
+  assert.equal(r.signed_in, true);
+  assert.equal(r.customer_id, OTHER);
+  assert.equal(r.at, T0 + 91 * 60_000, "有分歧：新鲜度取当前时刻");
+});
+
+test("同上，但旧页面先说了 bye（标签页读数先退出、再来新页面的弱读数）：结论一样", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)), gone(2), see(weak(2, 90)));
+  assert.equal(s.newest_gone?.customer_id, OTHER, "弱读数不作废已关闭页面上的强证据");
+  const r = reconcileIdentity(s, BOUND, T0 + 91 * 60_000);
+  assert.equal(r.conflict, true);
+  assert.equal(r.customer_id, OTHER);
+});
+
+test("另一个买家号的标签页关掉后开了一张读不出 ID 的新标签页：仍有分歧；再关掉它，证据还是另一个买家号", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)), gone(2), see(weak(3, 90)));
+  const r = reconcileIdentity(s, BOUND, T0 + 91 * 60_000);
+  assert.equal(r.conflict, true);
+  assert.equal(r.customer_id, OTHER);
+  const s2 = retireIdentityTab(s, 3);
+  assert.equal(s2.newest_gone.customer_id, OTHER, "弱读数关掉时不顶替强证据");
+  assert.equal(s2.newest_gone.tab_id, 2);
+  const r2 = reconcileIdentity(s2, BOUND, T0 + 92 * 60_000);
+  assert.equal(r2.conflict, true);
+  assert.equal(r2.customer_id, OTHER);
+});
+
+test("同一标签页从未登录的页面跳到读不出 ID 的页面：仍报未登录、有分歧；旧标签页重新加载出绑定账号后一致", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, null, 30)), see(weak(2, 40)));
+  const r = reconcileIdentity(s, BOUND, T0 + 41 * 60_000);
+  assert.equal(r.signed_in, false);
+  assert.equal(r.customer_id, null);
+  assert.equal(r.conflict, true);
+  const s2 = observeIdentity(s, obs(1, BOUND, 100));
+  assert.equal(s2.newest_gone, null, "比它新的强证据出现后，已关闭的读数作废");
+  const r2 = reconcileIdentity(s2, BOUND, T0 + 100 * 60_000);
+  assert.equal(r2.conflict, false);
+  assert.equal(r2.signed_in, true);
+  assert.equal(r2.customer_id, BOUND);
+});
+
+test("弱读数之间照常互相取代；只有一个标签页时，上一页读到的绑定账号在读不出 ID 的新页面上仍算数", () => {
+  const s = fold(see(weak(1, 10)), gone(1), see(weak(2, 20)));
+  assert.equal(s.newest_gone, null, "已关闭的弱读数被不比它旧的读数作废");
+  const one = fold(see(obs(1, BOUND, 0)), see(weak(1, 10, 12)));
+  const r = reconcileIdentity(one, BOUND, T0 + 12 * 60_000);
+  assert.equal(r.conflict, false);
+  assert.equal(r.customer_id, BOUND);
+  assert.equal(r.at, T0 + 12 * 60_000, "新鲜度取最近一次读取");
+});
+
+test("同一页重读时没读到 ID、或较早加载的页面迟到的读数：不抹掉另一个买家号的证据", () => {
+  // 重读同一页（加载时刻没变）这一次没读到 ID
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)), see(weak(2, 60, 65)));
+  const r = reconcileIdentity(s, BOUND, T0 + 66 * 60_000);
+  assert.equal(r.conflict, true);
+  assert.equal(r.customer_id, OTHER);
+  // 标签页 2 已经在读不出 ID 的新页面上，之前那一页（另一个买家号）的读数这时才到
+  const late = fold(see(obs(1, BOUND, 0)), see(weak(2, 90)), see(obs(2, OTHER, 60, 91)));
+  assert.equal(late.live["2"].customer_id, null, "不覆盖标签页现在的读数");
+  const r2 = reconcileIdentity(late, BOUND, T0 + 92 * 60_000);
+  assert.equal(r2.conflict, true);
+  assert.equal(r2.customer_id, OTHER);
+});
+
 test("同一标签页：较早加载的页面迟到的读数不能覆盖较新页面的；新鲜度取最近一次读取，不取加载时刻", () => {
   let s = fold(see(obs(1, BOUND, 50)));
   s = observeIdentity(s, obs(1, OTHER, 10, 51)); // 刷新之前那一页的消息迟到了

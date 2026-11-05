@@ -101,5 +101,5 @@ def adopt_customer_id(account_id: int, body: AdoptBody, ctx: deps.Console = Depe
 
 @router.post("/{account_id}/archive")
 def archive_account(account_id: int, ctx: deps.Console = Depends(deps.console)):
-    """输入：账号 id → 输出：账号（已归档；契约 §8 之外的补充接口，有执行中或待核实的采购时拒绝）。"""
+    """输入：账号 id → 输出：账号（已归档；有执行中或待核实的采购时拒绝）。"""
     return respond(accounts.archive(ctx.conn, ctx.workspace_id, account_id, ctx.user_id))

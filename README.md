@@ -90,7 +90,7 @@ cp .env.example .env                        # 可选：要改配置或接飞书�
 
 - `registry/settings.py` 在进程第一次读设置时加载 `backend/.env`，之后不再重读：改了 `.env` 要重启 `cli.py serve`。
 - 进程环境里已经有的变量优先，`.env` 不会覆盖它。
-- 每行一个 `KEY=VALUE`，`#` 开头的行是注释；行尾不能写注释（会被当成值的一部分）。不改的项保持注释掉：连接串、地址、目录这类文本项写成 `PC_HOST=` 这样的空值时会被当成空字符串，不会回落到缺省值。
+- 每行一个 `KEY=VALUE`（可加 `export ` 前缀），`#` 开头的行是注释。不带引号的值里「空白 + `#`」之后算行尾注释（`#` 前面没有空白时算值的一部分）；值本身含「 `#`」（如数据库密码）时用成对的单 / 双引号括起，引号里原样保留，收尾引号之后也可以再写「`# 注释`」。值为空（如 `PC_HOST=`）等于没写，用缺省值。
 - `backend/.env` 已在 `.gitignore` 里，飞书 App Secret 只写在这里或进程环境里。
 
 常用的几项：
@@ -153,7 +153,7 @@ cd backend
 
 1. 控制台「订单来源」→「文件导入」→「下载标准模板」（28 列，列名与飞书统一，只有「平台订单号」必填）。`reference/spreadsheets/` 里的是第三方参考系统的 15 列模板，不是本系统的标准模板。
 2. 上传 `.xlsx` 或 `.csv`（UTF-8、UTF-8-BOM 或 GBK，10 MB 以内；`.xls` 请先另存为 `.xlsx`）。
-3. 选工作表、核对字段对应（表头自动识别，可以存为个人模板，下次同样格式的文件自动套用）。
+3. 选工作表、核对字段对应（表头自动识别，可以存为工作区模板：同一工作区共用，同名覆盖，控制台保存前会先确认；下次同样格式的文件自动套用）。
 4. 预览：每行一个结论（新单、更新、无变化、待核实、历史采购、无效）并列出问题；改了字段对应要重新预览。
 5. 「提交导入」或「放弃」。提交后新单按账号配置自动分配；问题行可以下载。
 
@@ -216,7 +216,7 @@ cd extension && npm ci && npm run build     # 产物在 extension/dist
 (cd extension && npm run build && npm test)      # tsc + vite build + Node 单测
 ```
 
-后端测试的管理连接缺省是 `dbname=postgres`，要改时设进程环境变量 `PC_TEST_ADMIN_DSN`（写在 `.env` 里无效）。
+后端测试不读 `backend/.env`，也会清掉 shell 里的 `PC_*` / `FEISHU_*` 变量（测试只认缺省设置）；唯一读取的是管理连接 `PC_TEST_ADMIN_DSN`（缺省 `dbname=postgres`，须设在进程环境里）。
 
 ### `backend/cli.py`
 
@@ -226,7 +226,7 @@ cd extension && npm ci && npm run build     # 产物在 extension/dist
 |---|---|
 |`db_init`|库不存在时先建库，再建表（幂等）；`-p dsn=…` 临时指定连接串|
 |`user_create`|建控制台用户：`-p username=…`，`-p workspace="名称"`（新建工作区）或 `-p workspace_id=…`（加入已有工作区）；密码按提示输入|
-|`serve`|HTTP 服务 + 后台调度（清扫、每日分配、飞书读取与写回）；可选 `-p host=…`、`-p port=…`、`-p jobs=0`（不启动后台调度）、`-p log_level=…`|
+|`serve`|HTTP 服务 + 后台调度（清扫、每日分配、飞书读取与写回）；可选 `-p host=…`（该地址同时加入 Host 允许名单）、`-p port=…`、`-p jobs=0`（不启动后台调度）、`-p log_level=…`|
 |`allocate`|账号分配，等同控制台「重新分配」；`-p workspace_id=…` 只分一个工作区|
 |`sweep`|清扫过期的执行批次租约|
 |`feishu_intake`|读一次到期的飞书连接；`-p connection_id=…` 只读这一个|

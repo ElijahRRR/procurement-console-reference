@@ -24,7 +24,8 @@
 - 插件说「结果不明」，或未登记提交却上报成功、成功却没有合格的亚马逊订单号：同样按结果待核实处理
   （宁可人工核实，也不让任务回到可领取状态）。
 - 回执不丢：已登记提交的尝试在租约过期、尚未清扫时照常接收结果；已是「结果待核实」后才送到的不同结果
-  （迟到的回执）只记录、不改状态（_late_receipt）。
+  （迟到的回执）只记录、不改状态（_late_receipt）；控制台已核实（已下单 / 未下单）后才送到的不同结果同样只记录，
+  与核实结论矛盾时提醒并挡住重新领取（_late_receipt_after_resolution）。
 
 账号被本模块暂停时，除 accounts.pause 写的 'account.paused' 外，另写一条 PAUSE_MARKER_KIND 事件
 {cause: result_unknown | account_error, simulated, attempt_id, code}，供「清除模拟结果」判断哪些账号
@@ -34,7 +35,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -68,9 +69,9 @@ END_REASON_ZH = {
 }
 
 __all__ = [
-    "CANCEL_CODES", "PAUSE_MARKER_KIND", "apply_source_drift", "drift_updates", "end_run", "execution_gate",
-    "finish_run", "mark_submitting", "mark_verifying", "next_attempt", "progress", "report_result", "run_heartbeat",
-    "start_run", "submit_guard", "sweep",
+    "CANCEL_CODES", "HOLD_DEFERRED_KIND", "PAUSE_MARKER_KIND", "apply_source_drift", "drift_updates", "end_run",
+    "execution_gate", "finish_run", "mark_submitting", "mark_verifying", "next_attempt", "progress", "report_result",
+    "run_heartbeat", "start_run", "submit_guard", "sweep",
 ]
 
 
@@ -316,7 +317,9 @@ def _pause_account(conn, workspace_id: int, account_id: int | None, reason: str,
 #   落到任务上：人审结论直接采用（撤回 → 待确认；任务由控制台人审时，领取后才出现的来源关联带来的「拒绝」
 #   不直接采用，写成人审冲突 kind review，与 ingest 一致）；外部 AMZ 订单号、字段变化写进 conflict（incoming
 #   为来源新值，控制台「接受 / 保留」），任务按派生规则转待确认 / 待核实（异常保持异常），并置 needs_attention。
-#   每笔尝试只落一次（task_snapshot.source_drift_checked_at）。
+#   任务上已有冲突（执行期间来源写在任务上的暂停）时按冲突合并规则合并，不丢任何一项；采购开始后被推迟的暂停
+#   （HOLD_DEFERRED_KIND 事件）也在这时转成冲突。每笔尝试只落一次（task_snapshot.source_drift_checked_at）。
+# - 领取后才出现的来源关联按首次关联的规则比：没带的列不算变化（见 _source_drift）。
 
 _SOURCE_TEXT_FIELDS = frozenset({"recipient_name", "address1", "address2", "city", "state", "postal_code", "phone",
                                  "country", "district"})
@@ -332,7 +335,8 @@ def _clean(v: Any) -> str | None:
 
 
 def _source_vals(rec: UpstreamRecord) -> dict[str, Any]:
-    """输入：上游记录 → 输出：被监视的值（任务列口径，可入 JSON）：执行相关字段、建议采购日期依据、人审、外部单号。"""
+    """输入：上游记录 → 输出：被监视的值（任务列口径，可入 JSON）：执行相关字段、建议采购日期依据（及算它用的
+    下单时间、配送天数）、人审、外部单号。"""
     vals: dict[str, Any] = {}
     for f in EXECUTION_FIELDS:
         v = getattr(rec, f, None)
@@ -347,13 +351,15 @@ def _source_vals(rec: UpstreamRecord) -> dict[str, Any]:
     vals["unit_price"] = money(rec.unit_price)
     vals["price_cap"] = money_cap(rec.price_cap)
     vals["country"] = (vals["country"] or "US").upper()
+    ot = rec.order_time
+    if ot is not None and ot.tzinfo is None:
+        ot = ot.replace(tzinfo=clock.BJ_TZ)
+    sd = rec.ship_days if isinstance(rec.ship_days, int) and not isinstance(rec.ship_days, bool) else None
+    # 下单时间与配送天数不在指纹里，但决定按 +6−天数 算出的建议采购日期：一并监视（NEW-RB-2）
+    vals["order_time"], vals["ship_days"] = ot, sd
     if rec.suggested_purchase_date is not None:
         vals["suggested_purchase_date"], vals["suggested_date_basis"] = rec.suggested_purchase_date, "source"
     else:
-        ot = rec.order_time
-        if ot is not None and ot.tzinfo is None:
-            ot = ot.replace(tzinfo=clock.BJ_TZ)
-        sd = rec.ship_days if isinstance(rec.ship_days, int) and not isinstance(rec.ship_days, bool) else None
         d = orders.compute_suggested_date(ot, sd)
         vals["suggested_purchase_date"], vals["suggested_date_basis"] = d, ("computed" if d else None)
     vals["review_status"] = rec.review if rec.review in ("approved", "rejected", "unknown") else "unknown"
@@ -370,11 +376,19 @@ def _canon(f: str, v: Any) -> Any:
     if f in _SOURCE_MONEY_FIELDS:
         m = money_cap(v) if f == "price_cap" else money(v)
         return None if m is None else format(m, "f")
-    if f == "quantity":
+    if f in ("quantity", "ship_days"):
         try:
             return int(v)
         except (TypeError, ValueError):
             return str(v)
+    if f == "order_time":
+        # 同一时刻可能写成不同时区（来源是北京时间、库里读出是 UTC）：统一换成 UTC 再比
+        try:
+            t = datetime.fromisoformat(v) if isinstance(v, str) else v
+            if isinstance(t, datetime):
+                return (t if t.tzinfo else t.replace(tzinfo=clock.BJ_TZ)).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
     if isinstance(v, (datetime, date)):
         v = v.isoformat()
     s = " ".join(str(v).split()).casefold()
@@ -408,8 +422,27 @@ def _source_baseline(conn, order: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _order_vals(order: dict[str, Any]) -> dict[str, Any]:
-    keys = (*EXECUTION_FIELDS, "suggested_date_basis", "review_status", "review_value", "external_amz_order_no")
+    keys = (*EXECUTION_FIELDS, "suggested_date_basis", "order_time", "ship_days", "review_status", "review_value",
+            "external_amz_order_no")
     return _jsonable({k: order.get(k) for k in keys})
+
+
+def _first_link_date(order: dict[str, Any], cur: dict[str, Any]) -> tuple[Any, Any] | None:
+    """输入：任务、领取后才出现的来源关联（同种来源）的被监视值 → 输出：按首次关联的规则（与 orders._suggested_after
+    在 prv=None 时一致）它会带来的 (建议采购日期, 依据)；不会改日期 → None。
+
+    来源自己给了日期 → 用它；任务的日期来自来源而这条只能算出日期 → 不改；否则按「来源有的下单时间 / 配送天数，
+    没有的沿用任务现值」重新计算。
+    """
+    if cur.get("suggested_date_basis") == "source":
+        return cur.get("suggested_purchase_date"), "source"
+    if order.get("suggested_date_basis") == "source":
+        return None
+    ot = cur.get("order_time")
+    ot = datetime.fromisoformat(ot) if isinstance(ot, str) else order.get("order_time")
+    sd = cur.get("ship_days")
+    d = orders.compute_suggested_date(ot, sd if sd is not None else order.get("ship_days"))
+    return _iso(d), ("computed" if d else None)
 
 
 def _link_desc(link: dict[str, Any]) -> dict[str, Any]:
@@ -435,8 +468,16 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
     {fields: {字段: [任务现值, 来源新值]}, incoming, review, review_conflict, external, source_kind, source}；
     没有变化、或尝试没有基线（旧数据、外部尝试）→ None。
 
-    同一条来源关联与自己的基线比；领取后才出现的关联（如新一批文件）与同种来源最近的基线比（内容与任一
-    基线相同就不算变化），没有同种基线时与任务现值比。另一种来源的空值不算变化（与 ingest 一致）。
+    同一条来源关联与自己的基线比（指纹与被监视的值都没变才跳过：指纹不含下单时间与配送天数，它们改了也会
+    改掉算出来的建议采购日期）；领取后才出现的关联（如新一批文件）与同种来源最近的基线比（内容与任一同种基线
+    相同就不算变化），没有同种基线时与任务现值比。
+
+    领取后才出现的关联按首次关联的规则比（与 ingest 在采购开始前的规则一致）：它没带的列（空值）不算变化；
+    收件信息只有带了姓名 / 地址 / 城市 / 州 / 邮编之一时才整组比较（组里的空值也算）；同种来源只能算出建议采购
+    日期而任务的日期来自来源时不算变化（见 _first_link_date）。同一条关联把值改成空是真的清空：同种来源算变化，
+    另一种来源的空值不算（与 ingest 一致）。建议采购日期按 +6−天数 算出时，变化里一并带上来源的下单时间与配送
+    天数（控制台「接受」时写回）。
+
     人审（与 ingest 的规则一致）：只看同种来源；review 是直接采用的新结论。任务由控制台人审时，只有领取时就在的
     那条来源记录自己的变化才直接采用；领取后才出现的关联带来「拒绝」→ review_conflict（人审冲突，需人工核实，
     不悄悄改写控制台的通过结论），带来其他结论不算变化。
@@ -446,7 +487,6 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
     if not isinstance(base, list):
         return None
     by_id = {b.get("id"): b for b in base if isinstance(b, dict)}
-    base_fps = {b.get("fp") for b in by_id.values()}
     primary = order.get("primary_source_kind")
     fields: dict[str, list[Any]] = {}
     incoming: dict[str, Any] = {}
@@ -456,28 +496,51 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
     known_nos: set[str] | None = None
     for link in _links(conn, order):
         b = by_id.get(link["id"])
-        if (b is not None and b.get("fp") == link["fingerprint"]) or (b is None and link["fingerprint"] in base_fps):
-            continue
         cur = _link_vals(link)
         if cur is None:
+            continue
+        same = [x for x in by_id.values() if x.get("kind") == link["kind"]]
+        if b is not None and b.get("fp") == link["fingerprint"] and cur == b.get("vals"):
+            continue
+        if b is None and any(cur == x.get("vals") for x in same):
             continue
         if b is not None:
             ref = b.get("vals") or {}
         else:
-            same = [x for x in by_id.values() if x.get("kind") == link["kind"]]
             ref = (same[-1].get("vals") or {}) if same else _order_vals(order)
         same_kind = link["kind"] == primary
+        first = b is None
+        has_core = any(cur.get(f) is not None for f in orders.ADDRESS_CORE)
         found = False
         for f in EXECUTION_FIELDS:
             c = cur.get(f)
-            if _canon(f, c) == _canon(f, ref.get(f)) or _canon(f, c) == _canon(f, order.get(f)):
+            basis = cur.get("suggested_date_basis")
+            if first:
+                if f in orders.ADDRESS_GROUP:
+                    if not has_core:            # 没带收件信息：整组不比
+                        continue
+                elif f == "suggested_purchase_date" and same_kind:
+                    hit = _first_link_date(order, cur)
+                    if hit is None:
+                        continue
+                    c, basis = hit
+                elif c is None:                 # 没带的列不算变化
+                    continue
+            elif c is None and (f == "suggested_purchase_date" or (not same_kind and f not in _SOURCE_TEXT_FIELDS)):
                 continue
-            if c is None and (f == "suggested_purchase_date" or (not same_kind and f not in _SOURCE_TEXT_FIELDS)):
+            if _canon(f, c) == _canon(f, ref.get(f)) or _canon(f, c) == _canon(f, order.get(f)):
                 continue
             fields[f] = [_jsonable(order.get(f)), c]
             incoming[f] = c
             if f == "suggested_purchase_date":
-                incoming["suggested_date_basis"] = cur.get("suggested_date_basis")
+                incoming["suggested_date_basis"] = basis
+                if basis == "computed":
+                    # 算出来的日期：一并带上来源的下单时间与配送天数（「接受」时写回，下单北京日期随之重算）
+                    for k in ("order_time", "ship_days"):
+                        v = cur.get(k)
+                        if v is not None and _canon(k, v) != _canon(k, _jsonable(order.get(k))):
+                            fields[k] = [_jsonable(order.get(k)), v]
+                            incoming[k] = v
             found = True
         st = cur.get("review_status")
         if same_kind and st != ref.get("review_status") and st != order.get("review_status"):
@@ -549,59 +612,116 @@ def _mark_drift_checked(conn, att: dict[str, Any]) -> None:
     )
 
 
-def drift_updates(conn, order: dict[str, Any], att: dict[str, Any], *, actor_kind: str,
-                  actor_id: int | None) -> dict[str, Any] | None:
-    """输入：任务（已锁）、它最近一次没有完成采购的尝试、操作者 → 输出：要写到任务上的列（人审、conflict、
-    needs_attention）；尝试已处理过、没有基线或来源没有变化 → None。写 'order.source_changed_during_attempt' 事件，
-    并把尝试标记为已处理（之后同一笔尝试不再重复落地）。只计算与记录，不改任务状态。"""
-    if _drift_checked(att):
-        return None
-    drift = _source_drift(conn, order, att)
-    _mark_drift_checked(conn, att)
-    if drift is None:
-        return None
-    now = clock.now()
-    text = _drift_text(drift)
-    upd: dict[str, Any] = {}
-    if drift["review"]:
-        rv = drift["review"]
-        upd.update(review_status=rv["review_status"], review_value=rv["review_value"],
-                   review_source=rv["source_kind"], reviewed_by=None, reviewed_at=now)
-    payload = None
+#: ingest 在任务不能暂停时（已登记提交的采购中、结果待核实、已采购、待决定重采）收到「这笔任务不该再执行」的
+#: 来源变化（另一种来源的人审拒绝、准入变化、平台订单号变化）只置提醒，同时记这个事件 {conflict, attempt_id,
+#: status}；任务之后回到开始前时（drift_updates）把它转成 conflict。种类名只在 orders 定义一次
+HOLD_DEFERRED_KIND = orders.HOLD_DEFERRED_KIND
+
+
+def _deferred_holds(conn, order: dict[str, Any], att: dict[str, Any]) -> list[dict[str, Any]]:
+    """输入：任务、尝试 → 输出：采购期间（以这笔尝试为当前 / 已采购尝试时）被推迟、按来源现状仍成立的暂停
+    （冲突载荷），按发生顺序。来源之后又改回去了的（orders.deferred_hold_applies 为 False）不算。"""
+    rows = conn.execute(
+        "SELECT detail FROM procure.events WHERE workspace_id = %s AND entity = 'order' AND entity_id = %s "
+        "AND kind = %s AND detail->>'attempt_id' = %s ORDER BY id",
+        (order["workspace_id"], order["id"], HOLD_DEFERRED_KIND, str(att["id"])),
+    ).fetchall()
+    out = []
+    for r in rows:
+        c = (r["detail"] or {}).get("conflict")
+        if isinstance(c, dict) and c and orders.deferred_hold_applies(conn, order, c):
+            out.append(c)
+    return out
+
+
+def _drift_payloads(order: dict[str, Any], drift: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+    """输入：任务、_source_drift 的结果 → 输出：要写进 conflict 的载荷（外部单号、字段变化、人审冲突各一份，
+    有几项给几份；由调用方按冲突合并规则合并）。"""
+    out = []
     if drift["external"]:
         ex = drift["external"]
         no = ex["external_amz_order_no"]
         reason = f"采购过程中来源出现 AMZ 订单号 {no}，需人工核实是否已在别处采购"
-        payload = {"kind": "external_order_no", "source_kind": ex["source_kind"], "reason": reason,
-                   "fields": {"external_amz_order_no": [order.get("external_amz_order_no"), no]},
-                   "incoming": {"external_amz_order_no": no, "external_buyer_account": ex["external_buyer_account"]},
-                   "source": ex["source"], "at": now}
-    elif drift["fields"]:
+        out.append({"kind": "external_order_no", "source_kind": ex["source_kind"], "reason": reason,
+                    "fields": {"external_amz_order_no": [order.get("external_amz_order_no"), no]},
+                    "incoming": {"external_amz_order_no": no, "external_buyer_account": ex["external_buyer_account"]},
+                    "source": ex["source"], "at": now})
+    if drift["fields"]:
         labels = "、".join(orders.FIELD_LABELS.get(f, f) for f in drift["fields"])
         reason = _zh_join("采购过程中来源修改了", labels) + "，需人工核实"
-        payload = {"kind": "fields", "source_kind": drift["source_kind"], "reason": reason,
-                   "fields": drift["fields"], "incoming": drift["incoming"], "source": drift["source"], "at": now}
-    elif drift["review_conflict"]:
+        out.append({"kind": "fields", "source_kind": drift["source_kind"], "reason": reason,
+                    "fields": drift["fields"], "incoming": drift["incoming"], "source": drift["source"], "at": now})
+    if drift["review_conflict"]:
         rc = drift["review_conflict"]
         who = "飞书" if rc["source_kind"] == "feishu" else "文件"
         shown = rc["review_value"] or "拒绝"
         reason = f"{who}来源的人工审核为「{shown}」，与任务已有的通过结论不同，需人工核实"
-        payload = {"kind": "review", "source_kind": rc["source_kind"], "reason": reason,
-                   "fields": {"review_status": [order.get("review_status"), "rejected"]},
-                   "incoming": {"review_status": "rejected", "review_value": rc["review_value"],
-                                "review_source": rc["source_kind"]},
-                   "source": rc["source"], "at": now}
-    if payload is not None and not order.get("conflict"):
-        upd["conflict"] = payload
-    note = f"{text}（采购未完成，已按来源最新内容转人工核实）"
-    existing = order.get("attention_note") or ""
+        out.append({"kind": "review", "source_kind": rc["source_kind"], "reason": reason,
+                    "fields": {"review_status": [order.get("review_status"), "rejected"]},
+                    "incoming": {"review_status": "rejected", "review_value": rc["review_value"],
+                                 "review_source": rc["source_kind"]},
+                    "source": rc["source"], "at": now})
+    return out
+
+
+def _append(existing: str | None, note: str) -> str:
+    existing = existing or ""
+    if note in existing:
+        return existing
+    return (f"{existing}；{note}" if existing else note)[:1000]
+
+
+def drift_updates(conn, order: dict[str, Any], att: dict[str, Any], *, actor_kind: str,
+                  actor_id: int | None) -> dict[str, Any] | None:
+    """输入：任务（已锁）、它最近一次没有完成采购的尝试、操作者 → 输出：要写到任务上的列（人审、conflict、
+    needs_attention）；尝试已处理过、或来源没有变化也没有被推迟的暂停 → None。只计算与记录，不改任务状态。
+
+    - 领取后来源的执行相关变化（_source_drift）：人审结论直接采用；外部单号、字段变化、人审冲突各成一份冲突载荷；
+      写 'order.source_changed_during_attempt' 事件。
+    - 采购期间被推迟的暂停（HOLD_DEFERRED_KIND 事件里 attempt_id 是这笔尝试的）：同样成冲突载荷；写
+      'order.hold_deferred_applied' 事件。
+    - 这些载荷与任务上已有的冲突（如执行期间来源写在任务上的暂停）按冲突合并规则合并（orders._merge_conflict：
+      种类取处理方式更重的，字段与来源新值合并，原因去重拼接），不丢任何一项。
+    - 把尝试标记为已处理（之后同一笔尝试不再重复落地）。
+    """
+    if _drift_checked(att):
+        return None
+    drift = _source_drift(conn, order, att)
+    deferred = _deferred_holds(conn, order, att)
+    _mark_drift_checked(conn, att)
+    if drift is None and not deferred:
+        return None
+    now = clock.now()
+    upd: dict[str, Any] = {}
+    payload: dict[str, Any] | None = None
+    note = order.get("attention_note")
+    if drift is not None:
+        text = _drift_text(drift)
+        if drift["review"]:
+            rv = drift["review"]
+            upd.update(review_status=rv["review_status"], review_value=rv["review_value"],
+                       review_source=rv["source_kind"], reviewed_by=None, reviewed_at=now)
+        for p in _drift_payloads(order, drift, now):
+            payload = orders._merge_conflict(payload, p)
+        note = _append(note, f"{text}（采购未完成，已按来源最新内容转人工核实）")
+        events.record(conn, order["workspace_id"], "order", order["id"], "order.source_changed_during_attempt",
+                      actor_kind=actor_kind, actor_id=actor_id,
+                      detail={"attempt_id": att["id"], "reason": text, "fields": drift["fields"],
+                              "review": drift["review"], "review_conflict": drift["review_conflict"],
+                              "external": drift["external"], "source": drift["source"]})
+    if deferred:
+        for c in deferred:
+            payload = orders._merge_conflict(payload, c)
+        reasons = "；".join(dict.fromkeys(c["reason"] for c in deferred if c.get("reason")))
+        note = _append(note, "采购未完成，采购期间来源要求的暂停已转人工核实（见冲突说明）")
+        events.record(conn, order["workspace_id"], "order", order["id"], "order.hold_deferred_applied",
+                      actor_kind=actor_kind, actor_id=actor_id,
+                      detail={"attempt_id": att["id"], "kinds": [c.get("kind") for c in deferred],
+                              "reason": reasons or None})
+    if payload is not None:
+        upd["conflict"] = orders._merge_conflict(order.get("conflict"), payload)
     upd["needs_attention"] = True
-    upd["attention_note"] = existing if note in existing else (f"{existing}；{note}" if existing else note)[:1000]
-    events.record(conn, order["workspace_id"], "order", order["id"], "order.source_changed_during_attempt",
-                  actor_kind=actor_kind, actor_id=actor_id,
-                  detail={"attempt_id": att["id"], "reason": text, "fields": drift["fields"],
-                          "review": drift["review"], "review_conflict": drift["review_conflict"],
-                          "external": drift["external"], "source": drift["source"]})
+    upd["attention_note"] = note
     return upd
 
 
@@ -1362,6 +1482,24 @@ def _result_cols(r: dict[str, Any], now: datetime) -> dict[str, Any]:
 _OUTCOME_ZH = {"succeeded": "成功", "failed": "失败", "unknown": "结果不明"}
 
 
+def _late_seen(conn, att: dict[str, Any], r: dict[str, Any]) -> bool:
+    """输入：尝试、迟到的规范化结果 → 输出：最近一次记下的迟到回执是否就是这一份（结局、单号、错误码相同）。"""
+    seen = conn.execute(
+        "SELECT detail FROM procure.events WHERE workspace_id = %s AND entity = 'attempt' AND entity_id = %s "
+        "AND kind = 'attempt.late_result' ORDER BY id DESC LIMIT 1",
+        (att["workspace_id"], att["id"]),
+    ).fetchone()
+    return seen is not None and all((seen["detail"] or {}).get(k) == r[k]
+                                    for k in ("outcome", "amazon_order_no", "error_code"))
+
+
+def _receipt_detail(r: dict[str, Any]) -> dict[str, Any]:
+    return {"outcome": r["outcome"], "amazon_order_no": r["amazon_order_no"], "error_code": r["error_code"],
+            "error_detail": r["error_detail"], "amounts": {k: _m(v) for k, v in r["amounts"].items()},
+            "card_last4": r["card_last4"], "delivery_text": r["delivery_text"], "delivery_date": r["delivery_date"],
+            "delivery_days": r["delivery_days"]}
+
+
 def _late_receipt(conn, dev: dict[str, Any], att: dict[str, Any], order: dict[str, Any],
                   r: dict[str, Any]) -> dict[str, Any]:
     """输入：已是「结果待核实」（unknown）的尝试、它的任务、迟到的规范化结果 → 输出：
@@ -1376,13 +1514,7 @@ def _late_receipt(conn, dev: dict[str, Any], att: dict[str, Any], order: dict[st
     what = _OUTCOME_ZH.get(r["outcome"], r["outcome"])
     out = {"attempt_status": "unknown", "order_status": order["status"], "late_receipt": True,
            "message": f"该采购尝试已登记为「结果待核实」，迟到的结果（{what}）已记录，请在控制台核实"}
-    seen = conn.execute(
-        "SELECT detail FROM procure.events WHERE workspace_id = %s AND entity = 'attempt' AND entity_id = %s "
-        "AND kind = 'attempt.late_result' ORDER BY id DESC LIMIT 1",
-        (ws, att["id"]),
-    ).fetchone()
-    if seen is not None and all((seen["detail"] or {}).get(k) == r[k]
-                                for k in ("outcome", "amazon_order_no", "error_code")):
+    if _late_seen(conn, att, r):
         return out          # 插件补交同一份回执：不重复记录
     cols: dict[str, Any] = {}
     if r["amazon_order_no"] and not att["amazon_order_no"]:
@@ -1409,13 +1541,82 @@ def _late_receipt(conn, dev: dict[str, Any], att: dict[str, Any], order: dict[st
         order = orders.transition(conn, order, "result_unknown", reason=reason, actor_kind=ak, actor_id=aid,
                                   updates={"needs_attention": True, "attention_note": attention})
     events.record(conn, ws, "attempt", att["id"], "attempt.late_result", actor_kind=ak, actor_id=aid,
-                  order_id=order["id"],
-                  detail={"outcome": r["outcome"], "amazon_order_no": r["amazon_order_no"],
-                          "error_code": r["error_code"], "error_detail": r["error_detail"],
-                          "amounts": {k: _m(v) for k, v in r["amounts"].items()}, "card_last4": r["card_last4"],
-                          "delivery_text": r["delivery_text"], "delivery_date": r["delivery_date"],
-                          "delivery_days": r["delivery_days"], "reason": note})
+                  order_id=order["id"], detail={**_receipt_detail(r), "reason": note})
     return {**out, "order_status": order["status"]}
+
+
+_RESOLUTION_ZH = {"ordered": "已下单", "not_ordered": "未下单"}
+
+
+def _late_receipt_after_resolution(conn, dev: dict[str, Any], att: dict[str, Any], order: dict[str, Any],
+                                   r: dict[str, Any]) -> dict[str, Any]:
+    """输入：已由控制台核实（resolution 为 ordered / not_ordered）的尝试、它的任务（已锁）、与登记结局不同的迟到
+    规范化结果 → 输出：{attempt_status, order_status, late_receipt: True, message}（插件路由回 409
+    late_receipt_recorded，插件不再补交）。
+
+    **不改**尝试的状态、核实结论与金额，不恢复账号。完整回执写 'attempt.late_result' 事件（另记 resolution、
+    contradicts）；同一份回执重复送达不重复记录。回执与核实结论矛盾（核实未下单却送来带亚马逊订单号的成功、
+    核实已下单却送来另一个单号的成功）→ 任务置 needs_attention 并补一句提醒；非模拟尝试还按来源暂停的方式挡住
+    重新领取：任务在开始前 / 异常 → 写冲突（种类 external_order_no，incoming 为回执里的单号，任务按派生规则转
+    待核实并解除分配），任务正被另一笔尚未登记提交的尝试执行 → 冲突写在任务上（下一次进度 SOURCE_HOLD）。
+    模拟尝试只提醒（模拟单号不能按外部单号登记）。与核实结论一致的回执只记录。
+    """
+    ws = att["workspace_id"]
+    ak, aid = _actor_of(dev)
+    res = att["resolution"]
+    no = r["amazon_order_no"]
+    contradicts = bool(r["outcome"] == "succeeded" and no and (
+        res == "not_ordered"
+        or (res == "ordered" and _canon("amazon_order_no", no) != _canon("amazon_order_no", att["amazon_order_no"]))))
+    what = _OUTCOME_ZH.get(r["outcome"], r["outcome"])
+    res_zh = _RESOLUTION_ZH.get(res, res)
+    message = f"该采购尝试已人工核实为「{res_zh}」，迟到的结果（{what}）已记录"
+    message += "，与核实结论矛盾，请在控制台核实是否重复下单" if contradicts else "，不改变核实结论"
+    out = {"attempt_status": att["status"], "order_status": order["status"], "late_receipt": True, "message": message}
+    if _late_seen(conn, att, r):
+        return out          # 插件补交同一份回执：不重复记录
+    note = None
+    if contradicts:
+        if res == "not_ordered":
+            note = f"人工核实为未下单后，插件送到了成功回执（亚马逊订单号 {no}），请核实是否重复下单"
+        else:
+            note = (f"人工核实为已下单（亚马逊订单号 {att['amazon_order_no']}）后，插件送到了另一个成功回执"
+                    f"（亚马逊订单号 {no}），请核实是否重复下单")
+        order = _hold_for_late_success(conn, order, att, no, note, actor_kind=ak, actor_id=aid)
+    events.record(conn, ws, "attempt", att["id"], "attempt.late_result", actor_kind=ak, actor_id=aid,
+                  order_id=order["id"],
+                  detail={**_receipt_detail(r), "resolution": res, "contradicts": contradicts,
+                          "reason": note or f"人工核实为「{res_zh}」之后插件迟到上报的结果：{what}"})
+    return {**out, "order_status": order["status"]}
+
+
+def _hold_for_late_success(conn, order: dict[str, Any], att: dict[str, Any], no: str, note: str, *, actor_kind: str,
+                           actor_id: int | None) -> dict[str, Any]:
+    """输入：任务（已锁）、已核实的尝试、迟到成功回执里的亚马逊订单号、提醒 → 输出：任务行（见
+    _late_receipt_after_resolution：置 needs_attention；非模拟尝试另按来源暂停的方式挡住重新领取）。"""
+    upd: dict[str, Any] = {"needs_attention": True, "attention_note": _append(order.get("attention_note"), note)}
+    status = order["status"]
+    hold = False
+    if not att["simulated"]:
+        if status in PRE_EXECUTION_STATUSES or status == "exception":
+            hold = True
+        elif status == "executing" and order.get("current_attempt_id") not in (None, att["id"]):
+            cur = conn.execute("SELECT submitted_at FROM procure.purchase_attempts WHERE id = %s AND workspace_id = %s",
+                               (order["current_attempt_id"], order["workspace_id"])).fetchone()
+            hold = cur is not None and cur["submitted_at"] is None
+    if hold:
+        payload = {"kind": "external_order_no", "source_kind": None, "reason": note,
+                   "fields": {"external_amz_order_no": [order.get("external_amz_order_no"), no]},
+                   "incoming": {"external_amz_order_no": no, "external_buyer_account": None},
+                   "source": {"kind": "plugin", "attempt_id": att["id"]}, "at": clock.now()}
+        upd["conflict"] = orders._merge_conflict(order.get("conflict"), payload)
+    if status in PRE_EXECUTION_STATUSES and hold:
+        merged = {**order, **upd}
+        target = orders.derive_status(merged)
+        return orders.transition(conn, order, target, reason=orders.derived_reason(merged, target),
+                                 actor_kind=actor_kind, actor_id=actor_id, updates=upd,
+                                 event_detail={"attempt_id": att["id"], "late_receipt": True})
+    return orders.transition(conn, order, status, actor_kind=actor_kind, actor_id=actor_id, updates=upd)
 
 
 def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -> dict[str, Any]:
@@ -1432,7 +1633,9 @@ def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -
       其他（任务级、护栏拦截码、未知码）→ failed，任务 exception。
     - 已结束的尝试再次上报：结局与单号 / 错误码都相同 → 原样返回；已是「结果待核实」而本次不同（迟到的回执，
       如清扫之后才送到的成功）→ 不改状态，回执记进尝试与 'attempt.late_result' 事件，返回 late_receipt: true
-      （见 _late_receipt；插件路由回 409 但提交事务）；其他不同 → CONFLICT。
+      （见 _late_receipt；插件路由回 409 但提交事务）；已由控制台核实（ordered / not_ordered）而本次不同 → 同样
+      只记录、不改尝试，与核实结论矛盾时提醒并挡住重新领取（见 _late_receipt_after_resolution）；其他不同
+      （中止、未核实的失败）→ CONFLICT。
     - 已登记提交的在途尝试：批次租约过期（尚未清扫）也照常接收结果，回执不丢；未登记提交的要求批次有效。
     """
     dev = devices.require_active(conn, device)
@@ -1446,6 +1649,8 @@ def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -
             return {"attempt_status": att["status"], "order_status": order["status"], "duplicate": True}
         if att["status"] == "unknown":
             return _late_receipt(conn, dev, att, order, r)
+        if att["resolution"] in _RESOLUTION_ZH:
+            return _late_receipt_after_resolution(conn, dev, att, order, r)
         raise conflict(
             f"该采购尝试的结果已登记为「{ATTEMPT_STATUS_ZH.get(att['status'], att['status'])}」，与本次上报不一致",
             attempt_status=att["status"], reported=r["outcome"])

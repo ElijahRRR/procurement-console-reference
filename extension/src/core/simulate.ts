@@ -23,7 +23,7 @@ export type SimOutcome =
   | "account_captcha";
 
 export const SIM_OUTCOMES: ReadonlyArray<{ value: SimOutcome; label: string; hint: string }> = [
-  { value: "pass", label: "正常通过（默认）", hint: "护栏放行、提交登记、上报成功，单号形如 SIM-日期-尝试号" },
+  { value: "pass", label: "正常通过（默认）", hint: "护栏放行、提交登记、上报成功，单号形如 SIM-日期-尝试 ID" },
   { value: "price_over_cap", label: "结算总额超过限价", hint: "总额 = 限价 + 1 美元，服务端护栏应拦截 PRICE_OVER_CAP" },
   { value: "delivery_too_long", label: "配送时长超过上限", hint: "送达日期 = 洛杉矶今天 + 上限 + 1 天，应拦截 DELIVERY_TOO_LONG" },
   { value: "out_of_stock", label: "商品缺货", hint: "护栏之前上报失败 OUT_OF_STOCK，任务转异常" },

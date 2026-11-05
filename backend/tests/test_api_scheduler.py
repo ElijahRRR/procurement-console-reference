@@ -197,3 +197,23 @@ def test_run_sweep_passes_its_now_to_the_sweep(monkeypatch):
     scheduler.run_sweep(at)
     scheduler.run_jobs_once(at)
     assert seen == [at, at]
+
+
+def test_serve_allows_the_host_it_binds_to(monkeypatch):
+    """`cli.py serve -p host=X`：监听 X，也接受发往 X 的请求（不是只认 settings.host）；别的主机名仍 403。"""
+    import uvicorn
+    from starlette.testclient import TestClient
+
+    seen: dict = {}
+
+    def fake_run(app, **kw):
+        seen["app"], seen["kw"] = app, kw
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    scheduler.serve(host="127.0.0.2", port="8797", jobs="0")
+    assert seen["kw"]["host"] == "127.0.0.2" and seen["kw"]["port"] == 8797
+    assert not isinstance(seen["app"], str)                    # 现建的应用实例，不是 "server.app:app"
+    with TestClient(seen["app"], base_url="http://127.0.0.2:8797") as c:
+        assert c.get("/healthz").status_code == 200
+    with TestClient(seen["app"], base_url="http://evil.example") as c:
+        assert c.get("/healthz").status_code == 403

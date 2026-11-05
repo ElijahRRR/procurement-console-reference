@@ -14,7 +14,8 @@
   needs_attention），上游取消、外部 AMZ 订单号、跨来源冲突、人审拒绝、准入变化（采购方 / 采购状态）、平台订单号变化
   各有专门规则，见 ingest() 说明。「这笔任务不该再执行」的来源变化在开始前一律转「待核实」（conflict，按种类：
   fields / review / external_order_no / admission / source_key_changed）并解除分配，由 resolve_conflict 人工处理；
-  执行中未提交的写在任务的 conflict 上（插件据此中止，见 execution）。
+  执行中未提交的写在任务的 conflict 上（插件据此中止，见 execution）；已登记提交之后（结果待核实、已采购、待决定
+  重采）的记 HOLD_DEFERRED_KIND 事件，任务回到开始前时由 execution.drift_updates 转成 conflict。
 - 人工动作都写带操作者的事件；本模块的动作**不自动触发重新分配**（契约 §3.2 的触发点只有来源导入/同步后、
   人工点「重新分配」、账号配置变化、每日 00:01），回到「待分配」的任务等待下一次分配。
 """
@@ -687,6 +688,10 @@ def _append_note(existing: str | None, note: str) -> str:
     return f"{existing}；{note}"[:1000]
 
 
+#: 任务暂停不了时收到的「这笔任务不该再执行」的来源变化记成这个事件 {conflict, attempt_id, status}，
+#: 任务回到开始前时由 execution.drift_updates 按 attempt_id 取出转成 conflict（与 execution 的同名常量一致）
+HOLD_DEFERRED_KIND = "order.hold_deferred"
+
 #: 冲突合并时以「处理方式更重」的种类为准（accept 的含义跟着它走）
 _CONFLICT_RANK = {"fields": 0, "review": 1, "external_order_no": 2, "source_key_changed": 3, "admission": 4}
 
@@ -714,7 +719,8 @@ def ingest(conn, workspace_id: int, record: UpstreamRecord, source: SourceRef, *
 
     - 无平台订单号 → invalid。按（工作区, 平台订单号）找任务；同一来源记录的平台订单号变了 → conflict：
       原任务开始前 / 异常 → 转「待核实」并解除分配（冲突种类 source_key_changed，只在第一次发现时转）；
-      其他状态只置 needs_attention。不新建任务。
+      执行中未登记提交 → 冲突写在任务上（插件据此中止）；已登记提交的采购中、结果待核实、已采购、待决定重采 →
+      置 needs_attention 并推迟（HOLD_DEFERRED_KIND，回到开始前时转待核实）；其余只置 needs_attention。不新建任务。
     - 新任务：首次来源种类为主来源；主来源是飞书时第一个飞书来源为写回目标；建议采购日期取来源值（依据 source），否则
       下单北京日期 + 6 − 配送天数（依据 computed）；带可信 AMZ 订单号 → historical，直接「已采购」并建
       kind='external' 的成功尝试（单号已登记在别的任务、或格式不对 → conflict，不建尝试）。
@@ -725,18 +731,22 @@ def ingest(conn, workspace_id: int, record: UpstreamRecord, source: SourceRef, *
       * 另一种来源：执行相关字段（ASIN、数量、单价、限价、收件信息、建议采购日期）不同 → 开始前转 conflict
         （不覆盖，来源新值存进 conflict.incoming 供「接受」）；相同只追加来源关联；只能补上「未知」的人审结论。
       * 人审拒绝从不悄悄丢掉：另一种来源、或控制台已人审通过后新批次文件送来「拒绝」→ 开始前转 conflict
-        （冲突种类 review）并解除分配；执行中未登记提交 → 冲突写在任务上（插件据此中止）；其余置 needs_attention。
+        （冲突种类 review）并解除分配；执行中未登记提交 → 冲突写在任务上（插件据此中止）；其余置 needs_attention
+        （已登记提交的采购中、结果待核实、已采购、待决定重采另记 HOLD_DEFERRED_KIND 事件，回到开始前时转冲突）。
         控制台已确认通过、且同样的拒绝早已出现过的旧文件再次上传 → 不再转冲突，只在问题里说明。
       * 准入（admission 不为 None 时）：采购方已不在负责范围、或采购状态变为「已拍单 / 拿回」且没有可信单号 →
-        开始前 / 异常转 conflict（种类 admission）并解除分配；执行中未提交同上写在任务上；本系统曾采购成功的任务
-        不看采购状态（那是写回写的）。同一来源反复送来同样的值只提醒一次。
+        开始前 / 异常转 conflict（种类 admission）并解除分配；执行中未提交、以及之后的推迟同上；本系统曾**真实**采购
+        成功（非模拟、非外部单号）的任务不看采购状态（那是写回写的）。同一来源反复送来同样的值只提醒一次；
+        控制台已「保留」的准入冲突，新一批文件重传同样的取值不再暂停（只在问题里说明）。
       * 上游取消：开始前 / 异常 → cancelled 并解除分配；执行中未登记提交 → 置 upstream_cancelled（插件下次
         进度上报得到 continue=false）；执行中已登记提交 → result_unknown（「执行中收到取消」）；
         待核实 / 已采购 / 待决定重采 / 已关闭 → 只置 upstream_cancelled 与 needs_attention。
         **撤销取消只认发出取消的那条来源记录**（上次说取消、这次不说，且没有别的来源仍说取消）；
-        别的来源或新批次文件说「没取消」不会撤销取消。
-      * 外部 AMZ 订单号：开始前 / 异常 → purchased（建 external 尝试）；单号格式不对、已属别的任务 → conflict；
-        任务正在执行 / 已有不同单号 → needs_attention。
+        别的来源或新批次文件说「没取消」不会撤销取消（只由文件快照说取消时可在控制台撤销取消，见 uncancel）。
+        控制台撤销过的文件取消，同样的旧文件（同样的售后状态）再上传不再取消，只在问题里说明。
+      * 外部 AMZ 订单号：开始前 / 异常 → purchased（建 external 尝试，任务上待核实的 external_order_no 冲突随之作废）；
+        单号格式不对、已属别的任务 → conflict；任务正在执行 / 已有不同单号 → needs_attention。
+      * 同种来源直接应用的新值，让任务上同种来源冲突里这些字段的旧「来源新值」作废（见 _drop_superseded_fields）。
     - 每次都 upsert order_sources（快照、规范化记录、指纹、last_seen_at）。dry_run=True 时给出同样的结论但不写库。
     """
     order_no = (record.upstream_order_no or "").strip()
@@ -781,13 +791,20 @@ def _ingest_key_changed(conn, ws, link, order_no, source, issues, actor_kind, ac
         merged = {**old, "conflict": _merge_conflict(old["conflict"], payload)}
         status = derive_status(merged) if status in PRE else status
     changes = {"upstream_order_no": [old["upstream_order_no"], order_no]}
-    if dry_run or seen is not None:      # 定时同步反复送来时只处理一次（第一次已转待核实 / 已提醒）
+    if dry_run or seen is not None:      # 定时同步反复送来时只处理一次（第一次已转待核实 / 已提醒 / 已推迟）
         return IngestOutcome("conflict", old["id"], changes, issues, reason, status)
     events.record(conn, ws, "order", old["id"], "order.source_key_changed", actor_kind=actor_kind, actor_id=actor_id,
-                  detail={"source": src, "old": old["upstream_order_no"], "new": order_no})
-    upd: dict[str, Any] = {"needs_attention": True, "attention_note": _append_note(old["attention_note"], reason)}
-    if _holdable(old["status"]):
+                  detail={"source": src, "old": old["upstream_order_no"], "new": order_no, "link_id": link["id"]})
+    att = inflight_attempt(conn, old) if old["status"] == "executing" else None
+    exec_hold = att is not None and att["submitted_at"] is None
+    note = f"采购进行中，{reason}，插件将中止本次采购" if exec_hold else reason
+    upd: dict[str, Any] = {"needs_attention": True, "attention_note": _append_note(old["attention_note"], note)}
+    if _holdable(old["status"]) or exec_hold:
+        # 开始前 / 异常 → 待核实；执行中未登记提交 → 写在任务上（插件下次进度上报得到 continue=false，中止后转待核实）
         upd["conflict"] = _merge_conflict(old["conflict"], payload)
+    elif _defers_holds(old["status"]):
+        kind, detail = _defer_hold_event(old, payload)
+        events.record(conn, ws, "order", old["id"], kind, actor_kind=actor_kind, actor_id=actor_id, detail=detail)
     if old["status"] in PRE:
         row = _rederive(conn, ws, old, upd, actor_kind=actor_kind, actor_id=actor_id, event_detail={"source": src})
     else:
@@ -963,11 +980,125 @@ def _other_link_cancelled(conn, order: dict[str, Any], link: dict[str, Any] | No
     ).fetchone() is not None
 
 
-def _has_success(conn, order: dict[str, Any]) -> bool:
+def _has_real_success(conn, order: dict[str, Any]) -> bool:
+    """这笔任务有本系统**真实**采购成功的尝试（非模拟、非来源带来的外部单号）→ True。只有这种成功会写回「已拍单」
+    （模拟结果永不写回，铁律 10），所以只有它能让任务不看来源的采购状态。"""
     return conn.execute(
         "SELECT 1 FROM procure.purchase_attempts WHERE purchase_order_id = %s AND workspace_id = %s "
-        "AND status = 'succeeded' LIMIT 1", (order["id"], order["workspace_id"]),
+        "AND status = 'succeeded' AND NOT simulated AND kind <> 'external' LIMIT 1",
+        (order["id"], order["workspace_id"]),
     ).fetchone() is not None
+
+
+def _admission_kept(conn, order: dict[str, Any], adm_hold: dict[str, Any]) -> bool:
+    """控制台最近一次处理准入冲突时选了「保留」，且当时冲突里的同一项（采购方 / 采购状态）就是这个取值 → True
+    （新一批文件重传同样的取值不再暂停）。"""
+    ev = conn.execute(
+        "SELECT detail FROM procure.events WHERE workspace_id = %s AND entity = 'order' AND entity_id = %s "
+        "AND kind = 'order.conflict_resolved' AND detail->>'kind' = 'admission' ORDER BY id DESC LIMIT 1",
+        (order["workspace_id"], order["id"]),
+    ).fetchone()
+    if ev is None or (ev["detail"] or {}).get("choice") != "keep":
+        return False
+    pair = ((ev["detail"] or {}).get("fields") or {}).get(adm_hold["field"])
+    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+        return False
+    kept = _clean_text(pair[1])
+    return kept is not None and kept == _clean_text(adm_hold["value"])
+
+
+def _console_uncancel_covers(conn, order: dict[str, Any], after_sale_value: Any) -> bool:
+    """控制台撤销过只由文件快照说出的取消，且当时的取消说明就是这一行的售后状态 → True（同样的旧文件再上传不再取消）。"""
+    ev = conn.execute(
+        "SELECT detail FROM procure.events WHERE workspace_id = %s AND entity = 'order' AND entity_id = %s "
+        "AND kind = 'order.uncancelled' ORDER BY id DESC LIMIT 1",
+        (order["workspace_id"], order["id"]),
+    ).fetchone()
+    d = (ev["detail"] or {}) if ev is not None else {}
+    if d.get("overrode_upstream_cancel") is not True:
+        return False
+    return _clean_text(d.get("previous_cancel_note")) == (_clean_text(after_sale_value) or "上游取消")
+
+
+def _started_attempt_id(order: dict[str, Any]) -> int | None:
+    """采购开始后的任务 → 它当前的尝试（采购中、结果待核实）或已采购的那笔尝试；被推迟的暂停按它记。"""
+    if order["status"] in ("executing", "result_unknown"):
+        return order.get("current_attempt_id")
+    return order.get("purchased_attempt_id")
+
+
+def _defer_hold_event(order: dict[str, Any], payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """任务暂停不了（已登记提交的采购中、结果待核实、已采购、待决定重采）时收到的「这笔任务不该再执行」的来源变化
+    → 要记的 HOLD_DEFERRED_KIND 事件（kind, detail）；任务回到开始前时由 execution.drift_updates 转成 conflict。"""
+    return HOLD_DEFERRED_KIND, {"conflict": payload, "attempt_id": _started_attempt_id(order),
+                                "status": order["status"]}
+
+
+def _defers_holds(status: str) -> bool:
+    """这个状态下的暂停只能推迟（之后可能回到开始前）。已取消、已关闭的任务不会再执行，不必推迟。"""
+    return status in ("executing", "result_unknown", "purchased", "repurchase_pending")
+
+
+def deferred_hold_applies(conn, order: dict[str, Any], conflict_payload: dict[str, Any]) -> bool:
+    """输入：任务、一份被推迟的暂停（HOLD_DEFERRED_KIND 事件的 conflict）→ 输出：按来源**现状**它是否仍成立。
+
+    采购期间来源又改回去了的暂停不该落到任务上：准入（采购方 / 采购状态）按那条来源关联当前的规范化记录与其准入规则
+    重新判断（本系统已真实采购成功时不看采购状态）；平台订单号变化要求那条来源关联仍挂在这笔任务上；人审拒绝要求那条
+    来源当前仍说拒绝。找不到来源关联（已解除）→ False；其他种类 → True。供 execution 落地推迟的暂停时调用。
+    """
+    kind = conflict_payload.get("kind")
+    if kind not in ("admission", "source_key_changed", "review"):
+        return True
+    ws = order["workspace_id"]
+    if kind == "source_key_changed" and conflict_payload.get("link_id") is not None:
+        link = conn.execute("SELECT * FROM procure.order_sources WHERE id = %s AND workspace_id = %s "
+                            "AND purchase_order_id = %s", (conflict_payload["link_id"], ws, order["id"])).fetchone()
+    else:
+        link = _link_by_desc(conn, ws, order["id"], conflict_payload.get("source") or {})
+    if link is None:
+        return False
+    if kind == "source_key_changed":
+        return True
+    try:
+        rec = UpstreamRecord.from_json(link["normalized"] or {})
+    except (TypeError, ValueError, KeyError, ArithmeticError):
+        return True                     # 读不出来源现状：宁可按暂停处理
+    if kind == "review":
+        return rec.review == "rejected"
+    h = normalize.admission_hold(rec, _link_admission(conn, link))
+    if h is None:
+        return False
+    return not (h["kind"] == "purchase_status" and _has_real_success(conn, order))
+
+
+def _link_by_desc(conn, ws: int, order_id: int, desc: dict[str, Any]) -> dict[str, Any] | None:
+    if desc.get("kind") == "feishu":
+        return conn.execute(
+            "SELECT * FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s "
+            "AND kind = 'feishu' AND feishu_connection_id = %s AND feishu_record_id = %s",
+            (ws, order_id, desc.get("connection_id"), desc.get("record_id"))).fetchone()
+    if desc.get("kind") == "file":
+        return conn.execute(
+            "SELECT * FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s "
+            "AND kind = 'file' AND import_batch_id = %s AND import_row_no = %s",
+            (ws, order_id, desc.get("batch_id"), desc.get("row_no"))).fetchone()
+    return None
+
+
+def _link_admission(conn, link: dict[str, Any]) -> dict[str, Any]:
+    """来源关联 → 它所属飞书连接 / 文件批次保存的准入规则（补齐缺省值）。"""
+    if link["kind"] == "feishu":
+        r = conn.execute("SELECT admission FROM procure.feishu_connections WHERE id = %s AND workspace_id = %s",
+                         (link["feishu_connection_id"], link["workspace_id"])).fetchone()
+        return normalize.effective_admission((r or {}).get("admission") or {})
+    r = conn.execute("SELECT admission FROM procure.import_batches WHERE id = %s AND workspace_id = %s",
+                     (link["import_batch_id"], link["workspace_id"])).fetchone()
+    saved = (r or {}).get("admission")
+    if saved:
+        return normalize.effective_admission(saved)
+    from services import settings_svc     # 批次没存规则（旧数据）：按工作区当前的文件准入规则
+
+    return settings_svc.file_admission(conn, link["workspace_id"])
 
 
 def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, actor_id, dry_run,
@@ -1001,7 +1132,8 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
         return submitted_cache[0]
 
     def hold(payload: dict[str, Any], note: str) -> None:
-        """一项「这笔任务不该再执行」的来源变化：开始前 / 异常 → 冲突；执行中未提交 → 写在任务上；其余 → 提醒。"""
+        """一项「这笔任务不该再执行」的来源变化：开始前 / 异常 → 冲突；执行中未提交 → 写在任务上；已登记提交的采购中、
+        结果待核实、已采购、待决定重采 → 提醒，并记 HOLD_DEFERRED_KIND 事件（回到开始前时转冲突）；已关闭 → 提醒。"""
         nonlocal conflict_payload, hold_payload, reason
         if status == "cancelled":          # 已取消的任务不会再执行，不必暂停
             return
@@ -1016,10 +1148,13 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
             notes.append(f"采购进行中，{note}，插件将中止本次采购")
         else:
             notes.append(note)
+            if _defers_holds(status):
+                evs.append(_defer_hold_event(order, payload))
 
     cand = _candidate_fields(order, inc, prv)
     review_upd, review_reject, review_note = _review_change(conn, order, link, inc, prv, same_kind, source.kind)
     mutable = status in PRE or status in ("exception", "cancelled")
+    base_conflict = order["conflict"]       # 任务上已有的冲突（同种来源的新值直接应用后，冲突里过期的字段去掉）
 
     # ① 字段变化
     if same_kind:
@@ -1034,6 +1169,10 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
                 changes[f] = [order[f], v]
         if mutable:
             upd.update(field_upd)
+            # 这次来源「说到」的执行相关字段：同一关联里变了的；新关联（如新一批文件）里有值的
+            touched = set(field_upd) | ({f for f in EXECUTION_FIELDS if not _same(inc.get(f), prv.get(f))}
+                                        if prv is not None else {f for f in EXECUTION_FIELDS if inc.get(f) is not None})
+            base_conflict = _drop_superseded_fields(base_conflict, touched, source.kind)
             if any(f in changes for f in field_upd):
                 overridden = [f for f in ("asin", "quantity", "price_cap")
                               if f in changes and order.get(f"override_{f}") is not None]
@@ -1105,9 +1244,13 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
     if adm_hold is not None:
         prev_hold = normalize.admission_hold(prev, admission) if prev is not None else None
         fresh = prev_hold is None or prev_hold["reason"] != adm_hold["reason"]
-        own_status = adm_hold["kind"] == "purchase_status" and (
-            status in ("purchased", "repurchase_pending", "closed") or _has_success(conn, order))
-        if fresh and not own_status:
+        # 只有本系统真实采购成功（非模拟、非外部单号）的任务才不看采购状态：那是写回写的「已拍单」
+        own_status = adm_hold["kind"] == "purchase_status" and (status == "closed" or _has_real_success(conn, order))
+        kept = fresh and not own_status and prv is None and _admission_kept(conn, order, adm_hold)
+        if kept:
+            # 新一批文件（新关联）重传控制台已「保留」的同样取值：不再暂停，只在问题里说明
+            issues = issues + [f"{who}来源的{adm_hold['reason']}，控制台已保留，未暂停"]
+        elif fresh and not own_status:
             r = f"{who}来源的{adm_hold['reason']}，已暂停采购，需人工核实"
             changes[adm_hold["field"]] = [None, adm_hold["value"]]
             evs.append(("order.admission_hold", {"source": src, "reason": adm_hold["reason"], "status": status}))
@@ -1120,6 +1263,12 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
     cancel = rec_cancel and not order["upstream_cancelled"] and (prv is None or not prv["upstream_cancelled"])
     uncancel = (order["upstream_cancelled"] and not rec_cancel and prv is not None and prv["upstream_cancelled"]
                 and not _other_link_cancelled(conn, order, link))
+    if cancel and source.kind == "file" and prv is None and _console_uncancel_covers(conn, order,
+                                                                                     record.after_sale_value):
+        # 控制台已撤销过同样的文件取消（旧文件再上传）：不再取消，只在问题里说明
+        cancel = False
+        issues = issues + [f"文件来源的售后状态为「{_clean_text(record.after_sale_value) or '上游取消'}」，"
+                           "控制台已撤销取消，未再取消"]
     if cancel:
         cancel_note = _clean_text(record.after_sale_value) or "上游取消"
         upd.update(upstream_cancelled=True, upstream_cancel_note=cancel_note, upstream_cancelled_at=now)
@@ -1194,10 +1343,18 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
                                                              "status": status}))
 
     # ④ 最终状态
+    if (ext_apply and base_conflict and base_conflict.get("kind") == "external_order_no"
+            and conflict_payload is None and hold_payload is None):
+        # 可信的外部单号已登记：待核实的「外部单号」冲突（领取后来源出现的同一单号、或之前格式不对 / 重复的单号）作废
+        evs.append(("order.conflict_superseded", {"old_conflict": base_conflict, "amazon_order_no": ext_apply,
+                                                  "source": src}))
+        base_conflict = None
     if conflict_payload is not None:
-        upd["conflict"] = _merge_conflict(order["conflict"], conflict_payload)
+        upd["conflict"] = _merge_conflict(base_conflict, conflict_payload)
     elif hold_payload is not None:
-        upd["conflict"] = _merge_conflict(order["conflict"], hold_payload)
+        upd["conflict"] = _merge_conflict(base_conflict, hold_payload)
+    elif base_conflict != order["conflict"]:
+        upd["conflict"] = base_conflict
     merged = {**order, **upd}
     if ext_apply:
         merged["assigned_account_id"] = None
@@ -1261,6 +1418,31 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
         row = _update(conn, ws, order["id"], upd) if upd else order
     _upsert_link(conn, ws, order["id"], link, record, source, order["primary_source_kind"])
     return IngestOutcome(verdict, order["id"], _j(changes), issues, reason, row["status"])
+
+
+def _drop_superseded_fields(c: dict[str, Any] | None, touched: set[str], source_kind: str) -> dict[str, Any] | None:
+    """输入：任务上的冲突、同种来源这次送来新值（已直接写进原值，或改回了任务现值）的字段、来源种类 →
+    输出：去掉过期字段后的冲突。
+
+    冲突来自同一种来源（如领取后来源改了 ASIN，插件中止后写的 fields 冲突），而这种来源现在又送来了这些字段的新值：
+    任务已按同种来源的规则持有来源最新的值，冲突里这些字段的旧「来源新值」作废，免得「接受」把更旧的值写回去。
+    建议采购日期连同依据、下单时间、配送天数一起去掉。fields 冲突的字段全去掉 → None（任务按派生规则离开待核实）。别的种类的冲突只去掉
+    字段，冲突本身保留。
+    """
+    if not c or c.get("source_kind") != source_kind:
+        return c
+    incoming = dict(c.get("incoming") or {})
+    drop = {f for f in touched if f in (*EXECUTION_FIELDS, "order_time", "ship_days") and f in incoming}
+    if not drop:
+        return c
+    if "suggested_purchase_date" in drop:
+        # 领取后来源变化写的日期冲突一并带着下单时间 / 配送天数（「接受」时写回），日期作废时它们也作废
+        drop |= {"suggested_date_basis", "order_time", "ship_days"} & (set(incoming) | set(c.get("fields") or {}))
+    fields = {k: v for k, v in (c.get("fields") or {}).items() if k not in drop}
+    incoming = {k: v for k, v in incoming.items() if k not in drop}
+    if c.get("kind") == "fields" and not fields:
+        return None
+    return {**c, "fields": fields, "incoming": incoming}
 
 
 def _purchased_no(conn, order: dict[str, Any]) -> str | None:
@@ -1399,8 +1581,12 @@ def list_orders(conn, workspace_id: int, *, view: str = "all", q: str | None = N
 
 
 def allowed_actions(row: dict[str, Any], sources: list[dict[str, Any]] | None = None) -> list[str]:
-    """输入：任务行、它的来源关联（可选，kind / is_writeback_target）→ 输出：当前可做的人工动作
-    （契约 §10 allowed_actions，前端据此显示按钮）。"""
+    """输入：任务行、它的来源关联（可选，kind / is_writeback_target / upstream_cancelled）→ 输出：当前可做的人工动作
+    （契约 §10 allowed_actions，前端据此显示按钮）。
+
+    撤销取消：给了来源关联时，没有飞书来源仍说取消就可以（只由文件快照说取消的也可以，见 uncancel）；没给来源关联时
+    只看任务上的上游取消标记。
+    """
     s = row["status"]
     acts: list[str] = []
     if s == "pending_review":
@@ -1415,8 +1601,13 @@ def allowed_actions(row: dict[str, Any], sources: list[dict[str, Any]] | None = 
         acts.append("resume")
     if s in PRE or s == "exception":
         acts.append("cancel")
-    if s == "cancelled" and not row.get("upstream_cancelled"):
-        acts.append("uncancel")
+    if s == "cancelled":
+        if sources is None:
+            can_uncancel = not row.get("upstream_cancelled")
+        else:
+            can_uncancel = not any(x.get("kind") == "feishu" and x.get("upstream_cancelled") for x in sources)
+        if can_uncancel:
+            acts.append("uncancel")
     if s == "result_unknown":
         acts.append("resolve_unknown")
     if s == "purchased":
@@ -1496,6 +1687,7 @@ def get_detail(conn, workspace_id: int, order_id: int) -> dict[str, Any]:
         "id": s["id"], "kind": s["kind"], "connection_id": s["feishu_connection_id"],
         "connection_name": s["connection_name"], "record_id": s["feishu_record_id"], "batch_id": s["import_batch_id"],
         "row_no": s["import_row_no"], "filename": s["filename"], "is_writeback_target": s["is_writeback_target"],
+        "upstream_cancelled": (s["normalized"] or {}).get("upstream_cancelled") is True,
         "first_seen_at": _iso(s["first_seen_at"]), "last_seen_at": _iso(s["last_seen_at"]), "snapshot": s["snapshot"],
     } for s in sources]
     attempts = conn.execute(
@@ -1678,8 +1870,8 @@ def set_override(conn, workspace_id: int, order_id: int, *, asin: Any = UNSET, q
             qv = quantity
             if isinstance(qv, str) and qv.strip().isdigit():
                 qv = int(qv.strip())
-            if isinstance(qv, bool) or not isinstance(qv, int) or qv <= 0 or qv > 999:
-                raise validation("数量应为 1 到 999 的整数", field="quantity")
+            if isinstance(qv, bool) or not isinstance(qv, int) or qv <= 0 or qv > normalize.QUANTITY_MAX:
+                raise validation(f"数量应为 1 到 {normalize.QUANTITY_MAX} 的整数", field="quantity")
             upd["override_quantity"] = qv
     if price_cap is not UNSET:
         if price_cap is None or (isinstance(price_cap, str) and not price_cap.strip()):
@@ -1738,17 +1930,39 @@ def cancel(conn, workspace_id: int, order_id: int, note: str | None = None,
     return get_detail(conn, workspace_id, order_id)
 
 
+def _cancelled_links(conn, order: dict[str, Any]) -> list[dict[str, Any]]:
+    """这笔任务当前说「上游取消」的来源关联 [{id, kind}]。"""
+    return conn.execute(
+        "SELECT id, kind FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s "
+        "AND normalized->>'upstream_cancelled' = 'true' ORDER BY id",
+        (order["workspace_id"], order["id"]),
+    ).fetchall()
+
+
 def uncancel(conn, workspace_id: int, order_id: int, note: str | None = None,
              actor_user_id: int | None = None) -> dict[str, Any]:
-    """输入：工作区、任务、备注、操作人 → 输出：任务详情（已取消 → 派生状态；上游仍为取消时拒绝）。"""
+    """输入：工作区、任务、备注、操作人 → 输出：任务详情（已取消 → 派生状态）。
+
+    飞书来源仍说取消 → VALIDATION（飞书是活的来源，取消要靠飞书改回来）。上游取消只由文件快照说出（文件只是某一刻的
+    快照，新批次说「正常」也不会自动撤销）、或已没有来源说取消 → 允许：清掉上游取消标记，'order.uncancelled' 事件
+    记 {note, overrode_upstream_cancel: true, file_link_ids, previous_cancel_note}；之后同样的旧文件再上传不再取消。
+    """
     order = get_row(conn, workspace_id, order_id, for_update=True)
     if order["status"] != "cancelled":
         raise _invalid_for(order, "撤销取消")
-    if order["upstream_cancelled"]:
-        raise validation("上游仍为取消状态，不能撤销取消")
+    links = _cancelled_links(conn, order)
+    if any(lk["kind"] == "feishu" for lk in links):
+        raise validation("飞书来源仍为取消状态，不能撤销取消")
+    note = _note(note)
     ak, aid = _actor(actor_user_id)
-    _record_action(conn, workspace_id, order_id, "order.uncancelled", actor_user_id, {"note": _note(note)})
-    _rederive(conn, workspace_id, order, {}, actor_kind=ak, actor_id=aid, event_detail={"action": "uncancel"})
+    detail: dict[str, Any] = {"note": note}
+    upd: dict[str, Any] = {}
+    if order["upstream_cancelled"]:
+        detail.update(overrode_upstream_cancel=True, file_link_ids=[lk["id"] for lk in links],
+                      previous_cancel_note=order["upstream_cancel_note"])
+        upd.update(upstream_cancelled=False, upstream_cancel_note=None, upstream_cancelled_at=None)
+    _record_action(conn, workspace_id, order_id, "order.uncancelled", actor_user_id, detail)
+    _rederive(conn, workspace_id, order, upd, actor_kind=ak, actor_id=aid, event_detail={"action": "uncancel"})
     return get_detail(conn, workspace_id, order_id)
 
 
@@ -1863,9 +2077,10 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
     """输入：工作区、任务、approve / decline、备注、操作人 → 输出：任务详情。
 
     approve：解除原分配、清掉外部单号标记，按派生规则回到待分配等（下一次尝试的种类为 'repurchase'，
-    由 execution 领取时判定）；已采购期间被挡住的来源变化（相对成功尝试领取时的来源基线）一并落到任务上
-    （execution.drift_updates：人审撤回 → 待确认，外部 AMZ 订单号 / 执行相关字段变化 → 待核实；外部单号尝试、
-    没有基线的尝试不处理）。decline：→ closed。
+    由 execution 领取时判定）；已采购期间被挡住的来源变化（相对成功尝试领取时的来源基线）与被推迟的暂停
+    （HOLD_DEFERRED_KIND）一并落到任务上（execution.drift_updates：人审撤回 → 待确认，外部 AMZ 订单号 / 执行相关
+    字段变化、准入变化、平台订单号变化 → 待核实）。待核实的外部单号冲突若正是本任务已登记（刚被亚马逊取消）的单号，
+    先作废（记 'order.conflict_superseded'）。decline：→ closed。
     """
     if decision not in ("approve", "decline"):
         raise validation("重采决定只能是 approve 或 decline", field="decision")
@@ -1877,6 +2092,16 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
     _record_action(conn, workspace_id, order_id, "order.repurchase_decided", actor_user_id,
                    {"decision": decision, "note": note})
     if decision == "approve":
+        base: dict[str, Any] = {**_CLEAR_ASSIGNMENT, "external_amz_order_no": None, "page_load_retries": 0,
+                                "current_attempt_id": None}
+        c = order["conflict"]
+        if (c and c.get("kind") == "external_order_no"
+                and (c.get("incoming") or {}).get("external_amz_order_no") in _known_amazon_nos(conn, order)):
+            # 待核实的单号正是亚马逊刚取消的这一单：同意重采后不再拿它当「外部单号」冲突
+            _record_action(conn, workspace_id, order_id, "order.conflict_superseded", actor_user_id,
+                           {"old_conflict": c, "reason": "亚马逊已取消该单号，同意重采"})
+            base["conflict"] = None
+            order = {**order, "conflict": None}
         extra: dict[str, Any] = {}
         if order["purchased_attempt_id"] is not None:
             att = conn.execute("SELECT * FROM procure.purchase_attempts WHERE id = %s AND workspace_id = %s",
@@ -1885,9 +2110,7 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
                 from services import execution      # 延迟导入：execution 在模块级导入本模块
 
                 extra = execution.drift_updates(conn, order, att, actor_kind=ak, actor_id=aid) or {}
-        _rederive(conn, workspace_id, order,
-                  {**_CLEAR_ASSIGNMENT, "external_amz_order_no": None, "page_load_retries": 0,
-                   "current_attempt_id": None, **extra},
+        _rederive(conn, workspace_id, order, {**base, **extra},
                   actor_kind=ak, actor_id=aid, event_detail={"action": "repurchase", "decision": decision})
     else:
         transition(conn, order, "closed", reason=f"人工决定不重采：{note}" if note else "人工决定不重采",
@@ -1909,13 +2132,34 @@ def _from_j(f: str, v: Any) -> Any:
     return v
 
 
+def _stale_incoming(order: dict[str, Any], c: dict[str, Any]) -> set[str]:
+    """同种来源（主来源）写的冲突里，任务原值在冲突之后又被这种来源改过的执行相关字段（「接受」不再写回冲突里更旧的
+    来源值）。建议采购日期连同依据一起跳过。另一种来源的冲突 → 空集合。"""
+    if c.get("source_kind") != order.get("primary_source_kind"):
+        return set()
+    out: set[str] = set()
+    for f, pair in (c.get("fields") or {}).items():
+        if f not in EXECUTION_FIELDS or not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            then = _from_j(f, pair[0])
+        except (TypeError, ValueError):
+            continue
+        if not _same(then, order.get(f)):
+            out.add(f)
+    if "suggested_purchase_date" in out:
+        out.add("suggested_date_basis")
+    return out
+
+
 def resolve_conflict(conn, workspace_id: int, order_id: int, choice: str, note: str | None = None,
                      actor_user_id: int | None = None) -> dict[str, Any]:
     """输入：工作区、任务、keep / accept、备注、操作人 → 输出：任务详情。
 
     keep：保留任务现值，清除冲突（人审冲突时记为控制台确认通过）；accept：按冲突种类接受来源：
-    fields / review → 把 conflict.incoming 写进原值；external_order_no → 登记为已采购（单号仍属别的任务或格式不对 →
-    VALIDATION）；admission（采购方 / 采购状态已不归本系统）→ 取消任务；source_key_changed（来源记录改成了别的
+    fields / review → 把 conflict.incoming 写进原值（主来源写的冲突里、任务原值在冲突之后已被来源改过的字段跳过，
+    不把更旧的来源值写回去）；external_order_no → 登记为已采购（单号仍属别的任务、已登记在本任务的成功尝试、或格式
+    不对 → VALIDATION）；admission（采购方 / 采购状态已不归本系统）→ 取消任务；source_key_changed（来源记录改成了别的
     平台订单号）→ 取消原任务并解除那条来源关联（下次读取按新订单号接收）。之后按派生规则重新校验。
     """
     if choice not in ("keep", "accept"):
@@ -1953,16 +2197,22 @@ def resolve_conflict(conn, workspace_id: int, order_id: int, choice: str, note: 
             dup = _amazon_no_owner(conn, workspace_id, no, order_id) if no else None
             if dup:
                 raise validation(f"AMZ 订单号 {no} 仍登记在任务 {dup['upstream_order_no']}，不能接受")
+            own = _amazon_no_taken(conn, workspace_id, no, -1) if no else None
+            if own is not None:          # 只剩本任务自己的成功尝试（如亚马逊取消后同意重采）：不能再登记一次
+                raise validation(f"AMZ 订单号 {no} 已登记在本任务，不能再次登记为已采购；请选择保留当前")
             if no:
                 aid_ext = _insert_external_attempt(conn, workspace_id, order_id, no,
                                                    incoming.get("external_buyer_account"), c.get("source") or {})
                 upd.update(external_amz_order_no=no, purchased_attempt_id=aid_ext)
                 applied["external_amz_order_no"] = no
         else:
+            stale = _stale_incoming(order, c)
             for f, v in incoming.items():
-                if f in ORDER_COLUMNS and f not in ("conflict",):
+                if f in ORDER_COLUMNS and f not in ("conflict",) and f not in stale:
                     upd[f] = _from_j(f, v)
                     applied[f] = v
+            if stale:
+                applied["skipped_stale"] = sorted(stale)
             if "order_time" in upd:
                 upd["order_date_bj"] = clock.bj_date(upd["order_time"]) if upd["order_time"] else None
             if "review_status" in upd:

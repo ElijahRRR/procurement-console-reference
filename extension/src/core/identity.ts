@@ -105,6 +105,8 @@ export function isOrderHistoryPath(pathname: string | null | undefined): boolean
 //     较早加载的页面的读数永远不能覆盖较新加载的页面的读数；
 //   · 标签页关掉或离开那一页之后，它的读数不再代表一张开着的页面，但如果它是本浏览器**最新加载**的一份，
 //     仍然留作证据（例如：新标签页里登录了另一个买家号又关掉，旧标签页还显示绑定账号 —— 不能因此算一致）；
+//   · 「已登录、但没读到买家号 ID」的读数是弱证据：它不制造分歧，也**不取代、不作废**读到 ID 或显示未登录的
+//     读数（强证据）—— 同一个标签页跳到一张读不出 ID 的新页面、或开了一张这样的新标签页，之前那份强证据照样留着；
 //   · 读数之间不一致时，**绝不报「是绑定账号」**：报加载最新、且不是绑定账号的那一份，
 //     服务端据此判为「身份不一致」或「未登录」，拒绝领取；刷新或关掉较早打开的标签页后分歧消除。
 
@@ -124,7 +126,8 @@ export interface IdentityObservation {
 export interface IdentityStore {
   /** 开着、而且还停在读数那一页上的标签页：tab_id → 最近一份读数。 */
   live: Record<string, IdentityObservation>;
-  /** 已关闭或已离开那一页的标签页里，加载时刻最新的一份（只在比所有开着的都新时才参与对账）。 */
+  /** 已关闭或已离开那一页的读数里留作证据的一份：有强证据时是加载最新的那份强证据，否则是加载最新的一份
+   *  （只在比所有开着的强证据都新时才参与对账）。 */
   newest_gone: IdentityObservation | null;
 }
 
@@ -161,34 +164,56 @@ function isObservation(v: unknown): v is IdentityObservation {
   return typeof o.tab_id === "number" && typeof o.signed_in === "boolean" && typeof o.loaded_at === "number" && typeof o.read_at === "number";
 }
 
-/** 输入：仓库 → 输出：去掉「比某个开着的页面还旧」的已关闭读数后的仓库。 */
+/** 输入：一份读数 → 输出：是不是强证据（显示未登录，或已登录且读到了买家号 ID）。
+ *  「已登录、但没读到 ID」是弱证据：不知道登着谁，不能拿来否定一份知道的。 */
+function isStrong(o: { signed_in: boolean; customer_id: string | null }): boolean {
+  return !o.signed_in || !!o.customer_id;
+}
+
+/** 输入：已留作证据的已关闭读数、又一份退出「开着的」读数 → 输出：留哪一份。
+ *  弱证据绝不顶替强证据（不管谁加载得晚）；强弱相同时留加载时刻较新的。 */
+function keepEvidence(g: IdentityObservation | null, prev: IdentityObservation): IdentityObservation {
+  if (!g) return { ...prev };
+  const gs = isStrong(g);
+  if (gs !== isStrong(prev)) return gs ? g : { ...prev };
+  return prev.loaded_at > g.loaded_at ? { ...prev } : g;
+}
+
+/** 输入：仓库 → 输出：去掉「已被某个开着的、不比它旧的页面取代」的已关闭读数后的仓库。
+ *  强证据只能被强证据取代；弱证据被任何不比它旧的开着的读数取代。 */
 function prune(store: IdentityStore): IdentityStore {
   const g = store.newest_gone;
   if (!g) return store;
-  const superseded = Object.values(store.live).some((o) => o.loaded_at >= g.loaded_at);
+  const gs = isStrong(g);
+  const superseded = Object.values(store.live).some((o) => o.loaded_at >= g.loaded_at && (!gs || isStrong(o)));
   return superseded ? { ...store, newest_gone: null } : store;
 }
 
-/** 输入：仓库、一份新读数 → 输出：新仓库。同一标签页里，较早加载的页面送来的读数不能覆盖较新的
- *  （例如页面刷新后，旧页面迟到的一条消息）；同一页的重读只更新读数与 read_at。 */
+/** 输入：仓库、一份新读数 → 输出：新仓库。
+ *  · 同一页的重读（加载时刻相同）更新读数与 read_at；只是重读时没读到 ID 的话，之前读到的那份留作证据；
+ *  · 同一标签页来了新加载的页面：上一页的读数先按「已离开那一页」留作证据（弱证据不顶替强证据），再记新的；
+ *  · 较早加载的页面送来的读数（例如页面刷新后，旧页面迟到的一条消息）不覆盖这个标签页现在的读数，
+ *    那一页已经离开了，按已离开的页面留作证据（被不比它旧的强证据取代时随即作废）。 */
 export function observeIdentity(store: IdentityStore, obs: IdentityObservation): IdentityStore {
   const key = String(obs.tab_id);
   const prev = store.live[key];
-  if (prev && obs.loaded_at < prev.loaded_at) return store;
-  return prune({ live: { ...store.live, [key]: { ...obs } }, newest_gone: store.newest_gone });
+  if (prev && obs.loaded_at < prev.loaded_at) {
+    return prune({ live: store.live, newest_gone: keepEvidence(store.newest_gone, obs) });
+  }
+  const replaced = !!prev && (obs.loaded_at > prev.loaded_at || (isStrong(prev) && !isStrong(obs)));
+  const newest_gone = replaced ? keepEvidence(store.newest_gone, prev) : store.newest_gone;
+  return prune({ live: { ...store.live, [key]: { ...obs } }, newest_gone });
 }
 
-/** 输入：仓库、关闭或离开了页面的标签页 → 输出：新仓库。它的读数移出「开着的」；
- *  若它比已有的已关闭读数都新，留作最新证据。 */
+/** 输入：仓库、关闭或离开了页面的标签页 → 输出：新仓库。它的读数移出「开着的」，
+ *  按 keepEvidence 决定是否顶替已有的已关闭读数留作证据。 */
 export function retireIdentityTab(store: IdentityStore, tabId: number): IdentityStore {
   const key = String(tabId);
   const prev = store.live[key];
   if (!prev) return store;
   const live = { ...store.live };
   delete live[key];
-  const g = store.newest_gone;
-  const newest_gone = !g || prev.loaded_at > g.loaded_at ? prev : g;
-  return prune({ live, newest_gone });
+  return prune({ live, newest_gone: keepEvidence(store.newest_gone, prev) });
 }
 
 type ReadingKind = "out" | "in?" | `in:${string}`;
@@ -200,16 +225,19 @@ function kindOf(o: { signed_in: boolean; customer_id: string | null }): ReadingK
 
 /** 输入：仓库、绑定账号的买家号 ID（不知道为 null）、当前时刻 → 输出：要上报的身份；一份读数都没有为 null。
  *
- *  1. 候选 = 所有开着的页面的读数 + 比它们都新的那一份已关闭页面的读数，按加载时刻从新到旧；
+ *  1. 候选 = 所有开着的页面的读数 + 留作证据的那一份已关闭页面的读数（比所有开着的强证据都新时），
+ *     按加载时刻从新到旧；
  *  2. 「已登录、但没读到买家号 ID」的读数是弱证据：只要有读到 ID 的已登录读数，它不制造分歧；
+ *     它也不取代、不作废读到 ID 或显示未登录的读数（见 observeIdentity / retireIdentityTab）；
  *  3. 候选一致 → 报加载最新的那一份（有 ID 的优先），新鲜度取候选里最近的一次读取；
  *  4. 不一致 → 报加载最新、且不是「已登录绑定账号」的那一份，conflict = true，新鲜度取当前时刻
  *     （这个结论只会让服务端拒绝，不会放行）。 */
 export function reconcileIdentity(store: IdentityStore, boundCustomerId: string | null | undefined, now: number): ReconciledIdentity | null {
   const live = Object.values(store.live);
-  const newestLive = live.reduce((m, o) => Math.max(m, o.loaded_at), -Infinity);
+  // 只和开着的**强证据**比：一张读不出 ID 的新页面不能让已关闭页面上的另一个买家号（或未登录）出局。
+  const newestStrongLive = live.reduce((m, o) => (isStrong(o) ? Math.max(m, o.loaded_at) : m), -Infinity);
   const cands = [...live];
-  if (store.newest_gone && store.newest_gone.loaded_at > newestLive) cands.push(store.newest_gone);
+  if (store.newest_gone && store.newest_gone.loaded_at > newestStrongLive) cands.push(store.newest_gone);
   if (cands.length === 0) return null;
   cands.sort((a, b) => b.loaded_at - a.loaded_at || b.read_at - a.read_at);
 

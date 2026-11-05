@@ -47,8 +47,9 @@ class Settings:
 def _load_dotenv(path: Path) -> None:
     """输入：.env 路径 → 输出：无（把未设置的 KEY=VALUE 写进 os.environ）。
 
-    规则：# 开头的行是注释；可写 export KEY=VALUE；值可用成对的单 / 双引号括起（引号里原样保留）；
-    不带引号的值里「空白 + #」之后是行尾注释；值为空等于没写（用缺省值）。已存在的环境变量优先。
+    规则：# 开头的行是注释；可写 export KEY=VALUE；值可用成对的单 / 双引号括起（引号里原样保留，收尾引号
+    之后可以跟「# 注释」）；不带引号的值里「空白 + #」之后是行尾注释；值为空等于没写（用缺省值）。
+    已存在的环境变量优先。
     """
     if not path.is_file():
         return
@@ -61,8 +62,10 @@ def _load_dotenv(path: Path) -> None:
         if key.startswith("export "):
             key = key[len("export "):].strip()
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        end = value.find(value[0], 1) if value[:1] in ("\"", "'") else -1
+        rest = value[end + 1:].strip() if end > 0 else None
+        if rest is not None and (not rest or rest.startswith("#")):
+            value = value[1:end]          # 引号里原样保留；收尾引号之后只允许空白或「# 注释」
         else:
             value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
         if key and value and key not in os.environ:

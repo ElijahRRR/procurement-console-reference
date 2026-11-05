@@ -10,7 +10,7 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import ElementPlus, { ElSelect } from 'element-plus'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { defineComponent, h, nextTick, type Component, type DefineComponent } from 'vue'
-import type { ImportBatch, ImportRow, OrderDetail, OrderRow } from '@/api/types'
+import type { ImportBatch, ImportRow, ImportTemplate, OrderDetail, OrderRow } from '@/api/types'
 
 const ordersApi = vi.hoisted(() => ({
   listOrders: vi.fn(),
@@ -89,6 +89,7 @@ function buttons(text: string): HTMLButtonElement[] {
 beforeEach(() => {
   vi.clearAllMocks()
   feedback.confirmAction.mockResolvedValue(true)
+  feedback.promptText.mockResolvedValue('已在亚马逊取消对应订单')
 })
 afterEach(() => {
   while (mounted.length) mounted.pop()!.unmount()
@@ -173,6 +174,95 @@ describe('文件导入：预览之后改字段对应', () => {
     buttons('放弃')[0].click()
     await flushPromises()
     expect(importsApi.discardImport).toHaveBeenCalledWith(42)
+  })
+})
+
+describe('文件导入：模板工作区共用，同名保存先确认覆盖', () => {
+  const batch: ImportBatch = {
+    id: 44, filename: 'orders-demo-tpl.xlsx', sheet_name: '采购订单', status: 'uploaded', stats: null,
+    mapping: { 平台订单号: 'upstream_order_no', 限价: 'price_cap' },
+    sheets: [{ name: '采购订单', row_count: 3, headers: ['平台订单号', '限价'] }],
+    headers: ['平台订单号', '限价'],
+    created_at: '2026-11-05T02:00:00+00:00', committed_at: null, uploaded_by_name: 'DEMO 所有者',
+  }
+  const shared: ImportTemplate = {
+    id: 5, name: '小蜜蜂导出', mapping: { 平台订单号: 'upstream_order_no' }, created_at: '2026-11-02T02:00:00+00:00', created_by_name: 'DEMO 运营',
+  }
+
+  beforeEach(() => {
+    importsApi.listImports.mockResolvedValue({ total: 1, rows: [batch] })
+    importsApi.listTemplates.mockResolvedValue({ total: 1, rows: [shared] })
+    importsApi.getImport.mockResolvedValue(batch)
+    importsApi.createTemplate.mockImplementation(async (name: string, mapping: Record<string, string | null>) => ({ ...shared, name, mapping }))
+    feishuApi.getSystemFields.mockResolvedValue({
+      source_fields: [
+        { key: 'upstream_order_no', label: '平台订单号', required: true },
+        { key: 'price_cap', label: '限价', required: false },
+      ],
+      result_fields: [],
+    })
+  })
+
+  async function openWizard() {
+    const w = await mountWith(ImportPanel)
+    buttons('继续')[0].click()
+    await flushPromises()
+    return w
+  }
+
+  it('模板选择框不叫「个人模板」，下拉里显示创建人', async () => {
+    const w = await openWizard()
+    const tplSelect = w.findAllComponents(ElSelect).find((s) => s.props('clearable') && s.props('modelValue') === null && s.props('placeholder')?.includes('模板'))!
+    expect(tplSelect.props('placeholder')).toBe('套用工作区模板')
+    expect(tplSelect.findAllComponents({ name: 'ElOption' }).map((o) => o.text())).toEqual([expect.stringContaining('DEMO 运营')])
+  })
+
+  it('名称与已有模板相同：先确认覆盖（写明创建人），取消就不保存', async () => {
+    feedback.promptText.mockResolvedValue('小蜜蜂导出')
+    feedback.confirmAction.mockResolvedValue(false)
+    await openWizard()
+    buttons('存为模板')[0].click()
+    await flushPromises()
+    expect(feedback.confirmAction).toHaveBeenCalledTimes(1)
+    const msg = (feedback.confirmAction.mock.calls[0] as unknown as [{ message: string; confirmText?: string }])[0]
+    expect(msg.message).toContain('确定要覆盖模板「小蜜蜂导出」吗？')
+    expect(msg.message).toContain('DEMO 运营')
+    expect(msg.confirmText).toBe('覆盖')
+    expect(importsApi.createTemplate).not.toHaveBeenCalled()
+  })
+
+  it('确认覆盖后才保存，提示「已覆盖模板」', async () => {
+    feedback.promptText.mockResolvedValue('小蜜蜂导出')
+    await openWizard()
+    buttons('存为模板')[0].click()
+    await flushPromises()
+    expect(feedback.confirmAction).toHaveBeenCalledTimes(1)
+    expect(importsApi.createTemplate).toHaveBeenCalledWith('小蜜蜂导出', { 平台订单号: 'upstream_order_no', 限价: 'price_cap' })
+    expect(feedback.notifySuccess).toHaveBeenCalledWith('已覆盖模板「小蜜蜂导出」')
+  })
+
+  it('别人在面板打开之后才存的同名模板也会提醒（保存前重新读模板列表）', async () => {
+    importsApi.listTemplates.mockResolvedValueOnce({ total: 0, rows: [] })
+    feedback.promptText.mockResolvedValue('小蜜蜂导出')
+    feedback.confirmAction.mockResolvedValue(false)
+    await openWizard()
+    buttons('存为模板')[0].click()
+    await flushPromises()
+    expect(feedback.confirmAction).toHaveBeenCalledTimes(1)
+    expect(importsApi.createTemplate).not.toHaveBeenCalled()
+  })
+
+  it('新名称不弹覆盖确认，直接保存；保存提示说明工作区共用、同名覆盖', async () => {
+    feedback.promptText.mockResolvedValue('DEMO 新格式')
+    await openWizard()
+    buttons('存为模板')[0].click()
+    await flushPromises()
+    const prompt = (feedback.promptText.mock.calls[0] as unknown as [{ message: string }])[0]
+    expect(prompt.message).toContain('工作区')
+    expect(prompt.message).toContain('同名')
+    expect(feedback.confirmAction).not.toHaveBeenCalled()
+    expect(importsApi.createTemplate).toHaveBeenCalledWith('DEMO 新格式', { 平台订单号: 'upstream_order_no', 限价: 'price_cap' })
+    expect(feedback.notifySuccess).toHaveBeenCalledWith('已保存模板「DEMO 新格式」')
   })
 })
 

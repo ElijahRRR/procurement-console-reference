@@ -4,16 +4,22 @@
  * 后台不能只信本地记录的「正在执行」：
  *   · 同一个标签页里来了一张**新加载**的页面（pc.hello，加载时刻晚于批次开始）→ 原来的引擎已经没了；
  *   · 执行页面对 pc.ping 没有答复、或答复说自己没在跑这个批次 → 引擎已经没了；
- *   · 引擎没了之后，批次如果还有结果回执没送到，后台接着续租、补交，送达后再结束批次；
- *     租约预算用完还送不到就放手（服务端清扫；回执留着，连上后作为迟到回执补交）；
+ *   · 引擎没了之后，批次如果还有结果回执没送到，后台接着续租、补交（按回执的退避节奏），送达后再结束批次；
+ *     两种情况放手（不再续租，服务端在租约到期后清扫；回执留着，之后补交，记为迟到回执）：
+ *       - 租约预算用完（续租一直不成功，例如连不上服务端）；
+ *       - 接管满 CUSTODY_MAX_MS（10 分钟，和引擎自己重发结果的上限一样）还送不到 —— 续租照常成功、
+ *         结果接口却一直 5xx 时，不能替一个已经没有引擎的批次无限期占着账号（别的设备 ACCOUNT_BUSY、
+ *         当天的定时也开始不了）；
  *     没有待送的回执就立刻结束批次（服务端按租约过期同样处理在途尝试，只是更快）。
  */
 
 import type { ActiveRun, PingReply } from "./messages.js";
-import { DEFAULT_LEASE_TTL_S } from "./engine.js";
+import { DEFAULT_LEASE_TTL_S, REPORT_RETRY_MAX_MS } from "./engine.js";
 
 /** 放手之前给租约留的余量。 */
 export const CUSTODY_MARGIN_MS = 10_000;
+/** 接管之后最多续租多久（从 orphaned_at 算）：和引擎自己重发结果的总时长上限一样。 */
+export const CUSTODY_MAX_MS = REPORT_RETRY_MAX_MS;
 
 /** 输入：当前批次、发来 pc.hello 的标签页、那一页的加载时刻 → 输出：原来跑批次的引擎是不是已经没了。
  *  hello 每次页面加载只发一次；加载时刻早于批次开始的 hello 来自开始批次的那一页本身（消息迟到），不算。 */
@@ -34,10 +40,17 @@ export function pingSaysAlive(reply: unknown, runId: number): boolean {
 /** 接管的批次下一步做什么：finish = 结束批次；beat = 续租、等回执送达；release = 放手交给服务端清扫。 */
 export type CustodyStep = "finish" | "beat" | "release";
 
-/** 输入：接管的批次、当前时刻、它还有几条回执没送到 → 输出：下一步。 */
+/** 输入：接管的批次、当前时刻、它还有几条回执没送到 → 输出：下一步。
+ *  有回执没送到时，租约预算用完、或接管已满 CUSTODY_MAX_MS，都放手。 */
 export function custodyStep(ar: ActiveRun, now: number, pendingReceipts: number): CustodyStep {
   if (pendingReceipts <= 0) return "finish";
+  if (custodyOverBudget(ar, now)) return "release";
   const ttlMs = (ar.lease_ttl_s ?? DEFAULT_LEASE_TTL_S) * 1000;
   if (now > ar.last_beat_ok_at + ttlMs - CUSTODY_MARGIN_MS) return "release";
   return "beat";
+}
+
+/** 输入：接管的批次、当前时刻 → 输出：接管是不是已满 CUSTODY_MAX_MS（没接管为 false）。 */
+export function custodyOverBudget(ar: ActiveRun, now: number): boolean {
+  return ar.orphaned_at !== null && now - ar.orphaned_at > CUSTODY_MAX_MS;
 }

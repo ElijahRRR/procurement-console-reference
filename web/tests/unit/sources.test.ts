@@ -4,7 +4,15 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { SystemField } from '@/api/types'
 import { fillSuggested, fromColumns, missingRequired, toColumns, toEditableMap, toFieldMap } from '@/utils/feishuMap'
-import { applyTemplate, canResume, mappingSignature, previousUploadText, resumeFromBatch } from '@/utils/importWizard'
+import {
+  applyTemplate,
+  canResume,
+  findTemplateByName,
+  mappingSignature,
+  previousUploadText,
+  resumeFromBatch,
+  templateOverwriteMessage,
+} from '@/utils/importWizard'
 import { ADMISSION_LIST_KEYS, FEISHU_ADMISSION_DEFAULTS, FILE_ADMISSION_DEFAULTS, admissionEquals, defaultsHint, fullAdmission } from '@/utils/admission'
 
 describe('飞书字段对应：一项可以对应多列（按顺序回退）', () => {
@@ -108,6 +116,26 @@ describe('文件导入向导', () => {
     expect(t).toContain('2026-11-05 10:20')
     expect(t).toContain('批次 41，已提交')
     expect(t).toContain('按平台订单号去重')
+  })
+  it('模板工作区共用：保存的名称与已有模板相同（去掉首尾空白后完全一致）时找出被覆盖的那个', () => {
+    const list = [
+      { id: 1, name: '小蜜蜂导出', created_by_name: 'DEMO 运营' },
+      { id: 2, name: 'DEMO 店铺导出', created_by_name: null },
+    ]
+    expect(findTemplateByName(list, '小蜜蜂导出')?.id).toBe(1)
+    expect(findTemplateByName(list, '  DEMO 店铺导出 ')?.id).toBe(2)
+    expect(findTemplateByName(list, 'demo 店铺导出')).toBeUndefined()
+    expect(findTemplateByName(list, '新格式')).toBeUndefined()
+    expect(findTemplateByName([], '小蜜蜂导出')).toBeUndefined()
+  })
+  it('覆盖确认写明模板名、创建人与对整个工作区生效；不知道创建人时不提', () => {
+    const t = templateOverwriteMessage({ name: '小蜜蜂导出', created_by_name: 'DEMO 运营' })
+    expect(t.startsWith('确定要覆盖模板「小蜜蜂导出」吗？')).toBe(true)
+    expect(t).toContain('它由 DEMO 运营 创建')
+    expect(t).toContain('工作区')
+    const anon = templateOverwriteMessage({ name: '小蜜蜂导出', created_by_name: null })
+    expect(anon).not.toContain('创建')
+    expect(anon).toContain('工作区')
   })
 })
 

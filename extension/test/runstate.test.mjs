@@ -3,10 +3,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { CUSTODY_MARGIN_MS, custodyStep, helloEndsRun, pingSaysAlive } from "../build/core/custody.js";
+import { CUSTODY_MARGIN_MS, CUSTODY_MAX_MS, custodyOverBudget, custodyStep, helloEndsRun, pingSaysAlive } from "../build/core/custody.js";
 import { runViewActive, startGate } from "../build/core/startgate.js";
 import { ACCOUNT_LEVEL_CODES, CANCEL_CODE_LABEL, SERVER_CODE_LABEL, abortCodeFor, cancelLabel, codeLabel, stageLabel, stopReasonLabel } from "../build/core/codes.js";
-import { beatInterval, claimWaitMs, leaseMinutes } from "../build/core/engine.js";
+import { REPORT_RETRY_MAX_MS, beatInterval, claimWaitMs, leaseMinutes } from "../build/core/engine.js";
 
 const NOW = Date.parse("2026-11-05T06:00:00Z");
 const ar = (extra = {}) => ({ run_id: 9, tab_id: 3, trigger: "manual", started_at: NOW, touched_at: NOW, lease_ttl_s: 180, last_beat_ok_at: NOW, orphaned_at: null, orphan_reason: null, ...extra });
@@ -33,6 +33,17 @@ test("接管的批次：没有待送的回执就结束；有就续租等着；�
   assert.equal(custodyStep(ar(), NOW + 180_000 - CUSTODY_MARGIN_MS + 1, 1), "release");
   assert.equal(custodyStep(ar({ lease_ttl_s: 30 }), NOW + 25_000, 1), "release", "按服务端给的有效期算");
   assert.equal(custodyStep(ar({ lease_ttl_s: null }), NOW + 100_000, 1), "beat", "不知道有效期按 180 秒");
+});
+
+test("接管的批次：续租一直成功、回执却一直送不到 —— 接管满 10 分钟（引擎重发结果的上限）就放手", () => {
+  assert.equal(CUSTODY_MAX_MS, 10 * 60_000);
+  assert.equal(CUSTODY_MAX_MS, REPORT_RETRY_MAX_MS, "和引擎自己重发结果的总时长上限一致");
+  const t = NOW + 11 * 60_000;
+  assert.equal(custodyStep(ar({ orphaned_at: NOW, last_beat_ok_at: t }), t + 1, 1), "release", "刚续租成功也放手");
+  assert.equal(custodyStep(ar({ orphaned_at: NOW, last_beat_ok_at: NOW + CUSTODY_MAX_MS }), NOW + CUSTODY_MAX_MS, 1), "beat", "正好 10 分钟还在续");
+  assert.equal(custodyStep(ar({ orphaned_at: NOW, last_beat_ok_at: t }), t + 1, 0), "finish", "回执都送到了就结束批次");
+  assert.equal(custodyOverBudget(ar({ orphaned_at: null }), NOW + 3_600_000), false, "没接管（引擎还在）不算");
+  assert.equal(custodyOverBudget(ar({ orphaned_at: NOW }), NOW + CUSTODY_MAX_MS + 1), true);
 });
 
 const snap = (extra = {}) => ({

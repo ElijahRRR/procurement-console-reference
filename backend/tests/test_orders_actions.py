@@ -252,13 +252,16 @@ def test_cancel_and_uncancel(conn, workspace):
     assert acc["id"]
 
 
-def test_uncancel_refused_while_upstream_cancelled(conn, workspace):
+def test_uncancel_refused_while_feishu_says_cancelled(conn, workspace):
+    """飞书来源仍说取消 → 拒绝撤销取消（只由文件快照说取消的可以撤销，见 test_orders_uncancel_rules）。"""
     ws, uid = workspace["id"], workspace["user_id"]
-    o = f.ingest_ready_order(conn, ws, upstream_cancelled=True, after_sale_value="已取消")
+    o = f.ingest_ready_order(conn, ws, source=f.feishu_source(conn, ws, "recUC1"), upstream_cancelled=True,
+                             after_sale_value="已取消")
     assert o["status"] == "cancelled"
     with pytest.raises(DomainError) as e:
         orders.uncancel(conn, ws, o["id"], None, uid)
-    assert e.value.code == "VALIDATION"
+    assert e.value.code == "VALIDATION" and "飞书来源仍为取消状态" in e.value.message
+    assert "uncancel" not in orders.get_detail(conn, ws, o["id"])["allowed_actions"]
 
 
 # ── 结果待核实 ────────────────────────────────────────────────────────────────

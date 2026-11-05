@@ -18,7 +18,7 @@
 
 import { PluginClient, pairFailureText, type ApiError, type ApiResult } from "../core/client.js";
 import { codeLabel, stopReasonLabel } from "../core/codes.js";
-import { custodyStep, helloEndsRun, pingSaysAlive } from "../core/custody.js";
+import { CUSTODY_MAX_MS, custodyOverBudget, custodyStep, helloEndsRun, pingSaysAlive } from "../core/custody.js";
 import { leaseMinutes } from "../core/engine.js";
 import { Serial, withTimeout } from "../core/gates.js";
 import {
@@ -692,18 +692,21 @@ async function orphanRun(ar: ActiveRun, reason: string, text: string): Promise<v
   await settleOrphan();
 }
 
-/** 接管的批次：先补交它的回执；都送到了就结束批次；还有没送到的就续租等着，租约预算用完则放手。 */
+/** 接管的批次：先补交它的回执（按退避）；都送到了就结束批次；还有没送到的就续租等着，
+ *  租约预算用完、或接管满 CUSTODY_MAX_MS 还送不到（例如结果接口一直 5xx）则放手。 */
 async function settleOrphan(): Promise<void> {
   const ar = await sget<ActiveRun>(KEYS.activeRun);
   if (!ar || ar.orphaned_at === null) return;
   await drainReceipts({ runId: ar.run_id });
-  const pending = pendingForRun(await lget<ReceiptStore>(KEYS.receipts), ar.run_id);
+  const store = await lget<ReceiptStore>(KEYS.receipts);
+  const pending = pendingForRun(store, ar.run_id);
   const client = await makeClient();
   if (!client) {
     await clearActiveRun();
     return;
   }
-  const step = custodyStep(ar, Date.now(), pending);
+  const now = Date.now();
+  const step = custodyStep(ar, now, pending);
   const minutes = leaseMinutes(ar.lease_ttl_s);
   if (step === "finish") {
     const r = await client.finishRun(ar.run_id, ar.orphan_reason ?? "engine_gone");
@@ -719,10 +722,19 @@ async function settleOrphan(): Promise<void> {
   }
   if (step === "release") {
     await clearActiveRun();
-    await log(
-      "warn",
-      `批次 #${ar.run_id} 还有 ${pending} 条结果回执一直送不到服务端：不再续租，服务端会在租约到期后处理在途尝试；回执保留，连上后补交（记为迟到回执，供人工核实）`,
-    );
+    if (custodyOverBudget(ar, now)) {
+      // 续租一直成功、结果却一直送不到（服务端 5xx）：不能替没有引擎的批次一直占着账号。
+      const lastErr = Object.values(store ?? {}).find((r) => r.run_id === ar.run_id && r.last_error)?.last_error ?? null;
+      await log(
+        "warn",
+        `批次 #${ar.run_id} 还有 ${pending} 条结果回执在 ${Math.round(CUSTODY_MAX_MS / 60_000)} 分钟内没有送到服务端${lastErr ? `（${lastErr}）` : ""}：不再续租，服务端会在租约到期（约 ${minutes} 分钟）后处理在途尝试；回执保留，之后继续补交（记为迟到回执，供人工核实）`,
+      );
+    } else {
+      await log(
+        "warn",
+        `批次 #${ar.run_id} 还有 ${pending} 条结果回执一直送不到服务端：不再续租，服务端会在租约到期后处理在途尝试；回执保留，连上后补交（记为迟到回执，供人工核实）`,
+      );
+    }
     return;
   }
   const r = await client.runHeartbeat(ar.run_id);
@@ -789,8 +801,8 @@ async function settleReply(attemptId: number, r: ApiResult<unknown>, byDrain: bo
   return verdict;
 }
 
-/** 输入：只补交某个批次的回执（不看补交时间），或全部该补交的（ignoreBackoff：后台启动、心跳成功时不等退避）
- *  → 输出：无。断网时停在第一条，下一轮再试。 */
+/** 输入：只补交某个批次的回执（接管时：还没被后台补交过的立即发 —— 发起上报的引擎已经没了；补交过的按退避），
+ *  或全部该补交的（ignoreBackoff：后台启动、心跳成功时不等退避）→ 输出：无。断网时停在第一条，下一轮再试。 */
 async function drainReceipts(opts: { runId?: number; ignoreBackoff?: boolean } = {}): Promise<void> {
   const runId = opts.runId;
   await drainGate.run(async () => {
@@ -804,7 +816,10 @@ async function drainReceipts(opts: { runId?: number; ignoreBackoff?: boolean } =
     });
     for (const rc of expired) await log("warn", `尝试 #${rc.attempt_id} 的结果回执超过 24 小时仍没送到，不再补交（请在控制台核实）`);
     const store = (await lget<ReceiptStore>(KEYS.receipts)) ?? {};
-    const due = runId === undefined ? dueReceipts(store, now, { ignoreBackoff: opts.ignoreBackoff }) : Object.values(store).filter((r) => r.run_id === runId);
+    const due =
+      runId === undefined
+        ? dueReceipts(store, now, { ignoreBackoff: opts.ignoreBackoff })
+        : Object.values(store).filter((r) => r.run_id === runId && (r.tries === 0 || r.next_at <= now));
     for (const rc of due) {
       const r = await client.result(rc.attempt_id, rc.body);
       const v = await settleReply(rc.attempt_id, r, true);
@@ -909,8 +924,12 @@ async function onRunView(m: Extract<Msg, { type: "pc.runView" }>, tabId: number 
     if (!ar || ar.tab_id !== tabId || ar.orphaned_at !== null) return;
     const pending = pendingForRun(await lget<ReceiptStore>(KEYS.receipts), ar.run_id);
     if (pending > 0) {
-      // 引擎已中断，但这个批次还有结果没送到：后台接着续租、补交，送达后结束批次。
-      await orphanRun(ar, "engine_ended", `批次 #${ar.run_id} 还有 ${pending} 条结果回执没送到：后台继续续租并补交，送达后结束批次`);
+      // 引擎已中断，但这个批次还有结果没送到：后台接着续租、补交，送达后结束批次（最多 CUSTODY_MAX_MS）。
+      await orphanRun(
+        ar,
+        "engine_ended",
+        `批次 #${ar.run_id} 还有 ${pending} 条结果回执没送到：后台继续续租并补交（最多 ${Math.round(CUSTODY_MAX_MS / 60_000)} 分钟），送达后结束批次`,
+      );
     } else {
       await clearActiveRun(); // 引擎已结束（含中断）：后台也不再补发心跳
     }

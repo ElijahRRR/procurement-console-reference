@@ -299,7 +299,11 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       return ok({ ...fx.importPreview.batch, status: 'discarded', committed_at: null })
     }
     if (path === '/import-templates' && m === 'GET') return ok(page(fx.templates, q))
-    if (path === '/import-templates' && m === 'POST') return ok({ id: 9, name: String(b.name ?? ''), mapping: b.mapping ?? {} })
+    if (path === '/import-templates' && m === 'POST') {
+      const name = String(b.name ?? '').trim()
+      const same = fx.templates.find((t) => t.name === name)
+      return ok({ id: same?.id ?? 9, name, mapping: b.mapping ?? {}, created_at: same?.created_at ?? new Date().toISOString(), created_by_name: same?.created_by_name ?? 'DEMO 所有者' })
+    }
     if ((r = /^\/import-templates\/(\d+)$/.exec(path)) && m === 'DELETE') return { status: 204, body: null }
 
     // ── 事件 ──

@@ -98,7 +98,7 @@ def heartbeat(body: HeartbeatBody | None = None, ctx: deps.Plugin = Depends(deps
 @router.post("/identity")
 def identity(body: IdentityBody, ctx: deps.Plugin = Depends(deps.plugin)):
     """输入：{signed_in, customer_id, site, page_url, ext_version?} → 输出：{identity_status}（单独上报身份；
-    契约 §5 之外的补充接口，等价于心跳捎带 identity）。"""
+    契约 §5 第 3 步；等价于心跳捎带 identity）。"""
     ident = body.model_dump(include={"signed_in", "customer_id", "site", "page_url"})
     return respond({"identity_status": devices.report_identity(ctx.conn, ctx.device, ident)})
 
@@ -171,8 +171,9 @@ def result(attempt_id: int, body: ResultBody, ctx: deps.Plugin = Depends(deps.pl
     """输入：尝试 id、结果 {outcome, amazon_order_no, amounts, …} → 输出：{attempt_status, order_status}。
 
     结果体字段：outcome、amazon_order_no、amounts、card_last4、delivery、error_code、error_detail（契约 §5 第 11 步）；
-    重复上报相同结果时另有 duplicate: true。尝试已是「结果待核实」时收到的不同结果（迟到的回执）：回执照样保存
-    （事务提交），响应为 409 CONFLICT，detail = {attempt_status, order_status, late_receipt_recorded: true}。
+    重复上报相同结果时另有 duplicate: true。尝试已是「结果待核实」、或已由控制台核实（已下单 / 未下单）时收到的
+    不同结果（迟到的回执）：回执照样保存（事务提交），响应为 409 CONFLICT，detail = {attempt_status, order_status,
+    late_receipt_recorded: true}。
     """
     out = execution.report_result(ctx.conn, ctx.device, attempt_id, body.model_dump())
     if out.get("late_receipt"):

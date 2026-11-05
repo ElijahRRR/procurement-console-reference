@@ -1099,7 +1099,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
   ]
 
   const templates: ImportTemplate[] = [
-    { id: 1, name: '小蜜蜂导出', mapping: { 平台订单号: 'upstream_order_no', 买家号1: 'external_buyer_account', 数量1: 'quantity' }, created_at: ago(60 * 24 * 3) },
+    { id: 1, name: '小蜜蜂导出', mapping: { 平台订单号: 'upstream_order_no', 买家号1: 'external_buyer_account', 数量1: 'quantity' }, created_at: ago(60 * 24 * 3), created_by_name: 'DEMO 所有者' },
   ]
 
   const headers = ['平台订单号', 'ASIN', '数量', '采购单价', '限价', '下单时间', '配送天数', '人工审核', '收货人姓名', '收货人地址', '收货人城市', '收货人州/省', '邮编', '收货人电话', '备注']

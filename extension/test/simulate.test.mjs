@@ -2,6 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { parseAttempt } from "../build/core/client.js";
 import {
@@ -9,6 +10,7 @@ import {
   buildCheckoutFacts,
   centsToStr,
   normalizeOutcome,
+  SIM_OUTCOMES,
   simOrderNo,
   toCents,
 } from "../build/core/simulate.js";
@@ -71,9 +73,16 @@ test("邮编：平铺与嵌套的收件信息都认", () => {
   assert.equal(attemptPostalCode(attempt({ postal_code: "  " })), null);
 });
 
-test("模拟单号 SIM-<北京日期>-<尝试号>：北京已过零点时用新日期", () => {
+test("模拟单号 SIM-<北京日期>-<尝试 ID>：北京已过零点时用新日期", () => {
   assert.equal(simOrderNo(7, NOW), "SIM-20261105-7");
   assert.equal(simOrderNo(8, Date.parse("2026-11-05T16:30:00Z")), "SIM-20261106-8");
+});
+
+test("模拟单号的说明写「尝试 ID」：单号末尾是尝试 ID（attempt_id），不是「第 N 次尝试」的序号", () => {
+  assert.match(SIM_OUTCOMES.find((o) => o.value === "pass").hint, /单号形如 SIM-日期-尝试 ID/);
+  for (const f of ["../src/core/simulate.ts", "../src/options/options.ts", "../README.md"]) {
+    assert.doesNotMatch(readFileSync(new URL(f, import.meta.url), "utf8"), /尝试号/, f);
+  }
 });
 
 test("toCents / centsToStr", () => {

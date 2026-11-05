@@ -8,8 +8,10 @@
   写回行的已采购真实结果补入队列（例如写回对应原来为空时登记的结果）。
   写回值按连接保存的写回列类型（feishu_connections.writeback_field_types）转换；入队不访问飞书。
   同一（任务、连接、结果版本）只有一行；新版本入队时，同一任务同一连接的旧 pending / failed 行标 superseded。
-- **发送**（flush，后台每 60 秒）：只发连接「启用 + 开启写回 + 已验收」且目标表仍是当前结果表的到期 pending 行；
-  未验收的连接只积压不发送（界面显示「回填待验证」）。同一张表每批至多 500 条（batch_update_records）。
+- **发送**（flush，后台每 60 秒）：只发连接「启用 + 开启写回 + 已验收」、目标表仍是当前结果表、且连接所在工作区
+  **仍有这个多维表格的授权**（与 feishu_connections.require_base_access 同一口径：授权给本工作区，或表格尚未授权给
+  任何工作区而本工作区是部署所有者的工作区）的到期 pending 行；未验收或没有授权的只积压不发送（不计失败次数，
+  界面显示「回填待验证」，flush 统计里分别记 waiting_verification / waiting_grant）。同一张表每批至多 500 条（batch_update_records）。
   有更新版本的行先标 superseded，**旧版本永远不会覆盖新版本**。成功 → done；失败 → tries + 1，按 1、2、5、10、30 分钟
   退避，第 10 次失败标 failed 并留 last_error。一批因某条记录出错（记录不存在、值转换失败）而整批被拒时，
   逐条重发以找出出错的那条；权限、网络等整批错误不拆分，整批退避。
@@ -193,7 +195,17 @@ def _supersede_older(conn, ws: int, order_id: int, connection_id: int, version: 
 
 # ── 发送 ─────────────────────────────────────────────────────────────────────
 
-_DUE_SQL = """
+#: 连接 c 所在工作区（w.workspace_id）此刻可以使用 c 的多维表格（与 feishu_connections.require_base_access 同一口径）
+_BASE_ACCESS_SQL = """
+(EXISTS (SELECT 1 FROM procure.feishu_base_grants g
+         WHERE g.app_token = c.app_token AND g.workspace_id = c.workspace_id)
+ OR (NOT EXISTS (SELECT 1 FROM procure.feishu_base_grants g WHERE g.app_token = c.app_token)
+     AND c.workspace_id = (SELECT min(id) FROM procure.workspaces)))
+"""
+#: 连接可以发送写回：启用 + 开启写回 + 已验收
+_SENDABLE_SQL = "(c.enabled AND c.writeback_enabled AND c.writeback_verified_at IS NOT NULL)"
+
+_DUE_SQL = f"""
 SELECT w.*, o.upstream_order_no, c.app_token, c.source_table_id, c.field_map,
        EXISTS (SELECT 1 FROM procure.writebacks n
                WHERE n.workspace_id = w.workspace_id AND n.purchase_order_id = w.purchase_order_id
@@ -202,7 +214,7 @@ FROM procure.writebacks w
 JOIN procure.feishu_connections c ON c.id = w.connection_id AND c.workspace_id = w.workspace_id
 JOIN procure.purchase_orders o ON o.id = w.purchase_order_id AND o.workspace_id = w.workspace_id
 WHERE w.status = 'pending' AND w.next_try_at <= %s
-  AND c.enabled AND c.writeback_enabled AND c.writeback_verified_at IS NOT NULL
+  AND {_SENDABLE_SQL} AND {_BASE_ACCESS_SQL}
   AND w.table_id = c.result_table_id
 ORDER BY w.connection_id, w.table_id, w.id
 LIMIT %s
@@ -221,13 +233,15 @@ def backoff_minutes(tries: int) -> int:
 def flush(conn, *, now: datetime | None = None,
           client_factory: Callable[[], Any] | None = None) -> dict[str, Any]:
     """输入：连接、当前时刻（缺省 clock.now()）、飞书客户端工厂（缺省 feishu_connections.make_client）→
-    输出：{due, sent, done, retrying, failed, superseded, waiting_verification[, error]}。
+    输出：{due, sent, done, retrying, failed, superseded, waiting_verification, waiting_grant[, error]}。
 
     跨工作区处理全部到期行（后台任务）。没有到期行时不创建飞书客户端；飞书未配置时到期行原样保留（不计失败次数）。
+    waiting_verification：连接未验收 / 停用 / 关闭写回而积压的行；waiting_grant：连接可发送、但所在工作区已没有
+    这个多维表格的授权而积压的行（授权恢复后自动补发）。
     """
     now = now or clock.now()
     stats: dict[str, Any] = {"due": 0, "sent": 0, "done": 0, "retrying": 0, "failed": 0, "superseded": 0,
-                             "waiting_verification": _count_waiting(conn)}
+                             **_count_waiting(conn)}
     rows = conn.execute(_DUE_SQL, (now, FLUSH_LIMIT)).fetchall()
     stats["due"] = len(rows)
     fresh = []
@@ -262,16 +276,19 @@ def flush(conn, *, now: datetime | None = None,
     return stats
 
 
-def _count_waiting(conn) -> int:
-    """输入：连接 → 输出：因连接未验收 / 停用 / 关闭写回而积压的 pending 行数（全部工作区）。"""
-    return int(conn.execute(
-        """
-        SELECT count(*) AS n FROM procure.writebacks w
+def _count_waiting(conn) -> dict[str, int]:
+    """输入：连接 → 输出：{waiting_verification, waiting_grant}：因连接未验收 / 停用 / 关闭写回、或因所在工作区
+    已没有多维表格授权而积压的 pending 行数（全部工作区）。"""
+    row = conn.execute(
+        f"""
+        SELECT count(*) FILTER (WHERE NOT {_SENDABLE_SQL}) AS waiting_verification,
+               count(*) FILTER (WHERE {_SENDABLE_SQL} AND NOT {_BASE_ACCESS_SQL}) AS waiting_grant
+        FROM procure.writebacks w
         JOIN procure.feishu_connections c ON c.id = w.connection_id AND c.workspace_id = w.workspace_id
         WHERE w.status = 'pending'
-          AND NOT (c.enabled AND c.writeback_enabled AND c.writeback_verified_at IS NOT NULL)
         """
-    ).fetchone()["n"])
+    ).fetchone()
+    return {"waiting_verification": int(row["waiting_verification"]), "waiting_grant": int(row["waiting_grant"])}
 
 
 def _send_group(conn, client, group: list[dict[str, Any]], now: datetime, stats: dict[str, Any]) -> None:
@@ -468,9 +485,9 @@ def counts_by_connection(conn, workspace_id: int) -> dict[int, dict[str, int]]:
 
 # ── 列表与重试 ────────────────────────────────────────────────────────────────
 
-_LIST_SELECT = """
+_LIST_SELECT = f"""
 SELECT w.*, o.upstream_order_no, c.name AS connection_name, c.result_table_id,
-       (c.enabled AND c.writeback_enabled AND c.writeback_verified_at IS NOT NULL) AS active
+       ({_SENDABLE_SQL} AND {_BASE_ACCESS_SQL}) AS active
 FROM procure.writebacks w
 JOIN procure.purchase_orders o ON o.id = w.purchase_order_id AND o.workspace_id = w.workspace_id
 JOIN procure.feishu_connections c ON c.id = w.connection_id AND c.workspace_id = w.workspace_id

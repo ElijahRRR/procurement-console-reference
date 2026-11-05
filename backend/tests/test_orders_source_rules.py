@@ -220,13 +220,15 @@ def test_purchaser_moved_away_pauses_and_accept_cancels(conn, workspace):
 
 
 def test_own_writeback_bought_status_never_pauses(conn, workspace):
-    """本系统采购成功后写回「已拍单」：已采购 / 同意重采回到队列的任务都不因此暂停。"""
+    """本系统**真实**采购成功后写回「已拍单」：已采购 / 同意重采回到队列的任务都不因此暂停（模拟成功不算，见
+    test_orders_deferred_holds）。"""
     ws, uid = workspace["id"], workspace["user_id"]
     acc = f.make_account(conn, ws)
     src = f.feishu_source(conn, ws, "recAD3")
     o = orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-AD3", purchaser="自采购DEMO"), src,
                       admission=FEISHU_ADM)
-    att = f.make_attempt(conn, ws, o.order_id, acc["id"], status="succeeded", amazon_order_no="SIM-20261031-1")
+    att = f.make_attempt(conn, ws, o.order_id, acc["id"], status="succeeded", simulated=False,
+                         amazon_order_no="111-0000000-0000301")
     f.set_status(conn, o.order_id, "purchased", purchased_attempt_id=att["id"])
     bought = f.make_record(upstream_order_no="PO-DEMO-AD3", purchaser="自采购DEMO", purchase_status_value="已拍单")
     assert orders.ingest(conn, ws, bought, src, admission=FEISHU_ADM).status == "purchased"
@@ -294,7 +296,8 @@ def test_key_change_keep_stays_executable_and_does_not_reflag(conn, workspace):
     assert _row(conn, ws, o.order_id)["status"] == "queued"
 
 
-def test_key_change_on_started_task_only_flags(conn, workspace):
+def test_key_change_on_executing_unsubmitted_task_is_written_as_hold(conn, workspace):
+    """执行中未登记提交：平台订单号变化写在任务的 conflict 上（插件据此中止），与人审 / 准入暂停一致（NEW-RB-5）。"""
     ws = workspace["id"]
     acc = f.make_account(conn, ws)
     src = f.feishu_source(conn, ws, "recKC5")
@@ -302,7 +305,24 @@ def test_key_change_on_started_task_only_flags(conn, workspace):
     _executing(conn, ws, o.order_id, acc)
     orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-KC6"), src)
     row = _row(conn, ws, o.order_id)
+    assert row["status"] == "executing" and row["needs_attention"]
+    assert row["conflict"]["kind"] == "source_key_changed" and row["conflict"]["link_id"] is not None
+    assert "插件将中止本次采购" in row["attention_note"]
+
+
+def test_key_change_on_submitted_task_only_flags_and_defers(conn, workspace):
+    """已登记提交：只置 needs_attention，另记推迟的暂停（回到开始前时转待核实）。"""
+    ws = workspace["id"]
+    acc = f.make_account(conn, ws)
+    src = f.feishu_source(conn, ws, "recKC7")
+    o = orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-KC7"), src)
+    att = _executing(conn, ws, o.order_id, acc, submitted=True)
+    orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-KC8"), src)
+    row = _row(conn, ws, o.order_id)
     assert row["status"] == "executing" and row["needs_attention"] and row["conflict"] is None
+    ev = conn.execute("SELECT detail FROM procure.events WHERE order_id = %s AND kind = %s",
+                      (o.order_id, orders.HOLD_DEFERRED_KIND)).fetchone()
+    assert ev["detail"]["attempt_id"] == att["id"] and ev["detail"]["conflict"]["kind"] == "source_key_changed"
 
 
 # ── 不可信的 AMZ 订单号（D4-04）──────────────────────────────────────────────

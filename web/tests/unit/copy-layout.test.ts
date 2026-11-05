@@ -35,6 +35,10 @@ describe('文案规则', () => {
     expect(all).not.toMatch(/>\s*问题行\s*</)
     expect(all).not.toMatch(/\/>读取记录</)
   })
+  it('导入模板是工作区共用的（v2 §4、契约 §7），不叫「个人模板」', () => {
+    const bad = sources.filter(({ text }) => text.includes('个人模板')).map(({ p }) => p)
+    expect(bad).toEqual([])
+  })
 })
 
 describe('页面标题不重复顶栏', () => {

@@ -276,3 +276,82 @@ def test_upstream_change_after_claim_stops_submit_over_http(owner, api):
                                "error_detail": pr["cancel_reason"]}, headers=h))
     assert res == {"attempt_status": "aborted", "order_status": "conflict"}
     assert view_nos(owner, "conflict") == ["PO-DEMO-X0001"]
+
+
+def _sim_attempt_guarded(plugin, h):
+    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=good_facts(att), headers=h))
+    return run, att
+
+
+def _partial_import(owner, no):
+    """只有「平台订单号」「人工审核」两列的新文件（其他列都没带）。"""
+    from tests.api_helpers import xlsx_bytes
+
+    return import_orders(owner, data=xlsx_bytes([{"平台订单号": no, "人工审核": "通过"}],
+                                                headers=["平台订单号", "人工审核"]))
+
+
+def test_late_success_after_console_resolved_not_ordered_is_recorded_and_answered_with_409(owner, api):
+    """D1-05：控制台核实未下单之后才送到的成功回执：409 CONFLICT（detail.late_receipt_recorded），回执已提交入库
+    （attempt.late_result，contradicts），任务置提醒；尝试仍是失败 / 未下单。"""
+    from datetime import timedelta
+
+    from services import clock
+    from tests.api_helpers import NOW
+    from workflows import sweep as sweep_wf
+
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    _, att = _sim_attempt_guarded(plugin, h)
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h))
+    clock.freeze(NOW + timedelta(seconds=181))
+    assert sweep_wf.run()["unknown"] == 1
+    row = find_order(owner, "PO-DEMO-X0001")
+    ok(owner.post(f"/api/v1/orders/{row['id']}/resolve-unknown", json={"outcome": "not_ordered", "note": "DEMO"}))
+    no = f"SIM-{TODAY:%Y%m%d}-{att['attempt_id']}"
+    body = err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
+                           json={"outcome": "succeeded", "amazon_order_no": no, "amounts": {"total": "25.00"}},
+                           headers=h), 409, "CONFLICT")
+    assert body["detail"] == {"attempt_status": "failed", "order_status": "assigned", "late_receipt_recorded": True}
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert detail["needs_attention"] is True and no in detail["attention_note"]
+    assert detail["attempts"][0]["status"] == "failed" and detail["attempts"][0]["amazon_order_no"] is None
+    late = [e for e in detail["events"] if e["kind"] == "attempt.late_result"]
+    assert len(late) == 1 and late[0]["detail"]["contradicts"] is True and late[0]["detail"]["amazon_order_no"] == no
+    # 插件补交同一份回执：仍回 409 late_receipt_recorded（插件据此不再补交），不重复记录
+    again = err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
+                            json={"outcome": "succeeded", "amazon_order_no": no, "amounts": {"total": "25.00"}},
+                            headers=h), 409, "CONFLICT")
+    assert again["detail"]["late_receipt_recorded"] is True
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert len([e for e in detail["events"] if e["kind"] == "attempt.late_result"]) == 1
+
+
+def test_partial_import_during_an_attempt_is_not_a_source_change(owner, api):
+    """NEW-D2-execution-safety-1：领取后导入只有平台订单号与人工审核的文件：没带的列不算来源变化。"""
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    _, att = _sim_attempt_guarded(plugin, h)
+    _partial_import(owner, "PO-DEMO-X0001")
+    pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress", json={"stage": "x"}, headers=h))
+    assert pr == {"continue": True, "cancel_reason": None, "cancel_code": None}
+    assert ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h))["ok"] is True
+
+
+def test_partial_import_between_sim_success_and_reset_restores_assigned(owner, api):
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    _, att = _sim_attempt_guarded(plugin, h)
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h))
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
+                   json={"outcome": "succeeded", "amazon_order_no": f"SIM-{TODAY:%Y%m%d}-{att['attempt_id']}",
+                         "amounts": {"total": "25.00"}}, headers=h))
+    assert find_order(owner, "PO-DEMO-X0001")["status"] == "purchased"
+    _partial_import(owner, "PO-DEMO-X0001")
+    ok(owner.post("/api/v1/simulation/reset"))
+    row = find_order(owner, "PO-DEMO-X0001")
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert detail["status"] == "assigned" and detail["conflict"] is None
+    assert detail["original"]["asin"] == "B0DEMO0001" and detail["original"]["price_cap"] == "40.00"

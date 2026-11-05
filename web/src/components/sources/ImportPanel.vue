@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 文件导入：上传 .xlsx / .csv（10 MB 以内）→ 选工作表与字段对应（可套用 / 保存个人模板）→ 预览统计与逐行结论 → 提交或放弃。
+ * 文件导入：上传 .xlsx / .csv（10 MB 以内）→ 选工作表与字段对应（可套用 / 保存工作区模板：工作区共用，同名保存覆盖，保存前先确认）→ 预览统计与逐行结论 → 提交或放弃。
  * 下方是批次列表：继续或放弃未完成的批次、导出结果、下载问题行。不修改用户的原文件。
  * 预览之后再改字段对应（含套用模板、换工作表），预览即过期，必须重新生成才能提交（提交的是服务端存下的那次预览）。
  */
@@ -22,7 +22,15 @@ import {
   labelOf,
   tagOf,
 } from '@/utils/labels'
-import { applyTemplate, canResume, mappingSignature, previousUploadText, resumeFromBatch } from '@/utils/importWizard'
+import {
+  applyTemplate,
+  canResume,
+  findTemplateByName,
+  mappingSignature,
+  previousUploadText,
+  resumeFromBatch,
+  templateOverwriteMessage,
+} from '@/utils/importWizard'
 import { commitSummary } from '@/utils/results'
 import { confirmAction, notifyFailure, notifySuccess, notifySummary, promptText, runDownload, toast } from '@/utils/feedback'
 
@@ -75,11 +83,12 @@ async function loadBatches() {
   }
 }
 
+/** 读工作区模板；读不到时保留已有列表（保存前的同名检查仍按它提醒） */
 async function loadTemplates() {
   try {
     templates.value = (await imports.listTemplates()).rows
   } catch {
-    templates.value = []
+    /* 保留已有列表 */
   }
 }
 
@@ -220,12 +229,25 @@ async function discardBatch(b: ImportBatch) {
   }
 }
 
+/** 存为工作区模板：与已有模板同名时（保存前重新读列表，别人刚存的也算）先确认覆盖 */
 async function saveTemplate() {
-  const name = await promptText({ title: '存为模板', message: '给这套字段对应起个名字，下次上传同样格式的文件时可以直接套用。', placeholder: '如 小蜜蜂导出', required: true, confirmText: '保存' })
+  const name = await promptText({
+    title: '存为工作区模板',
+    message: '给这套字段对应起个名字。模板在工作区里共用，大家下次上传同样格式的文件时都可以直接套用；与已有模板同名会覆盖它。',
+    placeholder: '如 小蜜蜂导出',
+    required: true,
+    confirmText: '保存',
+  })
   if (!name) return
+  await loadTemplates()
+  const existing = findTemplateByName(templates.value, name)
+  if (existing) {
+    const ok = await confirmAction({ message: templateOverwriteMessage(existing), confirmText: '覆盖' })
+    if (!ok) return
+  }
   try {
     const t = await imports.createTemplate(name, { ...mapping })
-    notifySuccess(`已保存模板「${t?.name ?? name}」`)
+    notifySuccess(`${existing ? '已覆盖' : '已保存'}模板「${t?.name ?? name}」`)
     await loadTemplates()
   } catch (e) {
     notifyFailure('保存模板', e)
@@ -233,7 +255,7 @@ async function saveTemplate() {
 }
 
 async function removeTemplate(t: ImportTemplate) {
-  const ok = await confirmAction({ message: `确定要删除模板「${t.name}」吗？`, danger: true, confirmText: '删除' })
+  const ok = await confirmAction({ message: `确定要删除模板「${t.name}」吗？工作区里的人都不能再套用它。`, danger: true, confirmText: '删除' })
   if (!ok) return
   try {
     await imports.deleteTemplate(t.id)
@@ -405,10 +427,12 @@ function rowIssues(r: ImportRow): string {
                 :label="s.row_count === null || s.row_count === undefined ? s.name : `${s.name}（${formatNumber(s.row_count)} 行）`"
               />
             </el-select>
-            <el-select v-model="templateId" size="small" style="width: 12rem" clearable placeholder="套用个人模板" @change="onTemplate">
+            <el-select v-model="templateId" size="small" style="width: 12rem" clearable placeholder="套用工作区模板" @change="onTemplate">
               <el-option v-for="t in templates" :key="t.id" :value="t.id" :label="t.name">
                 <div class="flex items-center justify-between gap-3">
-                  <span>{{ t.name }}</span>
+                  <span class="min-w-0 truncate">
+                    {{ t.name }}<span v-if="t.created_by_name" class="ml-2 text-xs text-gray-400 dark:text-dark-500">{{ t.created_by_name }}</span>
+                  </span>
                   <button type="button" class="text-xs text-red-600 dark:text-red-400" @click.stop="removeTemplate(t)">删除</button>
                 </div>
               </el-option>

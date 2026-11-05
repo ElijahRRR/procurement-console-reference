@@ -24,6 +24,33 @@ from services import clock  # noqa: E402
 
 ADMIN_DSN = os.environ.get("PC_TEST_ADMIN_DSN", "dbname=postgres")
 
+# ── 测试与本机配置隔离 ────────────────────────────────────────────────────────
+# 测试只认缺省设置：不读 backend/.env，也不让 shell 里的 PC_* / FEISHU_* 调参漏进来（例如本机 .env 里改大了
+# PC_LEASE_TTL_S，执行权超时类测试就会失败）。只保留 PC_TEST_ADMIN_DSN；PC_PG_DSN 由 db_dsn 夹具指向临时库。
+#: 测试会话里不加载的 .env（模块常量，测试可改成临时文件来验证这条隔离）
+BLOCKED_DOTENV = (paths.BACKEND_DIR / ".env").resolve()
+_real_load_dotenv = settings._load_dotenv
+
+
+def _load_dotenv_except_local(path: Path) -> None:
+    """settings._load_dotenv 的测试替身：本机的 backend/.env（BLOCKED_DOTENV）一律跳过，其他路径照常解析
+    （test_registry_settings 用临时 .env 测解析规则）。"""
+    if Path(path).resolve() == BLOCKED_DOTENV:
+        return
+    _real_load_dotenv(path)
+
+
+def isolate_settings() -> None:
+    """输入：无 → 输出：无。删掉进程环境里的 PC_* / FEISHU_*（PC_TEST_ADMIN_DSN 除外），屏蔽本机 backend/.env，
+    并清掉已缓存的设置。导入本文件时执行一次。"""
+    for key in [k for k in os.environ if k.startswith(("PC_", "FEISHU_")) and k != "PC_TEST_ADMIN_DSN"]:
+        del os.environ[key]
+    settings._load_dotenv = _load_dotenv_except_local
+    settings.reset_for_tests()
+
+
+isolate_settings()
+
 
 def _tables(conn) -> list[str]:
     rows = conn.execute(

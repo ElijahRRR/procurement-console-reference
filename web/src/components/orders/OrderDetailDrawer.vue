@@ -749,6 +749,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
                   <el-tag size="small" :type="s.kind === 'feishu' ? 'primary' : 'info'" disable-transitions>{{ labelOf(SOURCE_KIND_LABEL, s.kind) }}</el-tag>
                   <span class="min-w-0 break-all">{{ sourceTitle(s) }}</span>
                   <el-tag v-if="s.is_writeback_target" size="small" type="success" disable-transitions>回填目标</el-tag>
+                  <el-tag v-if="s.upstream_cancelled" size="small" type="danger" disable-transitions>说已取消</el-tag>
                 </div>
                 <div class="mt-1 text-xs text-gray-500 dark:text-dark-400">
                   首次 {{ formatDateTime(s.first_seen_at) }} · 最近 {{ formatDateTime(s.last_seen_at) }}

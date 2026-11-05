@@ -9,8 +9,9 @@
 - 人审结论与上游取消由准入规则（admission，契约 §6）判定，取值比较为去首尾空白后的完全相等；多选值逐项比较
   （任一项是取消值即取消；任一项是拒绝值即拒绝；全部是通过值才算通过）；
 - 表格错误值（#N/A、#REF! 等）当作没读到并记问题；平台订单号是错误值、多个值或科学计数法文本 → 不可用（invalid）；
-- 金额只认「1234.5」「$1,234.50」这类写法（逗号只能是千分位），绝对值须小于 10^10（numeric(12,2)）；限价向下取整到分；
-- 配送天数 0–60、年份 2000–2100 之外视为不可靠（None + 问题），不会让日期计算溢出；
+- 金额与 models.money / money_cap 同一套规则（契约 §0：逗号只能是千分位，绝对值须小于 10^10，不认指数写法），
+  文本只多把全角逗号换成半角；限价向下取整到分；
+- 配送天数 0–60、数量 1–999、年份 2000–2100 之外视为不可靠（None + 问题），不会让日期计算溢出、也不会撑爆整数列；
 - 美国邮编：数字单元格的 3–4 位数补前导 0（并记问题）；文本不足 5 位只记问题（由 orders 判为资料待补齐）；
 - AMZ 订单号：明显的占位写法（「—」「无」「N/A」等）当作没有并记问题；其他不符合「3-7-7 位数字」格式的文本原样保留，
   由 orders 判为待核实（不当作可信单号）。
@@ -101,12 +102,10 @@ EXCEL_ERRORS = frozenset({"#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUL
                           "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#BUSY!", "#UNKNOWN!", "#N/A!"})
 #: 科学计数法文本（如 CSV 里的 1.23457E+12）：精度已丢失，不能当订单号
 _SCI_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$")
-#: 文本金额：普通数字，或逗号只作千分位（1,234.50）；可带 $ 与负号
-_MONEY_TEXT_RE = re.compile(r"^-?\$?-?\s*(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$")
-#: numeric(12,2) 能存的最大整数位：绝对值须小于 10^10
-_MONEY_LIMIT = Decimal(10) ** 10
 #: 配送天数的合理范围（天）
 SHIP_DAYS_MAX = 60
+#: 数量的合理上限（件；控制台覆盖数量同一上限）：超出视为不可靠（None + 问题），也不会撑爆 integer 列
+QUANTITY_MAX = 999
 #: 时刻与日期的合理年份范围
 YEAR_MIN, YEAR_MAX = 2000, 2100
 _COUNTRY_US = {"US", "USA", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA", "美国"}
@@ -277,7 +276,7 @@ def normalize(values: dict[str, Any], admission: dict[str, Any] | None = None) -
                 enums[key] = _enum_values(raw)
         elif kind == "int":
             out[key] = _to_int(raw, label, issues, allow_zero=(key != "quantity"),
-                               max_value=SHIP_DAYS_MAX if key == "ship_days" else None)
+                               max_value={"ship_days": SHIP_DAYS_MAX, "quantity": QUANTITY_MAX}.get(key))
         elif kind == "money":
             out[key] = _to_money(raw, label, issues, cap=(key == "price_cap"))
         elif kind == "datetime":
@@ -399,24 +398,22 @@ def _to_int(v: Any, label: str, issues: list[str], *, allow_zero: bool, max_valu
         issues.append(f"{label}不是{what}：{_show(v)}")
         return None
     if max_value is not None and n > max_value:
-        issues.append(f"{label}超出合理范围（0–{max_value}）：{_show(v)}")
+        issues.append(f"{label}超出合理范围（{0 if allow_zero else 1}–{max_value}）：{_show(v)}")
         return None
     return n
 
 
 def _money_value(x: Any, cap: bool) -> Decimal | None:
-    """数字或已校验格式的文本 → 两位小数（限价向下取整）；超出 numeric(12,2) 或无法换算 → None。"""
+    """数字或文本 → models.money / money_cap（限价向下取整）的结果；读不出、超出 numeric(12,2) → None。"""
     try:
-        d = (money_cap if cap else money)(x)
-    except (InvalidOperation, ValueError, ArithmeticError):
+        return (money_cap if cap else money)(x)
+    except (InvalidOperation, ValueError, ArithmeticError, TypeError):    # models 不抛异常；这里只是兜底
         return None
-    if d is None or abs(d) >= _MONEY_LIMIT:
-        return None
-    return d
 
 
 def _to_money(v: Any, label: str, issues: list[str], *, cap: bool = False) -> Decimal | None:
-    """金额：数字原样换算；文本只认普通写法或千分位逗号（「12,5」「1.234,50」「1e3」都不认）。cap=True（限价）向下取整到分。"""
+    """金额：与 models.money / money_cap 同一套规则（契约 §0），文本只多做一步：全角逗号「，」换成半角。
+    cap=True（限价）向下取整到分。读不出 → None 并记问题（不当 0）。"""
     v = _single(v)
     if _is_blank(v):
         return None
@@ -424,10 +421,9 @@ def _to_money(v: Any, label: str, issues: list[str], *, cap: bool = False) -> De
     if isinstance(v, bool) or v is _MULTI:
         d = None
     elif isinstance(v, (int, float, Decimal)):
-        d = _money_value(Decimal(str(v)) if isinstance(v, float) else v, cap)
+        d = _money_value(v, cap)
     else:
-        s = re.sub(r"(?i)usd", "", str(v)).replace("，", ",").strip()
-        d = _money_value(s, cap) if _MONEY_TEXT_RE.match(s) else None
+        d = _money_value(str(v).replace("，", ",").strip(), cap)
     if d is None:
         issues.append(f"{label}不是有效金额：{_show(v)}")
         return None

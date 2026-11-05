@@ -1,5 +1,6 @@
 /**
- * 文件导入向导的纯函数：字段对应签名（判断预览是否过期）、套用模板、从批次恢复向导、重复上传提醒。
+ * 文件导入向导的纯函数：字段对应签名（判断预览是否过期）、套用模板、同名模板覆盖确认、从批次恢复向导、重复上传提醒。
+ * 导入模板是工作区共用的（v2 §4、契约 §7）：同名保存会覆盖别人存的对应关系，所以保存前要先确认。
  */
 import type { ImportBatch, ImportSheet, ImportTemplate, PreviousUpload } from '@/api/types'
 import { formatDateTime } from './format'
@@ -20,6 +21,20 @@ export function applyTemplate(headers: readonly string[], current: ImportMapping
   const out: ImportMapping = {}
   for (const h of headers) out[h] = h in (t.mapping ?? {}) ? (t.mapping[h] ?? null) : (current[h] ?? null)
   return out
+}
+
+/**
+ * 输入：工作区模板列表、要保存的名称 → 输出：同名的已有模板（名称去掉首尾空白后完全一致，与服务端唯一键相同），没有为 undefined
+ */
+export function findTemplateByName<T extends Pick<ImportTemplate, 'name'>>(templates: readonly T[], name: string): T | undefined {
+  const key = name.trim()
+  return key ? templates.find((t) => t.name === key) : undefined
+}
+
+/** 输入：将被覆盖的模板 → 输出：覆盖确认文案（写明创建人；改动对整个工作区生效） */
+export function templateOverwriteMessage(t: Pick<ImportTemplate, 'name' | 'created_by_name'>): string {
+  const by = t.created_by_name ? `它由 ${t.created_by_name} 创建，` : ''
+  return `确定要覆盖模板「${t.name}」吗？${by}工作区里的人以后套用它都会用新的字段对应。`
 }
 
 /** 输入：批次 → 输出：能否在控制台继续（已上传或已预览、还没提交或放弃） */

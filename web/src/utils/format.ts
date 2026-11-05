@@ -13,14 +13,30 @@ export function isBlank(v: unknown): v is null | undefined | '' {
   return v === null || v === undefined || (typeof v === 'string' && v.trim() === '')
 }
 
-/** 输入：金额字符串 / 数字 → 输出：有限数字或 null（"$1,234.50"、" 52 " 都能解析） */
+/**
+ * 文本金额的写法，与服务端 models.money 同一规则（契约 §0）：开头只认一个正负号、US / USD 与 $（如 $25.50、
+ * US$25.50、-$5、$-5），结尾只认 USD（如 52 usd，不分大小写），US 不能首尾都有；数字只认普通写法或千分位逗号。
+ * 别处出现的 $、US（40$5、4US0、12US）或逗号不是千分位（12,5、1.234,50）一律读不出。
+ * 分组：1 正负号、2 开头的 US / USD、3 $ 之后的正负号、4 数字、5 结尾的 USD。
+ */
+const MONEY_TEXT = /^([+-]?)(USD?\s*)?(?:\$\s*)?([+-]?)((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(\s*USD)?$/i
+
+function matchMoneyText(v: string): { num: string; decimals: number } | null {
+  const m = v.trim().match(MONEY_TEXT)
+  if (!m || (m[1] && m[3]) || (m[2] && m[5])) return null
+  const digits = m[4].replace(/,/g, '')
+  const dot = digits.indexOf('.')
+  return { num: (m[1] || m[3]) + digits, decimals: dot < 0 ? 0 : digits.length - dot - 1 }
+}
+
+/** 输入：金额字符串 / 数字 → 输出：有限数字或 null（"$1,234.50"、" 52 "、"US$3.10" 都能解析；"40$5" 为 null） */
 export function parseAmount(v: unknown): number | null {
   if (isBlank(v)) return null
   if (typeof v === 'number') return Number.isFinite(v) ? v : null
   if (typeof v !== 'string') return null
-  const s = v.replace(/[$,\s]/g, '').replace(/^US/i, '')
-  if (!/^-?\d+(\.\d+)?$/.test(s)) return null
-  const n = Number(s)
+  const t = matchMoneyText(v)
+  if (!t) return null
+  const n = Number(t.num)
   return Number.isFinite(n) ? n : null
 }
 
@@ -184,8 +200,8 @@ export function blankToNull(v: string | null | undefined): string | null {
 export function hasAtMostTwoDecimals(v: string | number | null | undefined): boolean {
   if (isBlank(v)) return true
   if (typeof v === 'number') return Number.isFinite(v) && Math.abs(v * 100 - Math.round(v * 100)) < 1e-6
-  const s = String(v).replace(/[$,\s]/g, '').replace(/^US/i, '')
-  return /^-?\d+(\.\d{0,2})?$/.test(s)
+  const t = matchMoneyText(String(v))
+  return t !== null && t.decimals <= 2
 }
 
 /** 输入：金额输入 → 输出：规范的两位小数字符串或 null（"12.5" → "12.50"；解析不了为 null） */

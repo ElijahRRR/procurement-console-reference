@@ -1,4 +1,4 @@
-"""`python cli.py serve`：HTTP 服务（uvicorn `server.app:app`）+ 后台调度（契约 §9）。
+"""`python cli.py serve`：HTTP 服务（uvicorn 运行 `server.app.create_app()` 建的应用）+ 后台调度（契约 §9）。
 
 入口层文件（与 cli.py 同层），可以同时用 services 与 workflows；server 不导入本文件。
 
@@ -220,17 +220,23 @@ def serve(host: str | None = None, port: int | str | None = None, jobs: Any = "1
           **unknown: Any) -> None:
     """输入：监听地址、端口、是否启动后台调度、uvicorn 日志级别 → 输出：无（阻塞运行 uvicorn，退出后停止后台调度）。
 
-    地址与端口缺省取 settings（127.0.0.1:8790）；jobs=0 不启动后台调度（只跑 HTTP）。应用为 'server.app:app'。
+    地址与端口缺省取 settings（127.0.0.1:8790）；jobs=0 不启动后台调度（只跑 HTTP）。应用由
+    server.app.create_app(allowed_hosts=(监听地址,)) 现建：`-p host=` 给的地址也在 Host 允许名单里（否则
+    HostOriginMiddleware 只认 settings.host 与 PC_ALLOWED_HOSTS，按这个地址访问会一律 403）；0.0.0.0 / :: 由
+    create_app 滤掉，监听所有网卡时仍按 PC_HOST / PC_ALLOWED_HOSTS 认主机名。
     """
     if unknown:
         raise SystemExit(f"serve 不认识的参数：{'、'.join(sorted(unknown))}（可用 host、port、jobs、log_level）")
     import uvicorn
+
+    from server.app import create_app
 
     for name in ("httpx", "httpcore"):          # 它们的 INFO 请求日志带多维表格 token
         logging.getLogger(name).setLevel(logging.WARNING)
     s = settings.get()
     bind_host = host or s.host
     bind_port = int(port) if port not in (None, "") else int(s.port)
+    app = create_app(allowed_hosts=(bind_host,))
     sched = Scheduler() if _flag(jobs) else None
     if sched is not None:
         sched.start()
@@ -238,7 +244,7 @@ def serve(host: str | None = None, port: int | str | None = None, jobs: Any = "1
         log.info("后台调度未启动（jobs=%s）", jobs)
     try:
         log.info("采购控制台监听 http://%s:%d（前端目录 %s）", bind_host, bind_port, s.web_dist)
-        uvicorn.run("server.app:app", host=bind_host, port=bind_port, log_level=log_level, proxy_headers=False,
+        uvicorn.run(app, host=bind_host, port=bind_port, log_level=log_level, proxy_headers=False,
                     server_header=False)
     finally:
         if sched is not None:

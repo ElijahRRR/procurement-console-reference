@@ -17,7 +17,8 @@ log = logging.getLogger(__name__)
 
 
 def run(*, now: datetime | None = None) -> dict[str, Any]:
-    """输入：当前时刻（缺省 clock.now()）→ 输出：{due, sent, done, retrying, failed, superseded, waiting_verification[, error]}。"""
+    """输入：当前时刻（缺省 clock.now()）→ 输出：{due, sent, done, retrying, failed, superseded, waiting_verification,
+    waiting_grant[, error]}。"""
     with db.pg_conn() as c:
         stats = writeback.flush(c, now=now)
     if stats.get("sent") or stats.get("failed"):

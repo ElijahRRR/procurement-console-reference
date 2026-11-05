@@ -1,4 +1,5 @@
-"""文件导入（契约 §7、§10「导入」、v1 §6.2）：上传 → 选工作表与字段对应 → 预览 → 提交 / 放弃，问题行下载，个人模板。
+"""文件导入（契约 §7、§10「导入」；模板范围以 v2 §4 为准）：上传 → 选工作表与字段对应 → 预览 → 提交 / 放弃，问题行下载，
+工作区模板。
 
 - **上传**：只读取字节（sheet_io.read_workbook 校验格式与大小），原件存进 import_batches.file_bytes（只读副本，
   用于重新预览）；不改用户的原文件。给出第一个有表头的工作表的自动对应（file_mapping.suggest_mapping）。
@@ -21,6 +22,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from typing import Any
 
@@ -29,6 +31,8 @@ from psycopg.types.json import Jsonb
 from services import allocation, clock, events, feishu_connections, file_mapping, normalize, orders, settings_svc, sheet_io
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import SourceRef, UpstreamRecord
+
+log = logging.getLogger(__name__)
 
 VERDICTS = ("new", "update", "unchanged", "conflict", "historical", "invalid")
 VERDICT_ZH = {"new": "新单", "update": "更新", "unchanged": "无变化", "conflict": "待核实", "historical": "历史采购",
@@ -385,7 +389,8 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
     """输入：工作区、批次、操作人 → 输出：{batch, stats, allocation}。
 
     只能提交 previewed 的批次，且只能提交一次（已提交 → CONFLICT；未预览 / 已放弃 → VALIDATION）。逐行（invalid 除外）
-    经 orders.ingest 写入（一行出错只把该行记为 invalid 并写明原因），记下 purchase_order_id 与实际结论，重算统计，
+    经 orders.ingest 写入（一行出错——业务校验失败或任何意外的数据库错误——只把该行记为 invalid 并写明原因
+    「提交失败：…」，其余行照常提交），记下 purchase_order_id 与实际结论，重算统计，
     批次改为 committed，最后触发一次分配（trigger='import'）。
     """
     b = _batch(conn, workspace_id, batch_id, for_update=True)
@@ -413,11 +418,16 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
         try:
             with conn.transaction():
                 oc = orders.ingest(conn, workspace_id, rec, src, actor_kind=ak, actor_id=aid, admission=adm)
-        except DomainError as exc:
-            issues = list(r["issues"] or []) + [f"提交失败：{exc.message}"]
+        except Exception as exc:        # noqa: BLE001 —— 保存点已回滚：一行出错只让该行 invalid，不挡整批
+            if isinstance(exc, DomainError):
+                why = f"提交失败：{exc.message}"
+            else:
+                log.exception("导入批次 %s 第 %s 行提交失败", b["id"], r["row_no"])
+                why = f"提交失败：{type(exc).__name__}"
+            issues = list(r["issues"] or []) + [why]
             conn.execute("UPDATE procure.import_rows SET verdict = 'invalid', issues = %s, normalized = %s "
                          "WHERE batch_id = %s AND row_no = %s AND workspace_id = %s",
-                         (issues, Jsonb({**norm, _PREVIEW_KEY: {**meta, "reason": f"提交失败：{exc.message}"}}),
+                         (issues, Jsonb({**norm, _PREVIEW_KEY: {**meta, "reason": why}}),
                           b["id"], r["row_no"], workspace_id))
             items.append({"verdict": "invalid", "status": None})
             continue

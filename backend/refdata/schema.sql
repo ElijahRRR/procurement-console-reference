@@ -458,12 +458,17 @@ CREATE TABLE IF NOT EXISTS procure.feishu_base_grants (
     granted_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS feishu_base_grants_ws ON procure.feishu_base_grants (workspace_id);
--- 已有的启用连接：每个表格归最早连接它的工作区（其他工作区的同表连接读取时会被拒绝，需部署所有者用 CLI 转授）。
--- 撤销 / 转授时原工作区的连接会被停用，所以重复执行本句不会把撤销掉的授权又加回来。
+-- 已有的启用连接：每个表格归最早连接它的工作区。撤销 / 转授时原工作区的连接会被停用，所以重复执行本句
+-- 不会把撤销掉的授权又加回来。
 INSERT INTO procure.feishu_base_grants (app_token, workspace_id, granted_by)
 SELECT DISTINCT ON (app_token) app_token, workspace_id, 'migrated'
 FROM procure.feishu_connections WHERE enabled ORDER BY app_token, id
 ON CONFLICT (app_token) DO NOTHING;
+-- 一个表格同一时刻只归一个工作区：表格已授权给别的工作区时，这里仍启用的同表连接一律停用（读取、验收、写回发送
+-- 本来也会被拒绝；需要时由部署所有者用 CLI 转授后再启用）。幂等。
+UPDATE procure.feishu_connections c SET enabled = false, updated_at = now()
+WHERE c.enabled AND EXISTS (SELECT 1 FROM procure.feishu_base_grants g
+                            WHERE g.app_token = c.app_token AND g.workspace_id <> c.workspace_id);
 
 -- ── 追加（幂等）：同一工作区里同一个亚马逊买家号 ID 只能登记在一个未归档账号上 ──────────────────
 -- 执行权互斥按账号行算：同一个亚马逊登录挂在两行上就可能两处同时执行、各占一份额度。应用层检查之外由唯一索引兜底

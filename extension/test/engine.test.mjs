@@ -48,7 +48,7 @@ const IDENT = { signed_in: true, customer_id: "A1DEMO0000", site: "US", page_url
 const paths = (srv, re) => srv.calls.filter((c) => re.test(c.path));
 const resultsOf = (srv) => paths(srv, /\/result$/).map((c) => c.body);
 
-test("正常路径：每笔都护栏放行、登记一次、上报成功，单号 SIM-<北京日期>-<尝试号>，最后结束批次", async () => {
+test("正常路径：每笔都护栏放行、登记一次、上报成功，单号 SIM-<北京日期>-<尝试 ID>，最后结束批次", async () => {
   const { srv, eng, views } = setup();
   let notice = null;
   const s = await eng.run("manual", (n) => { notice = n; });
