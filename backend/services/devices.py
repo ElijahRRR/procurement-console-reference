@@ -33,7 +33,6 @@ from services.orders import UNSET
 ONLINE_WINDOW_S = 180
 PAIRING_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 PAIRING_CODE_LEN = 8
-IDENTITY_STATUSES = ("unknown", "match", "mismatch", "signed_out")
 BROWSERS = ("chrome", "adspower", "other")
 
 #: 心跳里账号配置要给插件的键（契约 §10「插件心跳 / 配置」）

@@ -36,10 +36,14 @@ function setup({ outcome = "pass", server = {}, engine = {}, wrapFetch = null } 
     // 等待（结果重发的退避、领取的稍后再试）推进假服务端的时钟：租约预算按真实时间推演
     sleep: async (ms) => { srv.advance(ms); },
     ownDeviceId: 5,
+    // 宿主重读并上报身份：这里直接用客户端上报一份绑定账号的身份（浏览器里是后台让各标签页重读、对账后上报）
+    refreshIdentity: () => api.identity(IDENT),
     ...engine,
   });
-  return { srv, eng, logs, views };
+  return { srv, eng, logs, views, api };
 }
+
+const IDENT = { signed_in: true, customer_id: "A1DEMO0000", site: "US", page_url: "https://www.amazon.com/gp/css/order-history" };
 
 const paths = (srv, re) => srv.calls.filter((c) => re.test(c.path));
 const resultsOf = (srv) => paths(srv, /\/result$/).map((c) => c.body);
@@ -70,14 +74,15 @@ test("正常路径：每笔都护栏放行、登记一次、上报成功，单�
   assert.deepEqual(paths(srv, /\/finish$/)[0].body, { reason: "finished", detail: "completed" });
   assert.equal([...srv.state.runs.values()][0].ended, true);
   assert.equal(views.at(-1).phase, "ended");
-  // 请求顺序：开始批次 → 领取 → 进度 → 护栏 → 登记 → 结果
-  const seq = srv.calls.slice(0, 8).map((c) => c.path.replace(/\/\d+(?=\/|$)/g, "/:id"));
+  // 请求顺序：开始批次 → 领取 → 进度 → 护栏 → 上报身份 → 登记前确认 → 登记 → 结果
+  const seq = srv.calls.slice(0, 9).map((c) => c.path.replace(/\/\d+(?=\/|$)/g, "/:id"));
   assert.deepEqual(seq, [
     "/plugin/v1/runs",
     "/plugin/v1/runs/:id/next",
     "/plugin/v1/attempts/:id/progress",
     "/plugin/v1/attempts/:id/progress",
     "/plugin/v1/attempts/:id/guard",
+    "/plugin/v1/identity",
     "/plugin/v1/attempts/:id/progress",
     "/plugin/v1/attempts/:id/submitting",
     "/plugin/v1/attempts/:id/result",
@@ -186,7 +191,7 @@ test("403 身份不一致：拒绝开始，中文原因", async () => {
   assert.equal(s.status, "rejected");
   assert.equal(s.error.code, "IDENTITY_MISMATCH");
   assert.match(s.message, /^开始执行失败：身份未通过/);
-  assert.match(s.message, /（服务端：身份不一致）$/);
+  assert.match(s.message, /（服务端：浏览器登录的买家账号（A9OTHER0000）与绑定账号 环境-DEMO（A1DEMO0000）不符，拒绝领取）$/);
   assert.equal(paths(srv, /\/next$/).length, 0);
 });
 
@@ -460,7 +465,7 @@ test("服务端给 cancel_code：身份不符也是 ABORTED_BY_SERVER（中止�
 
 test("旧服务端（没有 cancel_code）：仍报它唯一认得的中止码，任务回到已分配，不会被当成任务级失败转异常", async () => {
   const { srv, eng } = setup({
-    server: { hooks: { afterClaim: (t, a, state) => { if (t.upstream_order_no === "PO-DEMO-0001") { state.account.execution_paused = true; } } } },
+    server: { legacy: true, hooks: { afterClaim: (t, a, state) => { if (t.upstream_order_no === "PO-DEMO-0001") { state.account.execution_paused = true; } } } },
   });
   await eng.run("manual");
   const codes = resultsOf(srv).map((r) => r.error_code);
@@ -519,7 +524,7 @@ test("提交登记被拒、再问进度服务端仍说继续（例如任务状�
   assert.equal(s.counts.failed, 1);
   const r = resultsOf(srv);
   assert.deepEqual(r.map((x) => [x.outcome, x.error_code]), [["failed", "SUBMIT_REJECTED"]]);
-  assert.match(r[0].error_detail, /^CONFLICT：任务状态已变化/);
+  assert.equal(r[0].error_detail, "任务状态已变化，不能提交", "error_detail 写服务端的中文原话，不带英文码");
   assert.equal(srv.state.tasks[0].status, "exception", "服务端按任务级处理");
   assert.equal(paths(srv, /\/next$/).length, 1);
   assert.equal(paths(srv, /\/finish$/).length, 1);
@@ -574,4 +579,195 @@ test("批次心跳的 stop_reason 用中文说明（identity_mismatch 等不再�
   assert.ok(line, "收到了停止要求");
   assert.doesNotMatch(line.text, /identity_mismatch/);
   assert.match(line.text, /买家账号与绑定账号不一致/);
+});
+
+// ── 第二轮集成：照真实服务端的答复（cancel_code、身份新鲜度、来源变化、稍后再领、结束说明）──────
+
+/** 某一笔尝试按时间先后调过的接口（只留尝试级与身份上报）。 */
+const attemptTrail = (srv, id) =>
+  srv.calls
+    .filter((c) => new RegExp(`/attempts/${id}/|/identity$`).test(c.path))
+    .map((c) => (c.path.endsWith("/identity") ? "identity" : c.path.endsWith("/progress") ? `progress:${c.body.stage}` : c.path.split("/").pop()));
+
+test("提交登记之前先报一次新鲜身份（POST /identity），再做登记前确认与登记", async () => {
+  const { srv, eng } = setup({ server: { tasks: [TASKS()[0]] } });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.succeeded, 1);
+  const trail = attemptTrail(srv, 7);
+  const i = trail.indexOf("submitting");
+  assert.deepEqual(trail.slice(i - 3, i + 1), ["guard", "identity", "progress:before_submit", "submitting"]);
+  assert.equal(srv.state.identityReports.at(-1).via, "identity");
+});
+
+test("批次跑得久（超过 10 分钟）：每 3 分钟补报一次身份，服务端不会因身份过期而中止；不补报的对照组被中止", async () => {
+  const tasks = () => [TASKS()[0], TASKS()[1], { ...TASKS()[0], upstream_order_no: "PO-DEMO-0003", asin: "B0DEMO0003" }];
+  const { srv, eng } = setup({ server: { tasks: tasks(), tickMs: 30_000 } });
+  const t0 = srv.now();
+  const s = await eng.run("manual");
+  assert.ok(srv.now() - t0 > 600_000, "批次跨过了 10 分钟");
+  assert.equal(s.counts.succeeded, 3);
+  assert.equal(s.counts.aborted, 0);
+  assert.ok(srv.state.identityReports.filter((r) => r.via === "identity").length >= 3);
+
+  const { srv: srv2, eng: eng2 } = setup({ server: { tasks: tasks(), tickMs: 30_000 }, engine: { refreshIdentity: undefined } });
+  const s2 = await eng2.run("manual");
+  assert.ok(s2.counts.succeeded < 3, "不补报身份：10 分钟后服务端不再放行");
+  const codes = resultsOf(srv2).map((r) => r.error_code).filter(Boolean);
+  assert.ok(codes.every((c) => c === "ABORTED_BY_SERVER"), codes.join(","));
+  assert.equal(srv2.state.account.execution_paused, false, "身份过期不是账号级错误");
+});
+
+test("身份过期（cancel_code IDENTITY_STALE）：上报 ABORTED_BY_SERVER，任务回到已分配，账号不暂停；之后领取不下发，批次正常结束", async () => {
+  const { srv, eng, logs } = setup({
+    server: { tasks: [TASKS()[0]], hooks: { afterClaim: (t, a, state) => { state.identityAt = srv.now() - 601_000; } } },
+    engine: { refreshIdentity: undefined },
+  });
+  const s = await eng.run("manual");
+  assert.equal(s.status, "finished");
+  assert.equal(s.reason, "completed");
+  assert.equal(s.counts.aborted, 1);
+  const r = resultsOf(srv);
+  assert.deepEqual(r.map((x) => [x.outcome, x.error_code]), [["failed", "ABORTED_BY_SERVER"]]);
+  assert.match(r[0].error_detail, /超过 10 分钟没有上报登录身份/);
+  assert.equal(srv.state.attempts.get(7).status, "aborted");
+  assert.equal(srv.state.tasks[0].status, "assigned");
+  assert.equal(srv.state.account.execution_paused, false);
+  assert.ok(logs.some((l) => /没有可执行的任务了：.*超过 10 分钟没有上报登录身份/.test(l.text)), "领取说明了原因");
+  assert.ok(!logs.some((l) => /IDENTITY_STALE/.test(l.text)));
+});
+
+test("领取后来源有变化（cancel_code SOURCE_CHANGED）：ABORTED_BY_SERVER，任务按来源变化重新定状态（不转异常），下一笔照常", async () => {
+  const { srv, eng } = setup({
+    server: { hooks: { afterClaim: (t) => { if (t.upstream_order_no === "PO-DEMO-0001") t.drift = { text: "领取后来源改了数量（1 → 3）", fields: ["quantity"], to: "pending_review" }; } } },
+  });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.aborted, 1);
+  assert.equal(s.counts.succeeded, 1);
+  const r = resultsOf(srv);
+  assert.equal(r[0].error_code, "ABORTED_BY_SERVER");
+  assert.match(r[0].error_detail, /领取后来源改了数量/);
+  assert.deepEqual(srv.state.tasks.map((t) => t.status), ["pending_review", "purchased"]);
+  assert.equal(paths(srv, /\/attempts\/7\/(guard|submitting)$/).length, 0, "不走护栏与登记");
+});
+
+test("来源把任务暂停了（cancel_code SOURCE_HOLD）：ABORTED_BY_SERVER，未提交前中止", async () => {
+  const { srv, eng } = setup({
+    server: { tasks: [TASKS()[0]], hooks: { afterClaim: (t) => { t.hold = { text: "来源里这笔订单与另一行冲突，已暂停执行", kind: "duplicate_row" }; } } },
+  });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.aborted, 1);
+  assert.equal(resultsOf(srv)[0].error_code, "ABORTED_BY_SERVER");
+  assert.equal(srv.state.attempts.get(7).status, "aborted");
+  assert.equal(srv.state.tasks[0].status, "conflict", "来源暂停着：不再领取，也不是异常");
+  assert.equal(paths(srv, /\/next$/).length, 2);
+});
+
+test("登记前确认之后、登记之前来源才变（/submitting 409 SOURCE_CHANGED）：再问进度 → ABORTED_BY_SERVER，绝不报 SUBMIT_REJECTED", async () => {
+  const { srv, eng } = setup({
+    server: { tasks: [TASKS()[0]], hooks: { afterProgress: (t, a, state, stage) => { if (stage === "before_submit") t.drift = { text: "领取后来源改了限价", fields: ["price_cap"], to: "pending_review" }; } } },
+  });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.aborted, 1);
+  const sub = paths(srv, /\/attempts\/7\/submitting$/);
+  assert.equal(sub.length, 1, "登记只发了一次");
+  assert.equal(srv.state.attempts.get(7).submitted_at, null, "服务端没有登记");
+  const r = resultsOf(srv);
+  assert.deepEqual(r.map((x) => x.error_code), ["ABORTED_BY_SERVER"]);
+  assert.equal(srv.state.tasks[0].status, "pending_review", "中止后按来源变化重新定状态，不是异常");
+  assert.equal(srv.state.account.execution_paused, false);
+});
+
+test("登记那一刻身份过期（/submitting 409 IDENTITY_MISMATCH，detail.stale）：再问进度 → IDENTITY_STALE → ABORTED_BY_SERVER", async () => {
+  const { srv, eng } = setup({
+    server: { tasks: [TASKS()[0]], hooks: { afterProgress: (t, a, state, stage) => { if (stage === "before_submit") state.identityAt = srv.now() - 601_000; } } },
+  });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.aborted, 1);
+  assert.deepEqual(resultsOf(srv).map((x) => x.error_code), ["ABORTED_BY_SERVER"]);
+  assert.equal(srv.state.attempts.get(7).submitted_at, null);
+});
+
+test("提交前复核护栏不过、服务端没给 block_code：按 GUARD_BLOCKED 上报，计拦截，其他任务继续", async () => {
+  let n = 0;
+  const { srv, eng } = setup({ server: { hooks: { recheck: () => (n++ === 0 ? { code: null } : null) } } });
+  const s = await eng.run("manual");
+  assert.equal(s.counts.blocked, 1);
+  assert.equal(s.counts.succeeded, 1);
+  assert.equal(resultsOf(srv)[0].error_code, "GUARD_BLOCKED");
+  assert.equal(srv.state.tasks[0].status, "exception");
+});
+
+test("领取一直「稍后再领」：每轮最多等 30 秒、最多再领 6 次，等待期间照常续租（不丢执行权），然后以 completed 结束", async () => {
+  const { srv, eng, logs } = setup({
+    server: { leaseTtlS: 30, hooks: { beforeClaim: () => ({ attempt: null, retry_after_s: 90, reason: "有 2 笔可执行的任务正被其他操作（导入、同步或分配）占用，请 90 秒后再领取" }) } },
+  });
+  const t0 = srv.now();
+  const s = await eng.run("manual");
+  assert.equal(s.status, "finished");
+  assert.equal(s.reason, "completed");
+  assert.equal(paths(srv, /\/next$/).length, 7, "第一次 + 再领 6 次");
+  assert.equal(srv.now() - t0, 6 * 30_000, "每轮封顶 30 秒");
+  assert.ok(paths(srv, /\/runs\/9\/heartbeat$/).length >= 18, "租约 30 秒：等待期间每 10 秒续一次");
+  assert.equal(srv.state.runs.get(9).ended, true);
+  assert.equal(srv.state.runs.get(9).finish_detail, "completed");
+  assert.ok(logs.some((l) => /一直被其他操作占用/.test(l.text)));
+});
+
+test("稍后再领的 retry_after_s 是小数或 0：照样等（至少 1 秒）再领", async () => {
+  let n = 0;
+  const { srv, eng } = setup({
+    server: { tasks: [TASKS()[0]], hooks: { beforeClaim: () => (n++ === 0 ? { attempt: null, retry_after_s: 0, reason: "占用" } : n === 2 ? { attempt: null, retry_after_s: 2.5, reason: "占用" } : null) } },
+  });
+  const t0 = srv.now();
+  const s = await eng.run("manual");
+  assert.equal(s.counts.succeeded, 1);
+  assert.equal(paths(srv, /\/next$/).length, 4);
+  assert.ok(srv.now() - t0 >= 3_500);
+});
+
+test("结束批次：reason 恒为 finished，插件的细分原因进 detail（服务端记为 plugin_detail）", async () => {
+  const { srv, eng } = setup();
+  await eng.run("manual");
+  const fin = paths(srv, /\/runs\/9\/finish$/);
+  assert.deepEqual(fin.map((c) => c.body), [{ reason: "finished", detail: "completed" }]);
+  assert.equal(srv.state.runs.get(9).end_reason, "finished");
+  assert.equal(srv.state.runs.get(9).finish_detail, "completed");
+  const { srv: srv2, eng: eng2 } = setup({ outcome: "unknown_after_submit" });
+  await eng2.run("manual");
+  assert.equal(srv2.state.runs.get(9).finish_detail, "result_unknown");
+});
+
+test("结果的请求到了服务端、响应丢了：客户端原样再发，服务端认出重复（200 duplicate），只算一次成功", async () => {
+  const { srv, eng } = setup({ server: { tasks: [TASKS()[0]], faults: [{ match: /\/attempts\/7\/result$/, times: 1, after: true }] } });
+  const s = await eng.run("manual");
+  assert.equal(s.status, "finished");
+  assert.equal(s.counts.succeeded, 1);
+  assert.equal(resultsOf(srv).length, 2, "同一份结果发了两次");
+  assert.deepEqual(resultsOf(srv)[0], resultsOf(srv)[1]);
+  assert.equal(srv.state.attempts.get(7).status, "succeeded");
+  assert.equal(srv.state.account.execution_paused, false);
+});
+
+test("日志里不出现原样的英文错误码、中止原因码与阶段名", async () => {
+  const { SERVER_CODE_LABEL, GUARD_CODE_LABEL, ATTEMPT_CODE_LABEL, LOCAL_CODE_LABEL, CANCEL_CODE_LABEL, STOP_REASON_LABEL, STAGE_LABEL } = await import("../build/core/codes.js");
+  const codes = [...Object.keys(SERVER_CODE_LABEL), ...Object.keys(GUARD_CODE_LABEL), ...Object.keys(ATTEMPT_CODE_LABEL), ...Object.keys(LOCAL_CODE_LABEL), ...Object.keys(CANCEL_CODE_LABEL), ...Object.keys(STOP_REASON_LABEL), ...Object.keys(STAGE_LABEL)];
+  const re = new RegExp(`(^|[^A-Za-z_])(${codes.join("|")})($|[^A-Za-z_])`);
+  const scenarios = [
+    setup({ outcome: "price_over_cap" }),
+    setup({ outcome: "out_of_stock" }),
+    setup({ outcome: "account_captcha" }),
+    setup({ outcome: "unknown_after_submit" }),
+    setup({ server: { hooks: { afterClaim: (t) => { t.drift = { text: "领取后来源改了数量", fields: ["quantity"] }; } } } }),
+    setup({ server: { hooks: { afterClaim: (t, a, state) => { state.identityAt = null; } } }, engine: { refreshIdentity: undefined } }),
+    setup({ server: { hooks: { recheck: () => ({ code: null }) } } }),
+    setup({ server: { identityStatus: "signed_out" } }),
+    setup({ server: { faults: [{ match: /\/next$/, times: 1 }] } }),
+    setup({ server: { tickMs: 20_000, hooks: { afterClaim: (t, a, state) => { state.account.archived = true; } } } }),
+  ];
+  for (const { eng, logs, views } of scenarios) {
+    const s = await eng.run("manual");
+    for (const text of [...logs.map((l) => l.text), s.message, ...views.map((v) => v.stage_label ?? ""), ...views.map((v) => v.message ?? "")]) {
+      assert.doesNotMatch(text, re, text);
+    }
+  }
 });

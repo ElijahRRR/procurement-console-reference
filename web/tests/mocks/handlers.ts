@@ -137,6 +137,14 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         Object.assign(d, { review_status: b.decision === 'approve' ? 'approved' : 'rejected' })
       } else if (action === 'clear-attention') {
         Object.assign(d, { needs_attention: false, attention_note: null, allowed_actions: d.allowed_actions.filter((a) => a !== 'clear_attention') })
+        fx.overview.needs_attention = Math.max(0, (fx.overview.needs_attention ?? 1) - 1)
+      } else if (action === 'resolve-conflict') {
+        // 同服务端：来源的 AMZ 订单号格式不对时不能接受，只能保留
+        const no = d.conflict?.incoming?.external_amz_order_no
+        if (b.choice === 'accept' && d.conflict?.kind === 'external_order_no' && typeof no === 'string' && !/^\d{3}-\d{7}-\d{7}$/.test(no)) {
+          return err(422, 'VALIDATION', `AMZ 订单号「${no}」格式不对，不能登记为已采购；请选择保留当前`)
+        }
+        Object.assign(d, { conflict: null, status: 'queued', status_reason: null, allowed_actions: ['assign', 'override', 'cancel'] })
       } else if (action === 'writeback-target') {
         const src = d.sources.find((x) => x.id === b.source_id)
         if (!src) return err(404, 'NOT_FOUND', '来源记录不存在')
@@ -162,7 +170,8 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
       if (r[2] === 'pause') Object.assign(a, { execution_paused: true, pause_reason: String(b.reason ?? ''), paused_at: now.toISOString() })
-      if (r[2] === 'resume') Object.assign(a, { execution_paused: false, pause_reason: null, paused_at: null })
+      if (r[2] === 'pause') a.pause_cause = 'manual'
+      if (r[2] === 'resume') Object.assign(a, { execution_paused: false, pause_reason: null, paused_at: null, pause_cause: null })
       return ok(a)
     }
     if (path === '/devices' && m === 'GET') return ok(page(fx.devices, q))
@@ -227,13 +236,20 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       }
       if (r[2] === 'verify-writeback') {
         const recordId = String(b.record_id ?? '')
+        // 同服务端：测试记录已关联采购任务 → 422（验收只能在专用测试记录上做）
+        const linked = Object.values(fx.details).find((d) => d.sources.some((s) => s.kind === 'feishu' && s.record_id === recordId))
+        if (linked) {
+          return err(422, 'VALIDATION', `这条记录已关联采购任务 ${linked.upstream_order_no}，验收会写入测试值，请改用一条专用测试记录`, { field: 'record_id' })
+        }
         Object.assign(c, { writeback_verified_at: now.toISOString(), writeback_state: 'active', writeback_test_record: recordId })
+        // 记录 id 含 restorefail 时模拟「验收通过但恢复原值失败」
+        const restoreFailed = recordId.includes('restorefail')
         const res: VerifyWritebackResult = {
           ok: true,
           mismatches: [],
           written: Object.fromEntries(Object.values(c.writeback_map).map((col) => [col, '回填验收'])),
-          restored: true,
-          restore_error: null,
+          restored: !restoreFailed,
+          restore_error: restoreFailed ? '恢复测试记录原值失败：飞书接口限流（DEMO）' : null,
           error: null,
           connection: c,
         }
@@ -265,8 +281,9 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
     }
     if ((r = /^\/imports\/(\d+)$/.exec(path)) && m === 'GET') {
       const id = Number(r[1])
-      const found = fx.batches.find((x) => x.id === id) ?? (fx.importPreview.batch.id === id ? fx.importPreview.batch : null)
-      return found ? ok(found) : err(404, 'NOT_FOUND', '导入批次不存在')
+      // GET /imports/{id} 另带原文件的工作表与所选工作表的表头（读不到原文件时为空列表）
+      const found = fx.batches.find((x) => x.id === id) ?? (fx.importPreview.batch.id === id ? { ...fx.importPreview.batch, sheets: fx.upload.sheets, headers: fx.upload.headers } : null)
+      return found ? ok({ sheets: [], headers: [], ...found }) : err(404, 'NOT_FOUND', '导入批次不存在')
     }
     if ((r = /^\/imports\/(\d+)\/commit$/.exec(path)) && m === 'POST') {
       // 同服务端 imports.commit：{batch, stats, allocation}

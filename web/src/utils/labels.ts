@@ -10,6 +10,7 @@ import type {
   AttemptKind,
   AttemptStatus,
   BatchStatus,
+  ConflictKind,
   EventEntity,
   FeishuVerdict,
   GuardCheckKey,
@@ -20,7 +21,9 @@ import type {
   OrderAction,
   OrderStatus,
   OrderView,
+  PauseCause,
   PluginErrorCode,
+  ProgressCancelCode,
   PurchaseMode,
   Resolution,
   ReviewSource,
@@ -166,6 +169,19 @@ export const PLUGIN_ERROR_LABEL: Record<PluginErrorCode, string> = {
   ABORTED_BY_USER: '插件端人工中止',
   SUBMIT_REJECTED: '服务端拒绝了提交登记',
   PLUGIN_SIMULATION_ONLY: '插件只执行模拟任务，却领到了真实任务',
+  ABORTED_BY_SERVER: '服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止',
+}
+
+/** 进度上报被服务端叫停的原因（attempt.progress 的 cancel_code，services/execution.CANCEL_CODES） */
+export const PROGRESS_CANCEL_LABEL: Record<ProgressCancelCode, string> = {
+  UPSTREAM_CANCELLED: '上游已取消',
+  ACCOUNT_ARCHIVED: '账号已归档',
+  ACCOUNT_PAUSED: '账号已暂停执行',
+  IDENTITY_MISMATCH: '浏览器登录的买家账号与绑定不符',
+  IDENTITY_STALE: '设备身份超过 10 分钟没有上报',
+  SOURCE_HOLD: '来源要求暂停采购',
+  SOURCE_CHANGED: '领取后来源有变化',
+  ATTEMPT_FINISHED: '这次采购尝试已结束',
 }
 
 /** 输入：尝试的 error_code（插件码或护栏码）→ 输出：中文说明，未知码原样返回 */
@@ -194,6 +210,11 @@ export const API_ERROR_LABEL: Record<ApiErrorCode, string> = {
   FEISHU_NOT_CONFIGURED: '未配置飞书应用',
   FEISHU_ERROR: '飞书接口出错',
   INVALID_TRANSITION: '当前状态不允许此操作',
+  SOURCE_CHANGED: '领取后来源有变化，提交前中止',
+  GUARD_BLOCKED: '按最新配置复核护栏未通过',
+  RATE_LIMITED: '尝试次数过多，请稍后再试',
+  METHOD_NOT_ALLOWED: '不支持这种请求方法',
+  INTERNAL: '服务器内部错误',
 }
 
 // ── 人审、来源、分配 ──────────────────────────────────────────────────────────
@@ -219,6 +240,15 @@ export const REVIEW_SOURCE_LABEL: Record<ReviewSource, string> = {
 export const SOURCE_KIND_LABEL: Record<SourceKind, string> = {
   feishu: '飞书',
   file: '文件',
+}
+
+/** 冲突种类 → 中文（任务详情「来源冲突」的标题） */
+export const CONFLICT_KIND_LABEL: Record<ConflictKind, string> = {
+  fields: '执行相关字段不一致',
+  review: '来源送来人审拒绝',
+  external_order_no: '来源出现 AMZ 订单号',
+  source_key_changed: '来源记录的平台订单号变了',
+  admission: '来源已不归本系统采购',
 }
 
 export const ASSIGNMENT_KIND_LABEL: Record<AssignmentKind, string> = {
@@ -267,6 +297,13 @@ export const IDENTITY_STATUS_DOT: Record<IdentityStatus, DotColor> = {
   unknown: 'gray',
 }
 
+/** 账号暂停的起因（pause_cause） */
+export const PAUSE_CAUSE_LABEL: Record<PauseCause, string> = {
+  result_unknown: '结果待核实',
+  account_error: '账号级错误',
+  manual: '人工暂停',
+}
+
 export const RUN_TRIGGER_LABEL: Record<RunTrigger, string> = {
   manual: '手动触发',
   scheduled: '定时触发',
@@ -275,8 +312,8 @@ export const RUN_TRIGGER_LABEL: Record<RunTrigger, string> = {
 export const RUN_END_REASON_LABEL: Record<RunEndReason, string> = {
   finished: '正常结束',
   lease_expired: '执行权超时',
-  account_paused: '账号已暂停',
   device_revoked: '设备已撤销',
+  simulation_reset: '已清除模拟结果',
 }
 
 export const MEMBER_ROLE_LABEL: Record<MemberRole, string> = {
@@ -403,7 +440,7 @@ export const EVENT_KIND_LABEL: Record<string, string> = {
   'order.source_conflict': '来源内容冲突',
   'order.source_review_conflict': '来源人审结论冲突',
   'order.source_key_changed': '来源记录的平台订单号变了',
-  'order.source_changed_during_attempt': '采购过程中来源有变化',
+  'order.source_changed_during_attempt': '领取后来源有变化',
   'order.upstream_changed_after_start': '上游在采购开始后修改',
   'order.upstream_cancelled': '上游取消',
   'order.upstream_uncancelled': '上游撤销取消',
@@ -442,7 +479,7 @@ export const EVENT_KIND_LABEL: Record<string, string> = {
   'attempt.failed': '采购失败',
   'attempt.unknown': '结果待核实',
   'attempt.aborted': '已中止',
-  'attempt.late_result': '迟到的结果回执',
+  'attempt.late_result': '插件迟到上报的结果',
   // 账号
   'account.created': '新建账号',
   'account.updated': '修改账号',

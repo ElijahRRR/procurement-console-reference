@@ -144,6 +144,8 @@ export type Msg =
   | { type: "pc.sync"; reason: string; minAgeMs?: number }
   /** 开始执行前：让每个亚马逊标签页重读身份、对账、上报，并同步一次心跳。 */
   | { type: "pc.prepareStart" }
+  /** 执行中（提交登记之前、每隔几分钟）：让每个亚马逊标签页重读身份、对账、强制上报（不发心跳）。 */
+  | { type: "pc.refreshIdentity" }
   | { type: "pc.api"; op: ApiOp; args: unknown[] }
   | { type: "pc.lease"; busy: boolean }
   | { type: "pc.leaseRelease" }
@@ -176,6 +178,14 @@ export interface PrepareReply {
   conflict: boolean;
   identity_status: IdentityStatus | null;
   message: string | null;
+}
+
+/** 后台对 pc.refreshIdentity 的答复。 */
+export interface RefreshIdentityReply {
+  /** 这一次把一份新鲜的身份报到了服务端。 */
+  reported: boolean;
+  conflict: boolean;
+  identity_status: IdentityStatus | null;
 }
 
 export type ApiReply = ApiResult<unknown>;

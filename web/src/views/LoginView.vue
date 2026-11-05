@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import type { FormInstance, FormRules } from 'element-plus'
 import AuthShell from '@/components/AuthShell.vue'
 import * as auth from '@/api/auth'
+import { ApiError } from '@/api/client'
 import { safeRedirect } from '@/router/guard'
 import { setMe } from '@/stores/session'
 import { failureText } from '@/utils/format'
@@ -29,7 +30,9 @@ async function submit() {
     setMe(me)
     await router.replace(safeRedirect(route.query.redirect))
   } catch (e) {
-    error.value = failureText('登录', e)
+    // 同一 IP + 用户名短时间内失败过多 → 429 RATE_LIMITED（带 retry_after_s），不透露还剩几次
+    const limited = e instanceof ApiError && (e.status === 429 || e.code === 'RATE_LIMITED')
+    error.value = limited ? '登录失败：尝试次数过多，请稍后再试' : failureText('登录', e)
   } finally {
     busy.value = false
   }

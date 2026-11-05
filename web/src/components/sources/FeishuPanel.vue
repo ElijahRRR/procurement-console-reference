@@ -28,6 +28,8 @@ const runsOpen = ref(false)
 const runsFor = ref<FeishuConnection | null>(null)
 const runs = ref<SyncRun[]>([])
 const runsLoading = ref(false)
+/** 写回验收后没能恢复原值的测试记录（连接 id → 提醒）：记录里还留着测试值，提醒一直显示到手动关掉 */
+const restoreProblems = ref<Record<number, string>>({})
 
 async function load() {
   loading.value = true
@@ -106,8 +108,17 @@ async function verify(c: FeishuConnection) {
   if (recordId === null) return
   busyId.value = `verify-${c.id}`
   try {
-    const s = verifySummary(await feishu.verifyWriteback(c.id, recordId))
-    notifySummary(s, s.ok ? undefined : 'error')
+    const res = await feishu.verifyWriteback(c.id, recordId)
+    const s = verifySummary(res, recordId)
+    notifySummary(s, s.ok && !s.restoreProblem ? undefined : 'error')
+    const next = { ...restoreProblems.value }
+    if (s.restoreProblem) next[c.id] = s.restoreProblem
+    else delete next[c.id]
+    restoreProblems.value = next
+    // 返回里带着验收后的连接（writeback_state、writeback_verified_at），先换上再整体刷新
+    if (res.connection && res.connection.id === c.id) {
+      connections.value = connections.value.map((x) => (x.id === c.id ? res.connection : x))
+    }
     await load()
   } catch (e) {
     notifyFailure('写回验收', e)
@@ -128,6 +139,12 @@ async function openRuns(c: FeishuConnection) {
   } finally {
     runsLoading.value = false
   }
+}
+
+function dismissRestoreProblem(id: number) {
+  const next = { ...restoreProblems.value }
+  delete next[id]
+  restoreProblems.value = next
 }
 
 function onSaved() {
@@ -203,6 +220,11 @@ function onSaved() {
             </template>
           </dl>
           <el-alert v-if="c.last_error" :title="c.last_error" type="error" :closable="false" show-icon class="mt-3" />
+          <el-alert v-if="restoreProblems[c.id]" :title="restoreProblems[c.id]" type="error" show-icon :closable="false" class="mt-3">
+            <template #default>
+              <el-button size="small" class="mt-2" @click="dismissRestoreProblem(c.id)">关闭提醒</el-button>
+            </template>
+          </el-alert>
 
           <div class="mt-4 flex flex-wrap gap-2 border-t border-gray-100 pt-4 dark:border-dark-700">
             <el-button size="small" type="primary" :disabled="!c.enabled" :loading="busyId === `sync-${c.id}`" @click="sync(c)">

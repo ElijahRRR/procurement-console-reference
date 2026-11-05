@@ -1,7 +1,7 @@
 """唯一命令入口。
 
 用法（在 backend/ 目录内）：
-    python cli.py db_init
+    python cli.py db_init                     # 库不存在时先建库，再建表（幂等）
     python cli.py user_create -p username=david -p workspace="我的工作区"     # 密码交互输入（不进命令历史）
     python cli.py feishu_grant -p workspace_id=2 -p app_token=bascn…        # 把飞书多维表格授权给工作区
     python cli.py serve                       # HTTP 服务 + 后台调度

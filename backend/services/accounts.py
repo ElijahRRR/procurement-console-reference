@@ -26,12 +26,17 @@ _CARD_RE = re.compile(r"^[0-9]{4}$")
 
 #: 前端可能整份回传的只读键，忽略
 _READONLY = frozenset({"id", "workspace_id", "created_at", "updated_at", "archived_at", "quota_today", "devices",
-                       "active_run", "effective_max_delivery_days", "execution_paused", "pause_reason", "paused_at"})
+                       "active_run", "effective_max_delivery_days", "execution_paused", "pause_reason", "paused_at",
+                       "pause_cause", "open_result_unknown"})
 _EDITABLE = ("name", "amazon_customer_id", "site", "min_amount", "max_amount", "daily_limit", "priority",
              "max_delivery_days", "purchase_enabled", "sync_enabled", "purchase_mode", "schedule_times",
              "default_device_id", "expected_card_last4", "notes")
 #: 这些字段变化会改变分配结果
 ALLOCATION_FIELDS = frozenset({"min_amount", "max_amount", "daily_limit", "priority", "purchase_enabled", "site"})
+#: 账号输出的 pause_cause 取值（未暂停为 None）
+PAUSE_CAUSES = ("result_unknown", "account_error", "manual")
+#: 执行模块写的暂停标记里可能出现的起因（见 execution.PAUSE_MARKER_KIND）
+_EXECUTION_CAUSES = frozenset({"result_unknown", "account_error"})
 
 
 # ── 校验 ─────────────────────────────────────────────────────────────────────
@@ -226,6 +231,45 @@ def _iso(v: Any) -> str | None:
     return v.isoformat() if v is not None else None
 
 
+def pause_cause(conn, workspace_id: int, row: dict[str, Any]) -> str | None:
+    """输入：工作区、账号行 → 输出：当前暂停的起因 result_unknown / account_error / manual；未暂停 → None。
+
+    起因按「最近一次暂停」判定（pause_reason 也是那一次写的）：执行模块暂停账号时紧跟 'account.paused' 写一条
+    execution.PAUSE_MARKER_KIND 标记 {cause}，有标记就取它的 cause，没有就是人工暂停。没有任何暂停事件
+    （旧数据）时按 pause_reason 判断：以「结果待核实」开头 → result_unknown，否则 manual。
+    """
+    if not row["execution_paused"]:
+        return None
+    from services import execution      # 延迟导入：execution 在模块级导入本模块
+
+    marker = execution.PAUSE_MARKER_KIND
+    latest = conn.execute(
+        "SELECT kind, detail FROM procure.events WHERE workspace_id = %s AND entity = 'account' AND entity_id = %s "
+        "AND kind = ANY(%s) ORDER BY id DESC LIMIT 1",
+        (workspace_id, row["id"], ["account.paused", marker]),
+    ).fetchone()
+    if latest is None:
+        return "result_unknown" if (row["pause_reason"] or "").startswith("结果待核实") else "manual"
+    if latest["kind"] != marker:
+        return "manual"
+    cause = (latest["detail"] or {}).get("cause")
+    return cause if cause in _EXECUTION_CAUSES else "account_error"
+
+
+def open_result_unknown(conn, workspace_id: int, account_id: int) -> int:
+    """输入：工作区、账号 id → 输出：这个账号当前处在「结果待核实」的任务数（按待核实尝试的账号，
+    没有尝试指针时按任务的分配账号）。"""
+    return int(conn.execute(
+        """
+        SELECT count(*) AS n FROM procure.purchase_orders o
+        LEFT JOIN procure.purchase_attempts a ON a.id = o.current_attempt_id AND a.workspace_id = o.workspace_id
+        WHERE o.workspace_id = %s AND o.status = 'result_unknown'
+          AND COALESCE(a.account_id, o.assigned_account_id) = %s
+        """,
+        (workspace_id, account_id),
+    ).fetchone()["n"])
+
+
 def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days: int) -> dict[str, Any]:
     from services import devices        # 延迟导入：devices 也导入本模块
 
@@ -253,7 +297,8 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
                                         else default_days),
         "purchase_enabled": row["purchase_enabled"], "sync_enabled": row["sync_enabled"],
         "execution_paused": row["execution_paused"], "pause_reason": row["pause_reason"],
-        "paused_at": _iso(row["paused_at"]), "purchase_mode": row["purchase_mode"],
+        "paused_at": _iso(row["paused_at"]), "pause_cause": pause_cause(conn, ws, row),
+        "open_result_unknown": open_result_unknown(conn, ws, row["id"]), "purchase_mode": row["purchase_mode"],
         "schedule_times": list(row["schedule_times"] or []), "default_device_id": row["default_device_id"],
         "expected_card_last4": row["expected_card_last4"], "notes": row["notes"],
         "quota_today": quota.summary(conn, row, clock.bj_today(), simulated),
@@ -270,7 +315,8 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
 
 
 def get(conn, workspace_id: int, account_id: int) -> dict[str, Any]:
-    """输入：工作区、账号 id → 输出：契约 §10 账号形状（含 quota_today、devices、active_run）。"""
+    """输入：工作区、账号 id → 输出：契约 §10 账号形状（含 quota_today、devices、active_run、pause_cause、
+    open_result_unknown）。"""
     row = get_row(conn, workspace_id, account_id)
     st = settings_svc.get_row(conn, workspace_id)
     return _shape(conn, workspace_id, row, simulated=st["simulation_only"],

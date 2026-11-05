@@ -68,8 +68,9 @@ def upload(file: UploadFile = File(...), ctx: deps.Console = Depends(deps.consol
 
 @router.get("/imports/{batch_id}")
 def get_batch(batch_id: int, ctx: deps.Console = Depends(deps.console)):
-    """输入：批次 id → 输出：批次；别的工作区 → 404（契约 §8 之外的补充接口）。"""
-    return respond(imports.get_batch(ctx.conn, ctx.workspace_id, batch_id))
+    """输入：批次 id → 输出：批次 + sheets: [{name, row_count, headers}] + headers（所选工作表的表头；原件已清掉时
+    为空列表）；别的工作区 → 404。"""
+    return respond(imports.get_batch(ctx.conn, ctx.workspace_id, batch_id, with_sheets=True))
 
 
 @router.post("/imports/{batch_id}/preview")

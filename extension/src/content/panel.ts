@@ -197,7 +197,7 @@ export function mountPanel(host: RunHost, readIdentity: (force: boolean) => Prom
 
     const conn = connectionText(s, Date.now());
     const ident = identityText(s);
-    const outcome = SIM_OUTCOMES.find((o) => o.value === s.settings.simulationOutcome)?.label ?? s.settings.simulationOutcome;
+    const outcome = SIM_OUTCOMES.find((o) => o.value === s.settings.simulationOutcome)?.label ?? "—";
     body.append(
       h(
         "dl",

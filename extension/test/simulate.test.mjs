@@ -112,5 +112,5 @@ test("日志只保留最近 50 行；错误码都有中文说明", () => {
   assert.equal(lines[0].text, "第 10 行");
   assert.match(codeLabel("ACCOUNT_BUSY"), /其他设备/);
   assert.match(codeLabel("PRICE_OVER_CAP"), /限价/);
-  assert.equal(codeLabel("SOMETHING_NEW"), "SOMETHING_NEW");
+  assert.equal(codeLabel("SOMETHING_NEW"), "其他原因（插件不认识这个错误码）", "认不出的码也不原样显示");
 });

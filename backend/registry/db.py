@@ -11,12 +11,15 @@ import contextlib
 from collections.abc import Iterator
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 
 from registry import settings
 
 #: 单条 SQL 的缺省超时（秒）。卡死的查询响亮失败好过无声挂住。
 STATEMENT_TIMEOUT_S = 60
+#: 建库时连接的维护库（同一服务器、同一身份）
+MAINTENANCE_DB = "postgres"
 
 
 @contextlib.contextmanager
@@ -39,5 +42,31 @@ def pg_conn(dsn: str | None = None, autocommit: bool = False,
         if not autocommit:
             conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def dsn_dbname(dsn: str | None = None) -> str | None:
+    """输入：可选 DSN（缺省 settings 的 PC_PG_DSN）→ 输出：其中写明的库名；没写 → None（由 libpq 按 PGDATABASE /
+    用户名决定）。"""
+    return conninfo_to_dict(dsn or settings.get().pg_dsn).get("dbname") or None
+
+
+@contextlib.contextmanager
+def admin_conn(dsn: str | None = None, maintenance_db: str = MAINTENANCE_DB) -> Iterator[psycopg.Connection]:
+    """输入：可选 DSN、维护库名 → 输出：连到同一服务器维护库的 autocommit 连接（dict 行；总是 close）。
+
+    只给 db_init 建库用（CREATE DATABASE 不能在事务里、也不能连在要建的库上）。主机、端口、用户、密码等都沿用 DSN，
+    只把库名换成维护库。
+    """
+    conn = psycopg.connect(
+        make_conninfo(dsn or settings.get().pg_dsn, dbname=maintenance_db),
+        autocommit=True,
+        row_factory=dict_row,
+        options=f"-c statement_timeout={int(STATEMENT_TIMEOUT_S * 1000)} -c TimeZone=UTC",
+        application_name="procurement-console-admin",
+    )
+    try:
+        yield conn
     finally:
         conn.close()

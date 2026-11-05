@@ -8,15 +8,14 @@ import type { Account, Device } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
 import * as devicesApi from '@/api/devices'
 import * as settingsApi from '@/api/settings'
-import * as ordersApi from '@/api/orders'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import StatusDot from '@/components/StatusDot.vue'
 import AccountDialog from './AccountDialog.vue'
 import { formatAmountRange, formatDateTime, formatNumber, formatRelative } from '@/utils/format'
-import { IDENTITY_STATUS_DOT, IDENTITY_STATUS_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
-import { resumeConfirmText } from '@/utils/accounts'
-import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
+import { IDENTITY_STATUS_DOT, IDENTITY_STATUS_LABEL, PAUSE_CAUSE_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
+import { resumeConfirmText, resumeNeedsCaution } from '@/utils/accounts'
+import { confirmAction, notifyFailure, notifySuccess, promptText, toast } from '@/utils/feedback'
 
 const accounts = ref<Account[]>([])
 const devices = ref<Device[]>([])
@@ -117,23 +116,29 @@ async function pause(a: Account) {
   }
 }
 
-/** 输入：账号 → 输出：该账号仍为「结果待核实」的任务数；读不到为 null（确认框改用通用提醒） */
-async function openUnknownCount(a: Account): Promise<number | null> {
+/** 输入：列表里的账号 → 输出：重新读到的账号（暂停起因、结果待核实的任务数是最新的）；读不到时用列表里的 */
+async function freshAccount(a: Account): Promise<Account> {
   try {
-    return (await ordersApi.listOrders({ view: 'result_unknown', account_id: a.id, page: 1, page_size: 1 })).total
+    const next = await accountsApi.getAccount(a.id)
+    replace(next)
+    return next
   } catch {
-    return null
+    return a
   }
 }
 
-async function resume(a: Account) {
-  busy.value = `resume-${a.id}`
-  const open = await openUnknownCount(a)
+async function resume(row: Account) {
+  busy.value = `resume-${row.id}`
+  const a = await freshAccount(row)
   busy.value = null
+  if (!a.execution_paused) {
+    toast(`「${a.name}」已不在暂停状态`, 'info')
+    return
+  }
   const ok = await confirmAction({
-    message: resumeConfirmText(a.name, a.pause_reason, open),
+    message: resumeConfirmText(a),
     confirmText: '恢复执行',
-    danger: !!open,
+    danger: resumeNeedsCaution(a),
   })
   if (!ok) return
   busy.value = `resume-${a.id}`
@@ -232,8 +237,9 @@ function quotaStatus(a: Account): '' | 'warning' {
           <template #default="{ row }">
             <div class="flex flex-col items-start gap-1">
               <template v-if="row.execution_paused">
-                <StatusDot color="red" label="已暂停" />
+                <StatusDot color="red" :label="row.pause_cause ? `已暂停 · ${labelOf(PAUSE_CAUSE_LABEL, row.pause_cause)}` : '已暂停'" />
                 <span class="break-all text-xs text-gray-700 dark:text-gray-300">{{ row.pause_reason || '未写原因' }}</span>
+                <span v-if="row.open_result_unknown" class="text-xs text-red-600 dark:text-red-400">还有 {{ formatNumber(row.open_result_unknown) }} 笔结果待核实</span>
                 <span class="text-xs text-gray-500 dark:text-dark-400">{{ formatDateTime(row.paused_at) }}</span>
                 <el-button size="small" :loading="busy === `resume-${row.id}`" @click="resume(row as Account)">恢复执行</el-button>
               </template>

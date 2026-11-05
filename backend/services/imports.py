@@ -105,9 +105,31 @@ def batch_out(row: dict[str, Any]) -> dict[str, Any]:
             "uploaded_by_name": row.get("uploaded_by_name")}
 
 
-def get_batch(conn, workspace_id: int, batch_id: int) -> dict[str, Any]:
-    """输入：工作区、批次 id → 输出：批次形状；跨工作区 → NOT_FOUND。"""
-    return batch_out(_batch(conn, workspace_id, batch_id))
+def get_batch(conn, workspace_id: int, batch_id: int, *, with_sheets: bool = False) -> dict[str, Any]:
+    """输入：工作区、批次 id、是否附带工作表 → 输出：批次形状；跨工作区 → NOT_FOUND。
+
+    with_sheets=True（GET /imports/{id}）时另附 sheets: [{name, row_count, headers}] 与 headers（批次所选工作表的
+    表头，按文件里的顺序），从存下的原件重新读出；原件已清掉（放弃的批次）或读不出时都是空列表。
+    """
+    row = _batch(conn, workspace_id, batch_id)
+    out = batch_out(row)
+    if with_sheets:
+        out.update(_stored_sheets(conn, workspace_id, row))
+    return out
+
+
+def _stored_sheets(conn, ws: int, row: dict[str, Any]) -> dict[str, Any]:
+    data = conn.execute("SELECT file_bytes FROM procure.import_batches WHERE id = %s AND workspace_id = %s",
+                        (row["id"], ws)).fetchone()["file_bytes"]
+    if not data:
+        return {"sheets": [], "headers": []}
+    try:
+        sheets = sheet_io.read_workbook(bytes(data), row["filename"])
+    except DomainError:
+        return {"sheets": [], "headers": []}
+    chosen = next((s for s in sheets if s.name == row["sheet_name"]), None)
+    return {"sheets": [{"name": s.name, "row_count": len(s.rows), "headers": list(s.headers)} for s in sheets],
+            "headers": list(chosen.headers) if chosen is not None else []}
 
 
 def _file_admission(conn, ws: int, admission: dict[str, Any] | None) -> dict[str, Any]:

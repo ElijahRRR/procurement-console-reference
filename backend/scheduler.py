@@ -44,10 +44,11 @@ TICK_S = 1.0
 
 
 def run_sweep(now: datetime) -> dict[str, Any]:
-    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}（workflows.sweep.run）。"""
+    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}
+    （workflows.sweep.run(now=now)：租约按这个时刻判定是否过期）。"""
     from workflows import sweep
 
-    return sweep.run()
+    return sweep.run(now=now)
 
 
 def run_feishu_intake(now: datetime) -> dict[str, Any]:

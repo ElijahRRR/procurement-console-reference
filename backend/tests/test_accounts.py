@@ -17,7 +17,7 @@ ACCOUNT_KEYS = {
     "id", "name", "amazon_customer_id", "site", "min_amount", "max_amount", "daily_limit", "priority",
     "max_delivery_days", "effective_max_delivery_days", "purchase_enabled", "sync_enabled", "execution_paused",
     "pause_reason", "paused_at", "purchase_mode", "schedule_times", "default_device_id", "expected_card_last4",
-    "notes", "quota_today", "devices", "active_run", "created_at", "updated_at",
+    "notes", "quota_today", "devices", "active_run", "created_at", "updated_at", "pause_cause", "open_result_unknown",
 }
 
 

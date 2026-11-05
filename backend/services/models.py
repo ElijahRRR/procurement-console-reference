@@ -8,9 +8,10 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Context, Decimal
 from typing import Any
 
 # ── 任务状态 ──────────────────────────────────────────────────────────────────
@@ -97,6 +98,7 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("IDENTITY_MISMATCH", "account", "浏览器登录的买家账号与绑定不符"),
     ErrorCode("ABORTED_UPSTREAM_CANCELLED", "abort", "上游已取消，已中止"),
     ErrorCode("ABORTED_BY_USER", "abort", "插件端人工中止"),
+    ErrorCode("ABORTED_BY_SERVER", "abort", "服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止"),
     ErrorCode("ITEM_MISMATCH", "guard", "结算商品或数量与任务不一致"),
     ErrorCode("ZIP_MISMATCH", "guard", "收货邮编与任务不一致"),
     ErrorCode("SUBTOTAL_OUT_OF_RANGE", "guard", "商品小计不在账号金额区间内"),
@@ -214,36 +216,63 @@ def _jsonable(v: Any) -> Any:
 
 _CENT = Decimal("0.01")
 _NOISE = Decimal("0.000001")
+#: 金额列都是 numeric(12,2)：绝对值须小于 10^10，放不下的按读不出（None）
+MONEY_LIMIT = Decimal(10) ** 10
+#: 模拟尝试的亚马逊订单号前缀（模拟单号只能以它开头，真实单号不得以它开头）
+SIM_PREFIX = "SIM-"
+#: 金额换算用自己的上下文（不受调用方 decimal.localcontext 影响）
+_CTX = Context(prec=28)
+#: 文本金额：可带正负号；整数部分是普通数字或按 3 位分组的千分位逗号；不认指数写法
+_MONEY_TEXT_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?$|^[+-]?\.\d+$")
 
 
 def money(v: Any) -> Decimal | None:
-    """输入：数字 / 字符串（可带 $ 与千分位）/ None → 输出：两位小数的 Decimal（四舍五入）或 None。
+    """输入：数字 / 字符串（可带 $、US 与千分位逗号）/ None → 输出：两位小数的 Decimal（四舍五入）或 None。
 
-    先按 6 位小数抹掉浮点噪声（78.68999999 → 78.690000），再取两位。
+    先按 6 位小数抹掉浮点噪声（78.68999999 → 78.690000），再取两位。读不出、指数写法、逗号不是千分位
+    （12,5、1.234,50）、绝对值 ≥ 10^10（numeric(12,2) 放不下）→ None。从不抛异常。
     """
-    d = _parse_decimal(v)
-    return None if d is None else d.quantize(_NOISE, rounding=ROUND_HALF_UP).quantize(_CENT, rounding=ROUND_HALF_UP)
+    return _round(_parse_decimal(v), ROUND_HALF_UP)
 
 
 def money_cap(v: Any) -> Decimal | None:
-    """输入：同 money → 输出：用作上限（限价）的两位小数，**向下取整**（78.685 → 78.68），宁可少放行 1 美分。"""
-    d = _parse_decimal(v)
-    return None if d is None else d.quantize(_NOISE, rounding=ROUND_HALF_UP).quantize(_CENT, rounding=ROUND_DOWN)
+    """输入：同 money → 输出：用作上限（限价）的两位小数，**向下取整**（78.685 → 78.68），宁可少放行 1 美分；
+    不合格的输入同样 → None。"""
+    return _round(_parse_decimal(v), ROUND_DOWN)
+
+
+def _round(d: Decimal | None, rounding: str) -> Decimal | None:
+    if d is None:
+        return None
+    try:
+        out = d.quantize(_NOISE, rounding=ROUND_HALF_UP, context=_CTX).quantize(_CENT, rounding=rounding, context=_CTX)
+    except ArithmeticError:            # decimal.InvalidOperation 等：位数超出精度（|d| < 10^10 时不会发生）
+        return None
+    return out if out.copy_abs() < MONEY_LIMIT else None
 
 
 def _parse_decimal(v: Any) -> Decimal | None:
+    """输入：任意值 → 输出：有限且绝对值 < 10^10 的 Decimal；其他 → None（不抛异常）。
+
+    数字（int / float / Decimal）按数值换算（float 取最短十进制表示）；其他值按文本：去掉首尾空白、$ 与 US，
+    只认 _MONEY_TEXT_RE 的写法。
+    """
     if v is None or isinstance(v, bool):
         return None
-    if isinstance(v, Decimal):
-        d = v
-    else:
-        s = str(v).strip().replace("$", "").replace(",", "").replace("US", "").strip()
-        if not s:
-            return None
-        try:
-            d = Decimal(s)
-        except Exception:
-            return None
-    if not d.is_finite():
+    try:
+        if isinstance(v, Decimal):
+            d = v
+        elif isinstance(v, int):
+            d = Decimal(v)
+        elif isinstance(v, float):
+            d = Decimal(str(v))
+        else:
+            s = str(v).strip().replace("$", "").replace("US", "").strip()
+            if not s or not _MONEY_TEXT_RE.match(s):
+                return None
+            d = Decimal(s.replace(",", ""))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if not d.is_finite() or d.copy_abs() >= MONEY_LIMIT:
         return None
     return d

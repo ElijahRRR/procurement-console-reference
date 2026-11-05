@@ -1,6 +1,7 @@
 /** 三处界面（页面内面板、设置页、弹出页）共用的展示逻辑：状态 → 中文文案与色调，
  *  以及一个只用 textContent 的 DOM 构造器（动态内容从不拼进 innerHTML）。 */
 
+import { codeLabel } from "../core/codes.js";
 import { IDENTITY_STATUS_TEXT, maskCustomerId } from "../core/identity.js";
 import type { StateSnapshot } from "../core/messages.js";
 import { receiptText } from "../core/receipts.js";
@@ -19,7 +20,7 @@ export function connectionText(s: StateSnapshot, now: number): { text: string; t
   if (!s.device.paired) return { text: "未配对", tone: "muted" };
   const c = s.connection;
   if (!c) return { text: "正在连接", tone: "muted" };
-  if (!c.ok) return { text: `连接失败：${c.message ?? c.code ?? "未知原因"}`, tone: "danger" };
+  if (!c.ok) return { text: `连接失败：${c.message ?? codeLabel(c.code)}`, tone: "danger" };
   if (now - c.at > STALE_MS) return { text: `最近联系 ${bjShort(c.at) ?? "—"}，之后没有心跳`, tone: "warning" };
   return { text: `已连接 · ${bjClock(c.at)} 心跳`, tone: "success" };
 }
@@ -47,7 +48,7 @@ export function scheduleText(s: StateSnapshot): string {
     return slots.length ? `定时 ${slots.join("、")}（北京时间）` : "定时（未设置时间）";
   }
   if (a.purchase_mode === "manual") return "手动";
-  return a.purchase_mode ?? "—";
+  return "—"; // 认不出的执行方式不原样显示
 }
 
 /** 输入：状态快照 → 输出：绑定账号文案。 */

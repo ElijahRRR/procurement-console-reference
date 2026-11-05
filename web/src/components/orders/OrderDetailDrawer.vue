@@ -32,7 +32,6 @@ import {
   ATTEMPT_STATUS_LABEL,
   ATTEMPT_STATUS_TAG,
   GUARD_CODE_LABEL,
-  ORDER_STATUS_LABEL,
   RESOLUTION_LABEL,
   REVIEW_STATUS_LABEL,
   REVIEW_STATUS_TAG,
@@ -45,7 +44,16 @@ import {
   tagOf,
 } from '@/utils/labels'
 import { normalizeGuardChecks } from '@/utils/guard'
-import { missingFieldsText, showStatusReason, statusAlertType } from '@/utils/orderDetail'
+import {
+  amazonOrderNoProblem,
+  conflictView,
+  eventSummary,
+  missingFieldsText,
+  showStatusReason,
+  statusAlertType,
+  unknownPrefill,
+  type ConflictChoice,
+} from '@/utils/orderDetail'
 import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
 
 const props = defineProps<{ orderId: number | null }>()
@@ -209,23 +217,6 @@ function attemptAmounts(a: Attempt): [string, string][] {
     ['税前总额', formatMoney(a.total_before_tax)],
     ['结算总额', formatMoney(a.total)],
   ]
-}
-
-function eventSummary(e: EventRecord): string {
-  const d = e.detail ?? {}
-  const parts: string[] = []
-  const from = typeof d.from === 'string' ? d.from : null
-  const to = typeof d.to === 'string' ? d.to : null
-  if (from && to) parts.push(`${labelOf(ORDER_STATUS_LABEL, from)} → ${labelOf(ORDER_STATUS_LABEL, to)}`)
-  for (const k of ['reason', 'note', 'message', 'account_name', 'amazon_order_no']) {
-    const v = d[k]
-    if (typeof v === 'string' && v) parts.push(v)
-  }
-  if (!parts.length) {
-    const rest = Object.entries(d).filter(([, v]) => v !== null && v !== undefined && v !== '')
-    if (rest.length) parts.push(rest.map(([k, v]) => `${fieldLabel(k)}：${displayValue(v)}`).join('；'))
-  }
-  return parts.join(' · ')
 }
 
 function actorText(e: EventRecord): string {
@@ -463,12 +454,20 @@ const moneyRule = {
   },
   trigger: 'blur',
 }
+/** 打开对话框时按待核实的尝试预填（迟到的回执补进了单号或金额），附上最近一条迟到回执的说明 */
+const unknownInit = ref(unknownPrefill(null))
 const unknownRules = computed<FormRules>(() => ({
   amazon_order_no:
     unknownForm.outcome === 'ordered'
       ? [
-          { required: true, message: '请填写亚马逊订单号', trigger: 'blur' },
-          { pattern: /^\d{3}-\d{7}-\d{7}$/, message: '格式应为 123-1234567-1234567', trigger: 'blur' },
+          {
+            required: true,
+            validator: (_r: unknown, v: string, cb: (e?: Error) => void) => {
+              const problem = amazonOrderNoProblem(v, unknownInit.value.simulated)
+              cb(problem ? new Error(problem) : undefined)
+            },
+            trigger: 'blur',
+          },
         ]
       : [],
   total: unknownForm.outcome === 'ordered' ? [{ required: true, message: '请填写结算总额', trigger: 'blur' }, moneyRule] : [],
@@ -480,14 +479,16 @@ const unknownRules = computed<FormRules>(() => ({
 }))
 
 function openUnknown() {
+  const init = unknownPrefill(detail.value ? { attempts: detail.value.attempts, events: allEvents.value } : null)
+  unknownInit.value = init
   Object.assign(unknownForm, {
     outcome: 'ordered',
-    amazon_order_no: '',
-    subtotal: '',
-    shipping: '',
-    tax: '',
-    total_before_tax: '',
-    total: '',
+    amazon_order_no: init.amazon_order_no,
+    subtotal: init.subtotal,
+    shipping: init.shipping,
+    tax: init.tax,
+    total_before_tax: init.total_before_tax,
+    total: init.total,
     note: '',
   })
   unknownOpen.value = true
@@ -559,20 +560,23 @@ async function repurchase(decision: 'approve' | 'decline') {
 
 // ── 冲突 ──────────────────────────────────────────────────────────────────────
 
+/** 冲突区的说明与按钮：accept 的含义随冲突种类而变（字段 / 人审 / 外部单号 / 准入 / 平台订单号变化） */
+const conflict = computed(() => conflictView(detail.value?.conflict, detail.value?.status))
+
 async function resolveConflict(choice: 'keep' | 'accept') {
   if (!detail.value) return
-  const keep = choice === 'keep'
+  const c: ConflictChoice | null = choice === 'keep' ? conflict.value.keep : conflict.value.accept
+  if (!c) return
   const note = await promptText({
-    title: keep ? '保留当前值' : '接受来源新值',
-    message: keep
-      ? '确定要保留当前的执行值、忽略来源送来的新值吗？'
-      : '确定要接受来源送来的新值吗？任务会按新值重新校验，控制台覆盖值不受影响。',
+    title: c.title,
+    message: c.message,
     placeholder: '核实说明（可选）',
-    confirmText: keep ? '保留当前' : '接受新值',
+    confirmText: c.label,
+    danger: c.danger,
   })
   if (note === null) return
   const id = detail.value.id
-  await run('处理冲突', () => ordersApi.resolveConflict(id, choice, note || undefined), keep ? '已保留当前值' : '已接受来源新值')
+  await run('处理冲突', () => ordersApi.resolveConflict(id, choice, note || undefined), c.success)
 }
 
 // ── 需要留意 ──────────────────────────────────────────────────────────────────
@@ -701,11 +705,14 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
         </section>
 
         <section v-if="detail.conflict" class="pc-section">
-          <h3 class="pc-section-title">来源冲突</h3>
+          <h3 class="pc-section-title flex flex-wrap items-center gap-2">
+            来源冲突
+            <el-tag size="small" type="danger" disable-transitions>{{ conflict.kindLabel }}</el-tag>
+          </h3>
           <p class="mb-2 text-sm text-gray-500 dark:text-dark-400">
-            {{ labelOf(SOURCE_KIND_LABEL, detail.conflict.source_kind) }}来源送来的执行相关字段与当前不同（{{ formatDateTime(detail.conflict.at) }}），任务暂停在「待核实」。
+            {{ conflict.description }}<span v-if="detail.conflict.at" class="whitespace-nowrap">（{{ formatDateTime(detail.conflict.at) }}）</span>
           </p>
-          <el-table :data="conflictRows" size="small" class="eq-table-card">
+          <el-table v-if="conflictRows.length" :data="conflictRows" size="small" class="eq-table-card">
             <el-table-column label="字段" prop="label" width="130" />
             <el-table-column label="当前值" min-width="160">
               <template #default="{ row }"><span class="text-gray-900 dark:text-white">{{ row.current }}</span></template>
@@ -714,10 +721,18 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
               <template #default="{ row }"><span class="font-medium text-amber-700 dark:text-amber-400">{{ row.incoming }}</span></template>
             </el-table-column>
           </el-table>
-          <div v-if="can('resolve_conflict')" class="mt-3 flex flex-wrap gap-2">
-            <el-button :loading="busy === '处理冲突'" @click="resolveConflict('keep')">保留当前</el-button>
-            <el-button type="primary" :loading="busy === '处理冲突'" @click="resolveConflict('accept')">接受来源新值</el-button>
+          <div v-if="can('resolve_conflict')" class="mt-3 flex flex-wrap items-center gap-2">
+            <el-button :loading="busy === '处理冲突'" @click="resolveConflict('keep')">{{ conflict.keep.label }}</el-button>
+            <el-button
+              v-if="conflict.accept"
+              :type="conflict.accept.danger ? 'danger' : 'primary'"
+              :loading="busy === '处理冲突'"
+              @click="resolveConflict('accept')"
+            >
+              {{ conflict.accept.label }}
+            </el-button>
           </div>
+          <p v-if="conflict.acceptBlocked" class="mt-2 text-xs text-gray-500 dark:text-dark-400">{{ conflict.acceptBlocked }}</p>
         </section>
 
         <section class="pc-section">
@@ -900,8 +915,8 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
           <el-button type="primary" :loading="busy === '同意重采'" @click="repurchase('approve')">同意重采</el-button>
         </template>
         <template v-if="can('resolve_conflict') && !detail.conflict">
-          <el-button :loading="busy === '处理冲突'" @click="resolveConflict('keep')">保留当前</el-button>
-          <el-button type="primary" :loading="busy === '处理冲突'" @click="resolveConflict('accept')">接受来源新值</el-button>
+          <el-button :loading="busy === '处理冲突'" @click="resolveConflict('keep')">{{ conflict.keep.label }}</el-button>
+          <el-button v-if="conflict.accept" type="primary" :loading="busy === '处理冲突'" @click="resolveConflict('accept')">{{ conflict.accept.label }}</el-button>
         </template>
       </div>
     </template>
@@ -980,13 +995,25 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
 
     <!-- 结果待核实 -->
     <el-dialog v-model="unknownOpen" title="核实采购结果" width="600px" append-to-body>
-      <el-alert
-        type="warning"
-        :closable="false"
-        show-icon
-        class="mb-4"
-        title="请先在买家账号的亚马逊订单页核实。已登记提交的尝试可能已经下单，确认未下单前不要重新采购。"
-      />
+      <div class="mb-4 space-y-2">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="请先在买家账号的亚马逊订单页核实。已登记提交的尝试可能已经下单，确认未下单前不要重新采购。"
+        />
+        <el-alert
+          v-if="unknownInit.hint"
+          type="info"
+          :closable="false"
+          show-icon
+          :title="unknownInit.hint"
+          :description="unknownInit.prefilled ? '已按插件上报的回执预填单号与金额，请与亚马逊订单页逐项核对后再登记。' : ''"
+        />
+        <p v-if="unknownInit.simulated" class="text-xs text-gray-500 dark:text-dark-400">
+          这是模拟尝试，插件没有真实下单；登记已下单时填写模拟单号（SIM- 开头）。
+        </p>
+      </div>
       <el-form ref="unknownRef" :model="unknownForm" :rules="unknownRules" label-position="top">
         <el-form-item label="核实结论">
           <el-radio-group v-model="unknownForm.outcome">
@@ -996,7 +1023,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
         </el-form-item>
         <template v-if="unknownForm.outcome === 'ordered'">
           <el-form-item label="亚马逊订单号" prop="amazon_order_no">
-            <el-input v-model="unknownForm.amazon_order_no" placeholder="123-1234567-1234567" />
+            <el-input v-model="unknownForm.amazon_order_no" :placeholder="unknownInit.simulated ? 'SIM-20261105-27' : '123-1234567-1234567'" />
           </el-form-item>
           <div class="grid gap-x-6 sm:grid-cols-3">
             <el-form-item label="商品小计" prop="subtotal"><el-input v-model="unknownForm.subtotal" placeholder="0.00"><template #prefix>$</template></el-input></el-form-item>

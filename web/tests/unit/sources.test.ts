@@ -61,15 +61,47 @@ describe('文件导入向导', () => {
     expect(canResume({ status: 'committed' })).toBe(false)
     expect(canResume({ status: 'discarded' })).toBe(false)
   })
-  it('从批次的工作表与 mapping 恢复向导', () => {
-    expect(resumeFromBatch({ sheet_name: '采购订单', mapping: { 平台订单号: 'upstream_order_no', 备注: null, ASIN: '' } })).toEqual({
+  it('读不到原文件（headers、sheets 为空）时退回批次的工作表与 mapping 的键', () => {
+    expect(
+      resumeFromBatch({ sheet_name: '采购订单', mapping: { 平台订单号: 'upstream_order_no', 备注: null, ASIN: '' }, sheets: [], headers: [], stats: { total: 12 } }),
+    ).toEqual({
       sheet: '采购订单',
       headers: ['平台订单号', '备注', 'ASIN'],
       mapping: { 平台订单号: 'upstream_order_no', 备注: null, ASIN: null },
+      sheets: [{ name: '采购订单', row_count: 12, headers: ['平台订单号', '备注', 'ASIN'] }],
+    })
+    // 旧服务端没有 headers / sheets 字段
+    expect(resumeFromBatch({ sheet_name: 'S', mapping: { a: 'asin' } })).toEqual({
+      sheet: 'S', headers: ['a'], mapping: { a: 'asin' }, sheets: [{ name: 'S', row_count: null, headers: ['a'] }],
     })
     expect(resumeFromBatch({ sheet_name: null, mapping: { a: null } })).toBeNull()
     expect(resumeFromBatch({ sheet_name: 'S', mapping: null })).toBeNull()
     expect(resumeFromBatch({ sheet_name: 'S', mapping: {} })).toBeNull()
+  })
+  it('表头按原文件顺序（GET /imports/{id} 的 headers），工作表列表用 sheets', () => {
+    const state = resumeFromBatch({
+      sheet_name: '采购订单',
+      // jsonb 打乱了键的顺序，还带着一个原文件里没有的键
+      mapping: { 限价: 'price_cap', 平台订单号: 'upstream_order_no', 旧列: 'asin' },
+      headers: ['平台订单号', 'ASIN', '限价'],
+      sheets: [
+        { name: '说明', row_count: 3, headers: ['说明'] },
+        { name: '采购订单', row_count: 28, headers: ['平台订单号', 'ASIN', '限价'] },
+      ],
+    })
+    expect(state).toEqual({
+      sheet: '采购订单',
+      headers: ['平台订单号', 'ASIN', '限价'],
+      mapping: { 平台订单号: 'upstream_order_no', ASIN: null, 限价: 'price_cap' },
+      sheets: [
+        { name: '说明', row_count: 3, headers: ['说明'] },
+        { name: '采购订单', row_count: 28, headers: ['平台订单号', 'ASIN', '限价'] },
+      ],
+    })
+    // 批次没记下工作表时取第一个有表头的工作表，对应全部留空
+    expect(resumeFromBatch({ sheet_name: null, mapping: null, headers: [], sheets: [{ name: '空表', row_count: 0, headers: [] }, { name: 'S2', row_count: 2, headers: ['x'] }] })).toEqual({
+      sheet: 'S2', headers: ['x'], mapping: { x: null }, sheets: [{ name: '空表', row_count: 0, headers: [] }, { name: 'S2', row_count: 2, headers: ['x'] }],
+    })
   })
   it('重复上传提醒写明批次、状态与时间', () => {
     const t = previousUploadText({ id: 41, status: 'committed', created_at: '2026-11-05T02:20:00+00:00' })

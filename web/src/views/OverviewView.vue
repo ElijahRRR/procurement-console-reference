@@ -44,6 +44,8 @@ const preStart = computed(() => preStartManual(data.value?.counts))
 /** 异常处理页的异常 + 结果待核实 + 待决定重采 */
 const exceptions = computed(() => exceptionManual(data.value?.counts))
 const unknownCount = computed(() => counts.value.result_unknown ?? 0)
+/** 置了「需要留意」提醒的任务数（不论状态） */
+const attentionCount = computed(() => data.value?.needs_attention ?? 0)
 const last = computed<AllocationSummary | null>(() => data.value?.last_allocation ?? null)
 
 async function reallocate() {
@@ -139,10 +141,15 @@ function open(row: OrderRow | { id: number }) {
             <el-button text size="small" @click="router.push({ path: '/exceptions', query: { view: 'exception' } })">查看全部<AppIcon name="chevronRight" size="sm" class="ml-1" /></el-button>
           </div>
         </template>
-        <div v-if="unknownCount" class="px-4 pt-4">
-          <el-alert type="error" show-icon :closable="false" :title="`有 ${formatNumber(unknownCount)} 笔结果待核实：已登记提交但没有确认结果，对应账号已暂停执行。核实前不会重买。`">
+        <div v-if="unknownCount || attentionCount" class="space-y-3 px-4 pt-4">
+          <el-alert v-if="unknownCount" type="error" show-icon :closable="false" :title="`有 ${formatNumber(unknownCount)} 笔结果待核实：已登记提交但没有确认结果，对应账号已暂停执行。核实前不会重买。`">
             <template #default>
               <el-button size="small" class="mt-2" @click="router.push({ path: '/exceptions', query: { view: 'result_unknown' } })">去核实</el-button>
+            </template>
+          </el-alert>
+          <el-alert v-if="attentionCount" type="warning" show-icon :closable="false" :title="`有 ${formatNumber(attentionCount)} 笔任务需要留意（如上游在采购开始后修改或取消），处理后在任务详情里标记已处理。`">
+            <template #default>
+              <el-button size="small" class="mt-2" @click="router.push({ path: '/exceptions', query: { view: 'needs_attention' } })">去处理</el-button>
             </template>
           </el-alert>
         </div>

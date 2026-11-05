@@ -13,7 +13,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from registry import db
+from registry import db, settings
 from services import accounts, clock, execution, guard, orders, simulation
 from services.errors import DomainError
 from tests import factories as f
@@ -174,7 +174,7 @@ def test_next_says_busy_with_retry_hint_when_candidates_are_locked(clean_db, con
         holder.execute("SELECT 1 FROM procure.purchase_orders WHERE id = %s FOR UPDATE", (order["id"],))
         with db.pg_conn(clean_db) as c:
             out = execution.next_attempt(c, dev, run_id)
-        assert out["attempt"] is None and out["retry_after_s"] == execution.CLAIM_BUSY_RETRY_S
+        assert out["attempt"] is None and out["retry_after_s"] == settings.get().claim_busy_retry_s == 5
         assert "占用" in out["reason"] and "今天没有可执行的任务" not in out["reason"]
     finally:
         holder.rollback()

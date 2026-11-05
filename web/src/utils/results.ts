@@ -63,25 +63,35 @@ export function syncSummary(name: string, res: FeishuSyncResult): Summary {
 
 export interface VerifySummary extends Summary {
   ok: boolean
+  /** 测试记录没能恢复原值时的提醒（记录里还留着测试值，要醒目提示）；没有为空串 */
+  restoreProblem: string
 }
 
-/** 输入：写回验收的返回 → 输出：通过 / 未通过的提示（列出不一致的列与恢复原值的问题） */
-export function verifySummary(res: VerifyWritebackResult): VerifySummary {
+/**
+ * 输入：写回验收的返回、测试记录 id → 输出：通过 / 未通过的提示（列出不一致的列；恢复原值失败放在最前面并单独给出）。
+ */
+export function verifySummary(res: VerifyWritebackResult, recordId?: string | null): VerifySummary {
   const warnings: string[] = []
+  const rec = recordId ? `测试记录 ${recordId} ` : '测试记录'
+  // restore_error 是服务端的「恢复测试记录原值失败：原因（飞书错误码 X）」，原样附在后面
+  const restoreProblem = res.restore_error
+    ? `${rec}里还留着测试值，请到飞书里手动改回原值。${res.restore_error.trim().replace(/[。.]$/, '')}`
+    : ''
+  if (restoreProblem) warnings.push(restoreProblem)
+  else if (!res.restored && Object.keys(res.written ?? {}).length && !res.error) {
+    warnings.push(`${rec}的原值没有恢复，请到飞书里核对这条记录`)
+  }
   if (res.error) warnings.push(res.error)
   for (const m of res.mismatches ?? []) {
     warnings.push(`「${m.column}」写入 ${displayValue(m.expected)}，读回 ${displayValue(m.actual)}`)
   }
-  if (res.restore_error) warnings.push(`测试记录的原值没能恢复：${res.restore_error}，请到飞书里手动改回`)
-  else if (!res.restored && Object.keys(res.written ?? {}).length && !res.error) {
-    warnings.push('测试记录的原值没有恢复，请到飞书里核对这条记录')
-  }
   if (res.ok) {
     return {
       ok: true,
-      title: '写回验收通过',
+      title: restoreProblem ? '写回验收通过，但测试记录的原值没能恢复' : '写回验收通过',
       message: '之后的真实采购结果会写回飞书；模拟结果仍不写回。',
       warnings,
+      restoreProblem,
     }
   }
   return {
@@ -89,6 +99,7 @@ export function verifySummary(res: VerifyWritebackResult): VerifySummary {
     title: '写回验收失败：' + (res.error ? '飞书接口报错' : res.mismatches?.length ? '读回的值与写入的不一致' : '未完成验收'),
     message: '写回仍为「回填待验证」，队列只积压不发送。',
     warnings,
+    restoreProblem,
   }
 }
 

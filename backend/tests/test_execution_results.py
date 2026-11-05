@@ -323,7 +323,7 @@ def test_duplicate_failure_report_idempotent(conn, env, calls):
 def test_finish_run_with_unsubmitted_attempt_aborts_and_keeps_assignment(conn, env, calls):
     order, a = _claimed(conn, env)
     out = execution.finish_run(conn, env["dev"], env["run_id"], "stopped")
-    assert out["end_reason"] == "stopped" and out["stats"]["aborted"] == 1
+    assert out["end_reason"] == "finished" and out["stats"]["aborted"] == 1
     assert fx.attempt_row(conn, a["attempt_id"])["status"] == "aborted"
     o = fx.order_row(conn, order["id"])
     assert o["status"] == "assigned" and o["assigned_account_id"] == env["acc"]["id"]

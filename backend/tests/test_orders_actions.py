@@ -302,6 +302,34 @@ def test_resolve_unknown_ordered_marks_purchased_and_enqueues_writeback(conn, wo
     assert e.value.code == "VALIDATION"
 
 
+def test_resolve_unknown_ordered_checks_number_format_and_earlier_attempts(conn, workspace, monkeypatch):
+    """真实尝试：单号须为 3-7-7 位数字、不得以 SIM- 开头、不得已登记在任何别的成功真实尝试（含本任务之前的）；
+    模拟尝试：单号须以 SIM- 开头。都是 422，不是数据库唯一约束的 500。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    monkeypatch.setattr(orders.writeback, "enqueue_for_order", lambda c, w, oid: None)
+    acc = f.make_account(conn, ws)
+    o, att = _unknown_order(conn, ws, acc, simulated=False)
+    for bad in ("SIM-20261031-1", "sim-1", "12345", "112-0000000-00000AB"):
+        with pytest.raises(DomainError) as e:
+            orders.resolve_unknown(conn, ws, o["id"], "ordered", amazon_order_no=bad, actor_user_id=uid)
+        assert e.value.code == "VALIDATION" and e.value.detail["field"] == "amazon_order_no", bad
+    # 同一任务之前的成功真实尝试已经用过这个单号（亚马逊取消后同意重采，新尝试却核实成旧单号）
+    f.make_attempt(conn, ws, o["id"], acc["id"], status="succeeded", submitted=True, simulated=False,
+                   amazon_order_no="112-0000000-0000077")
+    with pytest.raises(DomainError) as e:
+        orders.resolve_unknown(conn, ws, o["id"], "ordered", amazon_order_no="112-0000000-0000077", actor_user_id=uid)
+    assert e.value.code == "VALIDATION" and "本任务之前的成功尝试" in e.value.message
+    assert orders.get_row(conn, ws, o["id"])["status"] == "result_unknown"
+    # 模拟尝试只认 SIM- 开头
+    acc2 = f.make_account(conn, ws)
+    o2, _ = _unknown_order(conn, ws, acc2, simulated=True)
+    with pytest.raises(DomainError) as e:
+        orders.resolve_unknown(conn, ws, o2["id"], "ordered", amazon_order_no="112-0000000-0000078", actor_user_id=uid)
+    assert e.value.code == "VALIDATION"
+    d = orders.resolve_unknown(conn, ws, o2["id"], "ordered", amazon_order_no="SIM-20261031-9", actor_user_id=uid)
+    assert d["status"] == "purchased"
+
+
 def test_resolve_unknown_not_ordered_frees_quota_keeps_assignment_and_pause(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     acc = f.make_account(conn, ws)

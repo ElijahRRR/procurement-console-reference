@@ -18,14 +18,22 @@ extension/ 浏览器插件（Chrome MV3 + TypeScript + Vite；AdsPower 与 Chrom
 ## 常用命令
 
 ```bash
+python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt   # 在仓库根目录装后端依赖（含 pytest）
+source .venv/bin/activate
+
 cd backend
 python -m pytest -q                 # 后端测试（需要本机 PostgreSQL；PC_TEST_ADMIN_DSN 可改管理连接）
-python cli.py db_init               # 建表（幂等）
+python cli.py db_init               # 库不存在时先建库，再建表（幂等）
+python cli.py user_create -p username=… -p workspace=…   # 建用户与工作区（密码交互输入）
 python cli.py serve                 # 127.0.0.1:8790，托管 web/dist，含后台调度
+python cli.py allocate              # 后台任务单跑：allocate / sweep / feishu_intake / feishu_writeback
+python cli.py feishu_grant -p workspace_id=… -p app_token=…   # 把飞书多维表格授权给工作区
 
 cd web && npm run build && npm test # 前端类型检查 + 构建 + 单测
 cd extension && npm run build && npm test
 ```
+
+配置取进程环境变量或 `backend/.env`，变量与缺省值见契约 §0。
 
 ## 后端铁律
 
@@ -33,10 +41,10 @@ cd extension && npm run build && npm test
 2. **业务判断只在 services**。`api/` 只做外部接口适配（认证、重试、分页、限速）；`server/routes` 只做参数校验、权限、事务边界和 JSON 转换。
 3. **路径、DSN、端口、密钥、可调参数只从 `registry/` 取**；数据库连接只经 `registry/db.pg_conn()`。
 4. **services 不 commit**：函数接收调用方的 `conn`，事务边界在入口层（`with db.pg_conn() as conn:` 正常退出即提交）。
-5. **每个查询都带工作区条件**；跨工作区访问一律 404。
+5. **每个查询都带工作区条件**；跨工作区访问一律 404（例外只有契约 §0 列出的认证查询、后台任务挑选到期行与 `feishu_base_grants`）。
 6. **时间只经 `services/clock`**：业务日期是北京日期（`bj_today()`），配送天数按站点日期（`site_today()`）。测试用 `clock.freeze()`。
 7. **NULL 不是 0**：没读到的金额、天数、日期保持 None，走「资料待补齐」或护栏拦截，绝不当 0 放行。
-8. **任务状态只经 `services/orders.transition()` 改**，它校验迁移表并写事件。
+8. **任务状态只经 `services/orders.transition()` 改**，它校验迁移表并写事件；唯一例外是清除模拟结果的 `orders.revert_simulation()`（直接退回开始前的派生状态，照样写 `order.status_changed`）。
 9. **登记提交后绝不自动重买**：`submitted_at` 非空的尝试，任何非成功结局都进「结果待核实」并暂停账号。
 10. **模拟结果永不写回飞书**；本阶段服务端拒绝非模拟执行批次。
 11. 密钥永不进 git：飞书 App ID / Secret 只在 `backend/.env` 或进程环境。仓库是公开的：**不得提交真实飞书链接、表 token、订单、收件人、卡号**；测试数据一律虚构。

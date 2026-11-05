@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 
 import { CUSTODY_MARGIN_MS, custodyStep, helloEndsRun, pingSaysAlive } from "../build/core/custody.js";
 import { runViewActive, startGate } from "../build/core/startgate.js";
-import { ACCOUNT_LEVEL_CODES, abortCodeFor, codeLabel, stopReasonLabel } from "../build/core/codes.js";
-import { beatInterval, leaseMinutes } from "../build/core/engine.js";
+import { ACCOUNT_LEVEL_CODES, CANCEL_CODE_LABEL, SERVER_CODE_LABEL, abortCodeFor, cancelLabel, codeLabel, stageLabel, stopReasonLabel } from "../build/core/codes.js";
+import { beatInterval, claimWaitMs, leaseMinutes } from "../build/core/engine.js";
 
 const NOW = Date.parse("2026-11-05T06:00:00Z");
 const ar = (extra = {}) => ({ run_id: 9, tab_id: 3, trigger: "manual", started_at: NOW, touched_at: NOW, lease_ttl_s: 180, last_beat_ok_at: NOW, orphaned_at: null, orphan_reason: null, ...extra });
@@ -87,4 +87,39 @@ test("续租节奏 = min(上限, 有效期 / 3)；「约 N 分钟」取自有效
   assert.equal(leaseMinutes(180), 3);
   assert.equal(leaseMinutes(20), 1);
   assert.equal(leaseMinutes(null), 3);
+});
+
+test("统一错误码表与契约 §8 一致（含顺序），每个都有中文；SOURCE_CHANGED、GUARD_BLOCKED、RATE_LIMITED 也有", () => {
+  assert.deepEqual(Object.keys(SERVER_CODE_LABEL), [
+    "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION", "CONFLICT", "ACCOUNT_BUSY", "ATTEMPT_IN_FLIGHT", "IDENTITY_MISMATCH",
+    "NOT_BOUND", "ACCOUNT_PAUSED", "REAL_PURCHASE_DISABLED", "LEASE_LOST", "FEISHU_NOT_CONFIGURED", "FEISHU_ERROR",
+    "INVALID_TRANSITION", "SOURCE_CHANGED", "GUARD_BLOCKED", "RATE_LIMITED", "METHOD_NOT_ALLOWED", "INTERNAL",
+  ]);
+  for (const [c, t] of Object.entries(SERVER_CODE_LABEL)) assert.doesNotMatch(t, /[A-Z_]{4,}/, c);
+  assert.equal(codeLabel("SOURCE_CHANGED"), "领取后来源有变化，提交前中止");
+  assert.match(codeLabel("GUARD_BLOCKED"), /护栏/);
+  assert.match(codeLabel("RATE_LIMITED"), /尝试次数过多/);
+  assert.match(codeLabel("ABORTED_BY_SERVER"), /账号暂停或归档、身份不符或过期、来源有变化/);
+  assert.equal(codeLabel("HTTP_502"), "服务端出错（状态码 502）");
+});
+
+test("进度的 cancel_code 都有中文；认不出的码、停止原因与阶段名也不原样显示", () => {
+  const codes = ["UPSTREAM_CANCELLED", "ACCOUNT_ARCHIVED", "ACCOUNT_PAUSED", "IDENTITY_MISMATCH", "IDENTITY_STALE", "SOURCE_HOLD", "SOURCE_CHANGED", "ATTEMPT_FINISHED"];
+  assert.deepEqual(Object.keys(CANCEL_CODE_LABEL), codes);
+  for (const c of codes) {
+    assert.doesNotMatch(cancelLabel(c), /[A-Za-z_]{4,}/, c);
+  }
+  assert.equal(cancelLabel("SOURCE_CHANGED"), "领取后来源有变化，提交前中止");
+  assert.equal(cancelLabel("SOMETHING_NEW"), "服务端要求中止");
+  assert.equal(cancelLabel(null), "服务端要求中止");
+  assert.equal(stopReasonLabel("something_new"), "服务端要求停止");
+  assert.equal(stageLabel("something_new"), "执行中");
+  assert.doesNotMatch(codeLabel("SOMETHING_NEW"), /SOMETHING/);
+});
+
+test("稍后再领的等待：夹在 1 – 30 秒之间", () => {
+  assert.equal(claimWaitMs(5), 5_000);
+  assert.equal(claimWaitMs(2.5), 2_500);
+  assert.equal(claimWaitMs(0), 1_000);
+  assert.equal(claimWaitMs(90), 30_000);
 });

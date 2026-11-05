@@ -44,6 +44,8 @@ export interface ApiError {
   /** 给人看的原因（中文）。 */
   message: string;
   detail: unknown;
+  /** 响应头 Retry-After 的秒数（429 等）；没有或读不出为 null / 缺省。 */
+  retry_after_s?: number | null;
 }
 
 export type ApiResult<T> = { ok: true; status: number; data: T } | { ok: false; error: ApiError };
@@ -106,13 +108,18 @@ export const FINISH_REASON = "finished";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RETRY_DELAYS = [1000, 3000];
 
+/** 响应体里没有错误码时按状态码推一个（与服务端 server/app 的框架层映射一致）。 */
 const STATUS_CODE: Record<number, string> = {
   400: "VALIDATION",
   401: "UNAUTHORIZED",
   403: "FORBIDDEN",
   404: "NOT_FOUND",
+  405: "METHOD_NOT_ALLOWED",
   409: "CONFLICT",
+  413: "VALIDATION",
   422: "VALIDATION",
+  429: "RATE_LIMITED",
+  500: "INTERNAL",
 };
 
 type Parser<T> = (body: unknown, status: number) => T | null;
@@ -127,6 +134,14 @@ const int = (v: unknown): number | null => {
   return null;
 };
 const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+/** 有限的数（数字或数字字符串，可带小数）；别的为 null。 */
+const num = (v: unknown): number | null => {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && /^\s*\d+(\.\d+)?\s*$/.test(v)) return Number(v);
+  return null;
+};
+/** 文本里有没有汉字：服务端给的原话是中文；框架层的英文短语（Not Found 等）不直接给人看。 */
+const hasCjk = (s: string): boolean => /[\u3400-\u9fff]/.test(s);
 
 /** 输入：任意值 → 输出：错误详情里的 `ACCOUNT_BUSY` 持有者；形状不对时各字段为 null。 */
 export function parseBusyHolder(detail: unknown): BusyHolder {
@@ -246,8 +261,9 @@ export function parseAttempt(v: unknown): Attempt | null {
 
 function parseNext(body: unknown): NextOut | null {
   if (!isObj(body) || !("attempt" in body)) return null;
-  const retry = int(body.retry_after_s);
-  const retry_after_s = retry !== null && retry > 0 ? retry : null;
+  // 只要是个不小于 0 的数（整数、小数、数字字符串）就算「稍后再领」；等多久由引擎夹在 1 – 30 秒之间。
+  const retry = num(body.retry_after_s);
+  const retry_after_s = retry !== null && retry >= 0 ? retry : null;
   if (body.attempt === null) return { attempt: null, reason: str(body.reason), retry_after_s };
   const a = parseAttempt(body.attempt);
   if (!a) return null;
@@ -281,25 +297,70 @@ const parseAny: Parser<unknown> = (body) => body ?? {};
 function describeFetchError(e: unknown): { code: string; message: string } {
   const name = (e as { name?: unknown })?.name;
   if (name === "TimeoutError" || name === "AbortError") return { code: "TIMEOUT", message: "请求超时" };
-  const msg = e instanceof Error ? e.message : String(e);
-  return { code: "NETWORK", message: `无法连接服务端（${msg}）` };
+  // 浏览器给的原因是英文（Failed to fetch 等），不往界面上放。
+  return { code: "NETWORK", message: "无法连接服务端（请确认服务端已启动、地址与端口正确）" };
 }
 
-/** 输入：非 2xx 的状态码与响应体 → 输出：结构化错误。
+/** 输入：Retry-After 响应头 → 输出：秒数（只认非负整数秒；HTTP 日期格式不认）；没有为 null。 */
+export function parseRetryAfter(v: string | null | undefined): number | null {
+  if (typeof v !== "string" || !/^\s*\d+\s*$/.test(v)) return null;
+  return Number(v.trim());
+}
+
+/** 输入：非 2xx 的状态码、响应体、Retry-After 响应头 → 输出：结构化错误。
  *  契约的错误体是 `{code, message, detail}`；FastAPI 原生的 `{detail: {...}}` 与
- *  `{detail: "Not Found"}` 也认，码缺失时按状态码推一个。 */
-export function httpError(status: number, body: unknown): ApiError {
+ *  `{detail: "Not Found"}` 也认，码缺失时按状态码推一个。
+ *  message 一律是中文：服务端的原话；没有原话（或只是框架层的英文短语）时用错误码的中文说明。 */
+export function httpError(status: number, body: unknown, retryAfter: string | null = null): ApiError {
   let b: Record<string, unknown> = isObj(body) ? body : {};
   if (!str(b.code) && isObj(b.detail) && str(b.detail.code)) b = b.detail;
   const code = str(b.code) ?? STATUS_CODE[status] ?? `HTTP_${status}`;
-  const message = str(b.message) ?? (typeof b.detail === "string" ? b.detail : null) ?? codeLabel(code);
-  return { kind: "http", status, code, message, detail: "code" in b ? (b.detail ?? null) : null };
+  const said = str(b.message) ?? (typeof b.detail === "string" ? b.detail : null);
+  const message = said && hasCjk(said) ? said : codeLabel(code);
+  return { kind: "http", status, code, message, detail: "code" in b ? (b.detail ?? null) : null, retry_after_s: parseRetryAfter(retryAfter) };
+}
+
+/** 输入：失败 → 输出：服务端建议多少秒后再试（detail.retry_after_s 优先，其次 Retry-After 响应头）；没有为 null。 */
+export function retryAfterSeconds(e: ApiError): number | null {
+  const d = isObj(e.detail) ? num(e.detail.retry_after_s) : null;
+  if (d !== null && d >= 0) return Math.ceil(d);
+  return typeof e.retry_after_s === "number" && Number.isFinite(e.retry_after_s) && e.retry_after_s >= 0 ? e.retry_after_s : null;
 }
 
 /** 输入：端点、失败 → 输出：这一次失败值不值得原样再发一次。 */
 function retryable(endpoint: Endpoint, e: ApiError): boolean {
   if (e.kind === "network") return true;
   return e.kind === "http" && e.status !== null && e.status >= 500 && RETRY_ON_5XX.has(endpoint);
+}
+
+/** 输入：配对失败、填的服务端地址 → 输出：给人看的一句「配对失败：……」。
+ *  · 429 RATE_LIMITED（配对按 IP 限速）：说清楚多少秒后再试（detail.retry_after_s 或 Retry-After 响应头）；
+ *  · 403 FORBIDDEN（服务端的 Host 允许名单：只接受本机地址与 PC_ALLOWED_HOSTS 里的名字）：
+ *    提示改用 http://127.0.0.1:8790 或 localhost，或请管理员把这个主机名加进 PC_ALLOWED_HOSTS；
+ *  · 其他：服务端的中文原话。 */
+export function pairFailureText(e: ApiError, serverUrl: string): string {
+  if (e.kind === "http" && (e.code === "RATE_LIMITED" || e.status === 429)) {
+    const n = retryAfterSeconds(e);
+    return n !== null && n > 0 ? `配对失败：尝试次数过多，请 ${n} 秒后再试` : "配对失败：尝试次数过多，请稍后再试";
+  }
+  if (e.kind === "http" && e.status === 403 && e.code === "FORBIDDEN") {
+    let host = "";
+    let port = "8790";
+    try {
+      const u = new URL(serverUrl);
+      host = u.hostname;
+      port = u.port || port;
+    } catch {
+      // 地址读不出来：提示里不带主机名
+    }
+    const who = host ? `主机名 ${host} ` : "这个主机名";
+    return (
+      `配对失败：服务端不接受${who}的请求（服务端只接受本机地址和 PC_ALLOWED_HOSTS 里登记的主机名）。` +
+      `请把服务端地址改成 http://127.0.0.1:${port} 或 http://localhost:${port}，` +
+      `或者请管理员把 ${host || "这个主机名"} 加进服务端的 PC_ALLOWED_HOSTS 后再试`
+    );
+  }
+  return `配对失败：${e.message || codeLabel(e.code)}`;
 }
 
 /** 插件协议客户端。一个实例绑定一个服务端地址与设备令牌。 */
@@ -369,7 +430,7 @@ export class PluginClient implements RunApi {
     }
 
     if (!res.ok) {
-      return { ok: false, error: httpError(res.status, parsed ? json : null) };
+      return { ok: false, error: httpError(res.status, parsed ? json : null, res.headers?.get?.("retry-after") ?? null) };
     }
     if (!parsed) {
       return {

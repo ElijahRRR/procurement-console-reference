@@ -176,6 +176,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       execution_paused: false,
       pause_reason: null,
       paused_at: null,
+      pause_cause: null,
+      open_result_unknown: 0,
       purchase_mode: 'scheduled',
       schedule_times: ['14:00', '16:30'],
       default_device_id: 5,
@@ -203,6 +205,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       execution_paused: false,
       pause_reason: null,
       paused_at: null,
+      pause_cause: null,
+      open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
       default_device_id: null,
@@ -228,8 +232,11 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       purchase_enabled: true,
       sync_enabled: false,
       execution_paused: true,
-      pause_reason: '结果待核实',
+      pause_reason: '结果待核实：PO-DEMO-RESULT-UNKNOWN',
       paused_at: ago(95),
+      // 执行模块因结果待核实暂停（services/accounts.pause_cause）；下面那笔结果待核实的任务在这个账号上
+      pause_cause: 'result_unknown',
+      open_result_unknown: 1,
       purchase_mode: 'scheduled',
       schedule_times: ['15:00'],
       default_device_id: 7,
@@ -257,6 +264,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       execution_paused: false,
       pause_reason: null,
       paused_at: null,
+      pause_cause: null,
+      open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
       default_device_id: null,
@@ -363,6 +372,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     row({ status: 'needs_info', unit: null, qty: 1, cap: '38.00', date: null, missing: ['unit_price', 'suggested_purchase_date', 'phone'], sources: ['file'] }),
     row({ status: 'needs_info', unit: '19.99', qty: null, cap: null, date: 0, missing: ['quantity', 'price_cap'] }),
     row({ status: 'conflict', unit: '27.50', qty: 1, cap: '35.00', date: 0, sources: ['feishu', 'file'], reason: '文件来源的数量、限价与飞书记录不同' }),
+    row({ status: 'conflict', unit: '33.10', qty: 1, cap: '42.00', date: 0, reason: '来源的 AMZ 订单号「114-DEMO」格式不对，需人工核实（不当作已采购）' }),
     row({
       status: 'executing',
       unit: '26.80',
@@ -400,8 +410,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       cap: '60.00',
       date: 0,
       account: 7,
-      reason: '已登记提交，插件失联后未回报结果',
-      attempt: { id: 27, status: 'unknown', amazon_order_no: null, total: null, simulated: true, error_code: null, finished_at: ago(95) },
+      reason: '已登记提交，插件失联后未回报结果；插件迟到上报的结果：成功，请据此核实',
+      attention: '插件迟到上报的结果：成功，请据此核实',
+      // 清扫判为待核实后插件才送到成功回执：单号与金额补进了尝试（services/execution._late_receipt）
+      attempt: { id: 27, status: 'unknown', amazon_order_no: simNo(27), total: '50.37', simulated: true, error_code: null, finished_at: ago(95) },
     }),
     row({
       status: 'exception',
@@ -445,9 +457,23 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       attention: '上游在采购开始后取消，请处理对应的亚马逊订单',
       attempt: { id: 15, status: 'succeeded', amazon_order_no: simNo(15), total: '19.95', simulated: true, error_code: null, finished_at: ago(60 * 30) },
     }),
-    row({ status: 'cancelled', unit: '31.00', qty: 1, cap: '39.00', date: 0, reason: '上游取消（售后状态：已退款）' }),
+    row({
+      status: 'cancelled',
+      unit: '31.00',
+      qty: 1,
+      cap: '39.00',
+      date: 0,
+      reason: '上游取消（售后状态：已退款）',
+      // 执行中上游取消：进度上报得到 continue=false、cancel_code=UPSTREAM_CANCELLED，插件未提交前中止
+      attempt: { id: 33, status: 'aborted', amazon_order_no: null, total: null, simulated: true, error_code: 'ABORTED_UPSTREAM_CANCELLED', finished_at: ago(70) },
+    }),
     row({ status: 'closed', unit: '26.00', qty: 1, cap: '33.00', date: -4, reason: '人工决定不重采' }),
   ]
+
+  // 执行模块暂停账号时写「结果待核实：<平台订单号>」
+  const unknownOrder = orders.find((o) => o.status === 'result_unknown')
+  const pausedByUnknown = accounts.find((a) => a.pause_cause === 'result_unknown')
+  if (unknownOrder && pausedByUnknown) pausedByUnknown.pause_reason = `结果待核实：${unknownOrder.upstream_order_no}`
 
   // ── 详情 ────────────────────────────────────────────────────────────────────
 
@@ -481,9 +507,9 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       simulated: la.simulated,
       status: la.status,
       bj_date: bjToday,
-      stage: la.status === 'checking' ? '结算页核对' : null,
       claimed_at: ago(60),
       submitted_at: la.status === 'succeeded' || la.status === 'unknown' ? ago(55) : null,
+      stage: la.status === 'checking' ? '结算页核对' : la.status === 'aborted' ? '结算页核对' : null,
       finished_at: la.finished_at,
       guard_verdict: null,
       amazon_order_no: la.amazon_order_no,
@@ -580,14 +606,23 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       base.error_code = null
       base.error_detail = '登记提交后 3 分钟未收到结果，执行权超时'
     }
+    if (la.status === 'aborted') base.error_detail = '上游已取消（售后状态：已退款），未提交前中止'
     return [base]
   }
 
   function eventsFor(r: OrderRow): EventRecord[] {
-    const ev = (id: number, minutes: number, kind: string, actor: EventRecord['actor_kind'], name: string | null, detail: Record<string, unknown>): EventRecord => ({
+    const ev = (
+      id: number,
+      minutes: number,
+      kind: string,
+      actor: EventRecord['actor_kind'],
+      name: string | null,
+      detail: Record<string, unknown>,
+      attemptId?: number,
+    ): EventRecord => ({
       id,
-      entity: 'order',
-      entity_id: r.id,
+      entity: attemptId ? 'attempt' : 'order',
+      entity_id: attemptId ?? r.id,
       order_id: r.id,
       at: ago(minutes),
       actor_kind: actor,
@@ -600,9 +635,25 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     const list: EventRecord[] = [ev(r.id * 10 + 1, 60 * 30, 'order.created', 'source', null, { from: null, to: 'queued' })]
     if (r.assigned_account) list.push(ev(r.id * 10 + 2, 60 * 29, 'order.assigned', 'system', null, { account_name: r.assigned_account.name, reason: r.assignment_note, kind: 'auto' }))
     if (r.has_override) list.push(ev(r.id * 10 + 3, 60 * 4, 'order.override_set', 'user', 'DEMO 所有者', { note: '上游限价与结算口径不一致，按 $50.00 执行' }))
-    if (r.latest_attempt) list.push(ev(r.id * 10 + 4, 60, 'attempt.claimed', 'device', 'Mac-AdsPower-DEMO-01', { attempt_id: r.latest_attempt.id }))
+    const la = r.latest_attempt
+    if (la) list.push(ev(r.id * 10 + 4, 60, 'attempt.claimed', 'device', 'Mac-AdsPower-DEMO-01', { run_id: 9, attempt_no: 1, kind: 'auto', simulated: la.simulated }, la.id))
+    if (la?.status === 'aborted') {
+      list.push(ev(r.id * 10 + 8, 71, 'attempt.progress', 'device', 'Mac-AdsPower-DEMO-01', {
+        stage: '结算页核对', detail: null, continue: false, cancel_reason: '上游已取消（售后状态：已退款）', cancel_code: 'UPSTREAM_CANCELLED',
+      }, la.id))
+      list.push(ev(r.id * 10 + 9, 70, 'attempt.aborted', 'device', 'Mac-AdsPower-DEMO-01', { error_code: la.error_code, reason: '上游已取消（售后状态：已退款），未提交前中止' }, la.id))
+    }
+    if (la?.status === 'unknown' && la.amazon_order_no) {
+      list.push(ev(r.id * 10 + 8, 50, 'attempt.late_result', 'device', 'Win-AdsPower-DEMO-03', {
+        outcome: 'succeeded', amazon_order_no: la.amazon_order_no, error_code: null, error_detail: null,
+        amounts: { subtotal: r.subtotal_eff, shipping: '0.00', tax: la.total && r.subtotal_eff ? (Number(la.total) - Number(r.subtotal_eff)).toFixed(2) : null, total_before_tax: r.subtotal_eff, total: la.total },
+        reason: `插件迟到上报的结果：成功，亚马逊订单号 ${la.amazon_order_no}，请据此核实`,
+      }, la.id))
+    }
     if (r.status === 'exception') list.push(ev(r.id * 10 + 5, 40, 'order.status_changed', 'device', 'Mac-AdsPower-DEMO-01', { from: 'executing', to: 'exception', reason: r.status_reason }))
     if (r.status === 'conflict') list.push(ev(r.id * 10 + 6, 30, 'order.source_conflict', 'source', null, { reason: r.status_reason }))
+    // 新的在前（与服务端一致）：按时间排序后再倒过来
+    list.sort((a, b) => a.at.localeCompare(b.at))
     if (r.needs_attention) list.push(ev(r.id * 10 + 7, 20, 'order.upstream_changed_after_start', 'source', null, { note: r.attention_note }))
     return list.reverse()
   }
@@ -688,10 +739,29 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
         country: 'US',
         district: null,
       },
+      // 形状同 services/orders 的冲突：{kind, source_kind, reason, fields, incoming, source, at}
       conflict:
-        r.status === 'conflict'
-          ? { source_kind: 'file', fields: { quantity: [1, 2], price_cap: ['35.00', '30.00'] }, at: ago(30) }
-          : null,
+        r.status !== 'conflict'
+          ? null
+          : (r.status_reason ?? '').includes('AMZ')
+            ? {
+                kind: 'external_order_no',
+                source_kind: 'feishu',
+                reason: r.status_reason,
+                fields: { external_amz_order_no: [null, '114-DEMO'] },
+                incoming: { external_amz_order_no: '114-DEMO', external_buyer_account: '环境-DEMO-02' },
+                source: { kind: 'feishu', connection_id: 1, record_id: `recDEMO${String(r.id).padStart(6, '0')}` },
+                at: ago(30),
+              }
+            : {
+                kind: 'fields',
+                source_kind: 'file',
+                reason: r.status_reason,
+                fields: { quantity: [1, 2], price_cap: ['35.00', '30.00'] },
+                incoming: { quantity: 2, price_cap: '30.00' },
+                source: { kind: 'file', batch_id: 41, row_no: 3 + (r.id % 17) },
+                at: ago(30),
+              },
       sources,
       attempts: attemptsFor(r),
       events: eventsFor(r),
@@ -731,7 +801,9 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     future_assigned: assigned.filter((o) => (o.suggested_purchase_date ?? '') > bjToday).length,
     accounts: { total: accounts.length, enabled: accounts.filter((a) => a.purchase_enabled).length, paused: accounts.filter((a) => a.execution_paused).length },
     devices: { total: devices.filter((d) => !d.revoked_at).length, online: devices.filter((d) => !d.revoked_at && d.online).length },
-    recent_exceptions: orders.filter((o) => ['exception', 'result_unknown', 'repurchase_pending'].includes(o.status)),
+    needs_attention: orders.filter((o) => o.needs_attention).length,
+    // 同服务端 overview：最近变为「异常」的任务（结果待核实单独提示）
+    recent_exceptions: orders.filter((o) => o.status === 'exception'),
     last_allocation: lastAllocation,
     simulation_only: true,
     feishu_configured: true,
@@ -992,8 +1064,14 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       sheet_name: '采购订单',
       status: 'uploaded',
       stats: null,
-      mapping: { 平台订单号: 'upstream_order_no', ASIN: 'asin', 数量: 'quantity', 限价: 'price_cap', 备注: null },
+      // jsonb 不保证键的顺序；GET /imports/{id} 另给原文件顺序的 headers 与全部工作表
+      mapping: { 限价: 'price_cap', 平台订单号: 'upstream_order_no', 备注: null, ASIN: 'asin', 数量: 'quantity' },
       size: 18_240,
+      sheets: [
+        { name: '采购订单', row_count: 12, headers: ['平台订单号', 'ASIN', '数量', '限价', '备注'] },
+        { name: '说明', row_count: 2, headers: ['说明'] },
+      ],
+      headers: ['平台订单号', 'ASIN', '数量', '限价', '备注'],
       created_at: ago(30),
       committed_at: null,
       uploaded_by_name: 'DEMO 所有者',

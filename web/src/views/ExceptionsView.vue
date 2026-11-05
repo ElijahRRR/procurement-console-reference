@@ -6,24 +6,23 @@
 import { computed, onMounted, ref } from 'vue'
 import type { Overview } from '@/api/types'
 import * as overviewApi from '@/api/overview'
-import * as ordersApi from '@/api/orders'
 import PageHeader from '@/components/PageHeader.vue'
 import OrderListCard, { type OrderTab } from '@/components/orders/OrderListCard.vue'
 import { formatNumber } from '@/utils/format'
 import { exceptionManual } from '@/utils/overview'
 
 const overview = ref<Overview | null>(null)
-/** 需要留意的任务数（服务端按 needs_attention 计数；读不到为 null，标签页不显示数字） */
-const attentionTotal = ref<number | null>(null)
 async function loadCounts() {
-  const [ov, attention] = await Promise.allSettled([
-    overviewApi.getOverview(),
-    ordersApi.listOrders({ view: 'all', needs_attention: true, page: 1, page_size: 1 }),
-  ])
-  overview.value = ov.status === 'fulfilled' ? ov.value : null
-  attentionTotal.value = attention.status === 'fulfilled' ? attention.value.total : null
+  try {
+    overview.value = await overviewApi.getOverview()
+  } catch {
+    overview.value = null
+  }
 }
 onMounted(loadCounts)
+
+/** 需要留意的任务数（概览的 needs_attention，不论状态；读不到为 null，标签页不显示数字） */
+const attentionTotal = computed(() => (typeof overview.value?.needs_attention === 'number' ? overview.value.needs_attention : null))
 
 const tabs = computed<OrderTab[]>(() => {
   const c = overview.value?.counts ?? {}

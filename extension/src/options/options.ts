@@ -97,8 +97,8 @@ async function doPair(): Promise<void> {
     );
     if (r.ok) form.code = "";
     show(r.ok ? "brand" : "danger", r.message);
-  } catch (e) {
-    show("danger", `配对失败：${e instanceof Error ? e.message : String(e)}`);
+  } catch {
+    show("danger", "配对失败：插件后台没有响应，请重新加载插件后再试");
   } finally {
     pending = false;
     await refresh();
@@ -107,7 +107,7 @@ async function doPair(): Promise<void> {
 
 async function doUnpair(): Promise<void> {
   if (!window.confirm("确定要解除配对吗？解除后本浏览器不再领取任务；如需让服务端也作废这个设备，请在控制台撤销该设备。")) return;
-  const r = await toSw<{ ok: boolean; message: string }>({ type: "pc.unpair" }).catch((e: unknown) => ({ ok: false, message: `解除配对失败：${String(e)}` }));
+  const r = await toSw<{ ok: boolean; message: string }>({ type: "pc.unpair" }).catch(() => ({ ok: false, message: "解除配对失败：插件后台没有响应" }));
   show(r.ok ? "brand" : "danger", r.message);
   await refresh();
 }

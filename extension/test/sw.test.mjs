@@ -31,6 +31,7 @@ async function paired({ server = {}, bound = true, manual = true } = {}) {
 }
 
 const get = async (areaObj, key) => (await areaObj.get(key))[key];
+const paths = (srv, re) => srv.calls.filter((c) => re.test(c.path));
 const view = (runId) => ({ phase: "running", trigger: "manual", run_id: runId, attempt: null, stage: null, stage_label: null, counts: { attempts: 0, succeeded: 0, failed: 0, blocked: 0, unknown: 0, aborted: 0 }, started_at: Date.now(), message: null });
 
 /** 像引擎那样经后台走到「已登记提交」：开始批次 → 领取 → 进度 → 护栏 → 登记。 */
@@ -452,4 +453,116 @@ test("模拟结局的日志写中文名，不写代码", async () => {
   const { env } = await paired();
   await env.fromPage({ type: "pc.saveSettings", patch: { simulationOutcome: "price_over_cap" } });
   assert.ok(env.logs().includes("模拟结局改为：结算总额超过限价"));
+});
+
+// ── 第二轮集成：配对的限速与 Host 允许名单、回执补交时机、执行中的身份重报 ─────────────────
+
+test("配对被限速（429 RATE_LIMITED）：配对失败：尝试次数过多，请 N 秒后再试", async () => {
+  const srv = createFakeServer({ tasks: TASKS(), pairRateLimit: { retry_after_s: 42 } });
+  const env = installFakeChrome({ fetch: srv.fetch });
+  await env.startWorker();
+  const r = await env.fromPage({ type: "pc.pair", serverUrl: "http://127.0.0.1:8790", code: "DEMO2345", deviceName: "Mac-DEMO", browser: "chrome" });
+  assert.equal(r.ok, false);
+  assert.equal(r.message, "配对失败：尝试次数过多，请 42 秒后再试");
+  assert.ok(env.logs().includes("配对失败：尝试次数过多，请 42 秒后再试"));
+  assert.equal((await env.fromPage({ type: "pc.getState" })).device.paired, false);
+});
+
+test("配对被服务端的 Host 允许名单拒绝（403 FORBIDDEN）：提示改用 127.0.0.1 / localhost，或请管理员加进 PC_ALLOWED_HOSTS", async () => {
+  const srv = createFakeServer({ tasks: TASKS(), rejectHost: true });
+  const env = installFakeChrome({ fetch: srv.fetch });
+  await env.startWorker();
+  const r = await env.fromPage({ type: "pc.pair", serverUrl: "http://localhost:8790", code: "DEMO2345", deviceName: "Mac-DEMO", browser: "chrome" });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /^配对失败：服务端不接受主机名 localhost 的请求/);
+  assert.match(r.message, /http:\/\/127\.0\.0\.1:8790 或 http:\/\/localhost:8790/);
+  assert.match(r.message, /PC_ALLOWED_HOSTS/);
+});
+
+/** 把一份「后台已经补交过、正在退避」的回执直接放进存储。 */
+async function heldReceipt(env, attempt, runId, body, extra = {}) {
+  const now = Date.now();
+  await env.local.set({
+    "pc.receipts": { [attempt.attempt_id]: { attempt_id: attempt.attempt_id, run_id: runId, body, created_at: now - 120_000, tries: 2, next_at: now + 240_000, last_error: "无法连接服务端", ...extra } },
+  });
+}
+
+test("回执补交：后台（重新）启动时不等退避，立即补交同一份结果", async () => {
+  const { srv, env } = await paired();
+  env.addTab(3, AMZ, () => ({ running: true, run_id: 9 }));
+  const { runId, attempt, body } = await driveToSubmitted(env, 3);
+  await heldReceipt(env, attempt, runId, body);
+  await env.startWorker();
+  await env.settle();
+  assert.deepEqual((await get(env.local, "pc.receipts")) ?? {}, {}, "送达后删掉");
+  assert.equal(srv.state.attempts.get(attempt.attempt_id).status, "succeeded");
+  assert.equal(paths(srv, /\/submitting$/).length, 1, "登记从不补发");
+});
+
+test("回执补交：每一次心跳成功都不等退避补交；引擎自己还在送的（没被后台补交过、宽限未到）不抢着发", async () => {
+  const { srv, env } = await paired();
+  env.addTab(3, AMZ, () => ({ running: true, run_id: 9 }));
+  const { runId, attempt, body } = await driveToSubmitted(env, 3);
+  await heldReceipt(env, attempt, runId, body, { tries: 0, next_at: Date.now() + 25_000, created_at: Date.now() - 5_000 });
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle();
+  assert.equal(Object.keys(await get(env.local, "pc.receipts")).length, 1, "引擎那一路还在送：心跳不抢");
+  assert.equal(paths(srv, /\/result$/).length, 0);
+  await heldReceipt(env, attempt, runId, body);
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle();
+  assert.deepEqual((await get(env.local, "pc.receipts")) ?? {}, {});
+  assert.equal(srv.state.attempts.get(attempt.attempt_id).status, "succeeded");
+  assert.ok(env.logs().some((t) => /结果回执已补交/.test(t)));
+});
+
+test("回执补交：服务端说同一份已收过（200 duplicate）算送达；尝试已是结果待核实、这份不同（409 迟到回执）也算送达，都不再发", async () => {
+  const { srv, env } = await paired();
+  env.addTab(3, AMZ, () => ({ running: true, run_id: 9 }));
+  const { runId, attempt, body } = await driveToSubmitted(env, 3);
+  const first = await env.fromTab(3, { type: "pc.api", op: "result", args: [attempt.attempt_id, body] });
+  assert.equal(first.ok, true);
+  await heldReceipt(env, attempt, runId, body);
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle();
+  assert.deepEqual((await get(env.local, "pc.receipts")) ?? {}, {}, "duplicate：送达");
+  // 另一笔：服务端已判为结果待核实，迟到的成功回执被记下
+  const a2 = srv.state.attempts.get(attempt.attempt_id);
+  a2.status = "unknown";
+  a2.amazon_order_no = null;
+  await heldReceipt(env, attempt, runId, body);
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle();
+  assert.deepEqual((await get(env.local, "pc.receipts")) ?? {}, {}, "迟到回执已记下：送达");
+  assert.equal(srv.state.lateReceipts.length, 1);
+  assert.ok(env.logs().some((t) => /作为迟到回执记下/.test(t)));
+});
+
+test("执行中重报身份（pc.refreshIdentity）：每个亚马逊标签页重读、强制上报 POST /identity，不发心跳", async () => {
+  const { srv, env } = await paired();
+  const now = Date.now();
+  const reading = { signed_in: true, customer_id: BOUND, site: "US", page_url: AMZ, at: now, loaded_at: now - 60_000 };
+  env.addTab(1, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: reading } : { ok: true }));
+  env.addTab(2, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: { ...reading, loaded_at: now - 30_000 } } : { ok: true }));
+  // 刚报过同一份（60 秒去重之内）也照发：这是给提交登记用的
+  await env.fromTab(1, { type: "pc.identity", identity: reading, force: false });
+  const hb0 = srv.count(/\/heartbeat$/);
+  const id0 = srv.state.identityReports.filter((r) => r.via === "identity").length;
+  const r = await env.fromTab(1, { type: "pc.refreshIdentity" });
+  assert.deepEqual(r, { reported: true, conflict: false, identity_status: "match" });
+  assert.equal(srv.state.identityReports.filter((x) => x.via === "identity").length, id0 + 1);
+  assert.equal(srv.state.identityReports.at(-1).customer_id, BOUND);
+  assert.equal(srv.count(/\/heartbeat$/), hb0, "不发心跳");
+  assert.equal(env.sentToTabs.filter((m) => m.msg.type === "pc.readIdentity").length >= 2, true, "两个标签页都重读了");
+});
+
+test("身份结论已经过时（几分钟前读的、这一轮哪个标签页都没读到）：不当成刚读到的再报给服务端", async () => {
+  const { srv, env } = await paired();
+  const old = Date.now() - 6 * 60_000;
+  env.addTab(1, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: null } : { ok: true }));
+  await env.session.set({ "pc.identityObs": { live: { 1: { tab_id: 1, signed_in: true, customer_id: BOUND, page_url: AMZ, loaded_at: old - 60_000, read_at: old } }, newest_gone: null } });
+  const n0 = srv.state.identityReports.length;
+  const r = await env.fromTab(1, { type: "pc.refreshIdentity" });
+  assert.equal(r.reported, false);
+  assert.equal(srv.state.identityReports.length, n0, "服务端没有收到一份「新」身份");
 });

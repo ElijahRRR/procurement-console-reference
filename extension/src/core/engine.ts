@@ -22,14 +22,21 @@
  *   · **服务端是全局权威。** 409 ACCOUNT_BUSY 显示持有者设备与开始时间；
  *     LEASE_LOST 立即停止；批次心跳 stop=true 在当前这一笔结束后停止并结束批次。
  *     续租节奏按服务端给的租约有效期（lease_ttl_s）算：min(35 秒, 有效期 / 3)，每一步之前到点就补一次。
+ *   · **身份要新鲜。** 服务端在开始批次、领取、进度与提交登记时都要求设备身份在 identity_fresh_s
+ *     （默认 600 秒）内上报过：引擎在批次进行中每 identityEveryMs（默认 3 分钟）请宿主重读并上报一次身份，
+ *     并且在提交登记之前（登记前最后一次进度确认之前）无条件再报一次 —— 读不到、报不上不影响流程，
+ *     服务端是裁决者：身份过期或不符时它让进度 continue=false（IDENTITY_STALE / IDENTITY_MISMATCH）。
+ *   · **服务端要求中止时按原因码上报**（cancel_code，契约 §5 第 7 步）：只有 UPSTREAM_CANCELLED 报
+ *     ABORTED_UPSTREAM_CANCELLED；ATTEMPT_FINISHED 不再上报；其余报 ABORTED_BY_SERVER（中止类，任务回到已分配）。
  *   · 本阶段尝试是「原子」的：模拟的一笔在毫秒级内完成，批次心跳的 stop 在两笔之间生效。
  *     真实驱动接入时，需要在每一步之间检查 stop（见 README「后续」）。
- *   · 所有等待都有界：每个请求有超时，结果重发有租约预算与总时长上限，单批次最多领取 maxAttempts 笔。
+ *   · 所有等待都有界：每个请求有超时，结果重发有租约预算与总时长上限，单批次最多领取 maxAttempts 笔；
+ *     领取时服务端说「稍后再领」（retry_after_s）最多等 6 轮、每轮最多 30 秒，等待期间照常续租。
  */
 
 import type { ApiError, RunApi } from "./client.js";
 import { parseBusyHolder } from "./client.js";
-import { ACCOUNT_LEVEL_CODES, STAGE_LABEL, abortCodeFor, codeLabel, stopReasonLabel } from "./codes.js";
+import { ACCOUNT_LEVEL_CODES, abortCodeFor, cancelLabel, codeLabel, stageLabel, stopReasonLabel } from "./codes.js";
 import type { LogLevel } from "./log.js";
 import { isLateReceipt, isRetryableResultError } from "./receipts.js";
 import {
@@ -131,6 +138,11 @@ export interface EngineDeps {
   reportRetryMaxMs?: number;
   /** 本设备 ID：ACCOUNT_BUSY 的持有者就是自己时换一句说明。 */
   ownDeviceId?: number | string | null;
+  /** 重读本浏览器的亚马逊登录身份并上报服务端（`POST /plugin/v1/identity`）。提交登记之前必调，
+   *  批次进行中每 identityEveryMs 补一次。没有它（或它失败）时引擎照常走，由服务端按身份新鲜度裁决。 */
+  refreshIdentity?: () => Promise<unknown>;
+  /** 批次进行中多久补报一次身份，默认 3 分钟（服务端要求 10 分钟内上报过）。 */
+  identityEveryMs?: number;
 }
 
 /** 契约 §5.4 的租约有效期默认值（服务端没给 lease_ttl_s 时用）。 */
@@ -142,6 +154,26 @@ const REPORT_BACKOFF_MS = [2_000, 5_000, 10_000, 20_000, 30_000];
 /** 领取时服务端说「稍后再领」（retry_after_s），最多等几轮、每轮最多等多久。 */
 const CLAIM_RETRY_MAX = 6;
 const CLAIM_RETRY_CAP_MS = 30_000;
+const CLAIM_RETRY_MIN_MS = 1_000;
+/** 批次进行中补报身份的默认间隔。 */
+const IDENTITY_EVERY_MS = 3 * 60_000;
+
+/** 输入：服务端的 retry_after_s → 输出：这一轮实际等多久（毫秒，夹在 1 – 30 秒之间）。 */
+export function claimWaitMs(retryAfterS: number): number {
+  const ms = Number.isFinite(retryAfterS) ? Math.ceil(retryAfterS * 1000) : CLAIM_RETRY_CAP_MS;
+  return Math.min(CLAIM_RETRY_CAP_MS, Math.max(CLAIM_RETRY_MIN_MS, ms));
+}
+
+/** 批次结束原因（finish 的 detail）里没有错误详情时，给人看的中文。 */
+const END_REASON_TEXT: Record<string, string> = {
+  plugin_internal: "执行引擎内部错误",
+  network: "无法连接服务端",
+  lease_lost: "执行权已失效",
+  result_not_delivered: "结果暂时送不到服务端",
+  progress_not_delivered: "进度上报没有送到服务端",
+  guard_not_delivered: "护栏请求没有送到服务端",
+  submitting_unconfirmed: "提交登记没有得到确认",
+};
 
 /** 输入：租约有效期（秒）→ 输出：「约 N 分钟」里的 N（至少 1）。 */
 export function leaseMinutes(ttlS: number | null | undefined): number {
@@ -217,6 +249,9 @@ export class RunEngine {
   private readonly beatCap: number;
   private readonly maxAttempts: number;
   private readonly reportRetryMaxMs: number;
+  private readonly identityEvery: number;
+  /** 上一次补报身份的时刻（开始批次之前宿主刚报过一次，所以从开始那一刻算）。 */
+  private lastIdentityAt = 0;
   private beatEvery: number;
   private leaseTtlS: number = DEFAULT_LEASE_TTL_S;
 
@@ -249,6 +284,7 @@ export class RunEngine {
     this.beatEvery = beatInterval(this.beatCap, DEFAULT_LEASE_TTL_S);
     this.maxAttempts = deps.maxAttempts ?? 200;
     this.reportRetryMaxMs = deps.reportRetryMaxMs ?? 10 * 60_000;
+    this.identityEvery = deps.identityEveryMs ?? IDENTITY_EVERY_MS;
   }
 
   /** 输入：无 → 输出：当前引擎状态的拷贝。 */
@@ -296,6 +332,7 @@ export class RunEngine {
     this.beatEvery = beatInterval(this.beatCap, this.leaseTtlS);
     this.lastBeatAt = this.now();
     this.lastBeatOkAt = this.lastBeatAt;
+    this.lastIdentityAt = this.lastBeatAt;
     this.emit({ phase: "running", run_id: this.runId, message: `执行批次 #${this.runId} 已开始` });
     this.log("ok", `执行批次 #${this.runId} 已开始（模拟）`);
     onStarted?.({ started: true, run_id: this.runId, status: null, error: null, message: `执行批次 #${this.runId} 已开始`, busy_mine: false });
@@ -313,7 +350,8 @@ export class RunEngine {
       // 引擎自身的意外异常：当作没说上话处理（不再继续），交给服务端清扫。
       abandoned = true;
       endReason = "plugin_internal";
-      this.log("err", `执行引擎内部错误：${e instanceof Error ? e.message : String(e)}`);
+      console.error("采购助手执行引擎内部错误", e); // 原始的英文报错只进控制台，不进界面与日志
+      this.log("err", "执行引擎内部错误，本批次中断");
     } finally {
       this.timers.clearInterval(handle);
     }
@@ -322,7 +360,7 @@ export class RunEngine {
     const tally = `成功 ${c.succeeded}，失败 ${c.failed}，拦截 ${c.blocked}，待核实 ${c.unknown}，中止 ${c.aborted}`;
 
     if (abandoned || this.stopNoFinish) {
-      const why = abandonError ? abandonError.message : this.stopReason ?? endReason;
+      const why = abandonError ? abandonError.message : this.stopReason ?? END_REASON_TEXT[endReason] ?? "执行中断";
       const message =
         endReason === "result_not_delivered"
           ? `执行中断：结果暂时送不到服务端（${why}）。回执已存在插件里，后台会继续续租并补交，送达后结束批次（${tally}）`
@@ -377,10 +415,40 @@ export class RunEngine {
     if (this.now() - this.lastBeatAt >= this.beatEvery) await this.beat();
   }
 
+  /** 输入：无 → 输出：无。请宿主重读并上报身份；失败只记一行，不影响流程（服务端按新鲜度裁决）。 */
+  private async refreshIdentity(): Promise<void> {
+    const fn = this.deps.refreshIdentity;
+    this.lastIdentityAt = this.now();
+    if (!fn) return;
+    try {
+      await fn();
+    } catch (e) {
+      this.log("warn", `身份上报失败：${e instanceof Error && /[\u3400-\u9fff]/.test(e.message) ? e.message : "插件后台没有响应"}`);
+    }
+  }
+
+  /** 批次进行中到点就补报一次身份（服务端要求身份 10 分钟内上报过）。 */
+  private async identityIfDue(): Promise<void> {
+    if (this.now() - this.lastIdentityAt >= this.identityEvery) await this.refreshIdentity();
+  }
+
+  /** 输入：要等多久 → 输出：无。分段等，每段之后到点就续租、补报身份；收到停止请求就不再等。 */
+  private async waitKeepingLease(ms: number): Promise<void> {
+    let left = ms;
+    while (left > 0 && this.stopReason === null) {
+      const slice = Math.min(left, this.beatEvery);
+      await this.sleep(slice);
+      left -= slice;
+      await this.beatIfDue();
+      await this.identityIfDue();
+    }
+  }
+
   private async loop(): Promise<{ reason: string; abandon: boolean; error: ApiError | null }> {
     let claimWaits = 0;
     for (;;) {
       await this.beatIfDue();
+      await this.identityIfDue();
       if (this.stopReason !== null) return { reason: "stopped", abandon: false, error: null };
       if (this.view.counts.attempts >= this.maxAttempts) {
         this.log("warn", `本批次已领取 ${this.maxAttempts} 笔，达到单批次上限，停止领取`);
@@ -400,12 +468,16 @@ export class RunEngine {
       }
       if (n.data.attempt === null) {
         if (n.data.retry_after_s !== null && claimWaits < CLAIM_RETRY_MAX) {
-          // 候选任务只是暂时被别的操作（导入、同步、分配）锁着：等一会儿再领，不结束批次。
+          // 候选任务只是暂时被别的操作（导入、同步、分配）锁着：等一会儿再领，不结束批次，等待期间照常续租。
           claimWaits += 1;
-          const wait = Math.min(n.data.retry_after_s * 1000, CLAIM_RETRY_CAP_MS);
-          this.log("info", `${n.data.reason ?? "可执行的任务暂时被占用"}（${Math.round(wait / 1000)} 秒后再领）`);
-          await this.sleep(wait);
+          const wait = claimWaitMs(n.data.retry_after_s);
+          this.log("info", `${n.data.reason ?? "可执行的任务暂时被占用"}（${Math.ceil(wait / 1000)} 秒后第 ${claimWaits} 次再领，最多 ${CLAIM_RETRY_MAX} 次）`);
+          await this.waitKeepingLease(wait);
           continue;
+        }
+        if (n.data.retry_after_s !== null) {
+          this.log("warn", `可执行的任务一直被其他操作占用（已再领 ${CLAIM_RETRY_MAX} 次），本批次先结束，稍后再执行`);
+          return { reason: "completed", abandon: false, error: null };
         }
         this.log("info", `没有可执行的任务了${n.data.reason ? `：${n.data.reason}` : ""}`);
         return { reason: "completed", abandon: false, error: null };
@@ -420,7 +492,7 @@ export class RunEngine {
   }
 
   private setStage(stage: string): void {
-    this.emit({ stage, stage_label: STAGE_LABEL[stage] ?? stage });
+    this.emit({ stage, stage_label: stageLabel(stage) });
   }
 
   private bump(k: keyof RunCounts): void {
@@ -468,6 +540,7 @@ export class RunEngine {
   /** 进度上报。返回 null = 继续；否则是这一笔的结局。 */
   private async progress(a: Attempt, stage: string, detail: Record<string, unknown>): Promise<StepResult | null> {
     await this.beatIfDue();
+    await this.identityIfDue();
     this.setStage(stage);
     const p = await this.deps.api.progress(a.attempt_id, stage, { simulated: true, ...detail });
     if (!p.ok) {
@@ -478,9 +551,9 @@ export class RunEngine {
       return { kind: "stop", reason: "progress_rejected" };
     }
     if (!p.data.continue) {
-      const why = p.data.cancel_reason ?? "服务端要求中止";
+      const why = p.data.cancel_reason ?? cancelLabel(p.data.cancel_code);
       const code = abortCodeFor(p.data.cancel_code);
-      this.log("warn", `尝试 #${a.attempt_id}（${a.upstream_order_no ?? "—"}）：${why}，未提交前中止`);
+      this.log("warn", `尝试 #${a.attempt_id}（${a.upstream_order_no ?? "—"}）：${why}${/中止$/.test(why) ? "" : "，未提交前中止"}`);
       if (code === null) {
         // 服务端已经结束了这一笔（例如清除模拟结果、清扫）：不用再上报，继续下一笔。
         this.bump("aborted");
@@ -499,7 +572,7 @@ export class RunEngine {
     this.emit({
       attempt: { attempt_id: a.attempt_id, upstream_order_no: a.upstream_order_no, asin: a.asin, quantity: a.quantity },
       stage: "claimed",
-      stage_label: STAGE_LABEL.claimed ?? "claimed",
+      stage_label: stageLabel("claimed"),
     });
     this.log("info", `领取尝试 #${a.attempt_id}：${a.upstream_order_no ?? "—"} · ${a.asin ?? "—"} × ${a.quantity ?? "—"}`);
 
@@ -566,7 +639,9 @@ export class RunEngine {
     }
     this.log("ok", `尝试 #${a.attempt_id} 护栏放行：总额 $${facts.total ?? "—"}，送达 ${facts.delivery.date ?? "—"}`);
 
-    // 登记前最后一次确认：上游在这之前取消的话，这里拿到 continue=false。
+    // 提交登记之前先报一次新鲜的身份（服务端在登记前的确认与登记时都要求身份 10 分钟内上报过），
+    // 再做登记前最后一次确认：上游在这之前取消、身份不符或过期、来源有变化，这里拿到 continue=false。
+    await this.refreshIdentity();
     const before = await this.progress(a, "before_submit", {});
     if (before) return before;
 
@@ -611,7 +686,7 @@ export class RunEngine {
       this.log("warn", `尝试 #${a.attempt_id} 提交登记被拒绝：${s.error.message}`);
       const again = await this.progress(a, "before_submit", { submit_rejected: s.error.code });
       if (again) return again;
-      const rep = await this.report(a, failureResult("failed", "SUBMIT_REJECTED", `${s.error.code}：${s.error.message}`));
+      const rep = await this.report(a, failureResult("failed", "SUBMIT_REJECTED", s.error.message || codeLabel(s.error.code)));
       if (typeof rep === "object") return rep;
       this.bump("failed");
       return { kind: "stop", reason: "submit_rejected" };

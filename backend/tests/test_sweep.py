@@ -254,3 +254,12 @@ def test_workflow_run_uses_own_transaction(clean_db, conn, env):
         assert c.execute("SELECT status FROM procure.purchase_orders WHERE id = %s",
                          (order["id"],)).fetchone()["status"] == "assigned"
     assert sweep_wf.run(conn=conn)["expired_runs"] == []
+
+
+def test_workflow_passes_now_to_sweep(conn, env):
+    """workflows.sweep.run(now=…) 按给定时刻判定租约是否过期（调度器把自己的「现在」传进来）。"""
+    run_id = fx.start(conn, env["dev"])
+    assert sweep_wf.run(conn=conn)["expired_runs"] == []                    # 时钟仍在 NOW：租约有效
+    assert sweep_wf.run(conn=conn, now=NOW + timedelta(seconds=179))["expired_runs"] == []
+    assert sweep_wf.run(conn=conn, now=LATER)["expired_runs"] == [run_id]
+    assert fx.run_row(conn, run_id)["end_reason"] == "lease_expired"

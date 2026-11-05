@@ -14,10 +14,10 @@ RECENT_EXCEPTIONS = 5
 
 
 def overview(conn, workspace_id: int) -> dict[str, Any]:
-    """输入：工作区 → 输出：{bj_date, counts, today_executable, future_assigned, accounts, devices,
+    """输入：工作区 → 输出：{bj_date, counts, needs_attention, today_executable, future_assigned, accounts, devices,
     recent_exceptions, last_allocation, simulation_only, feishu_configured}。
 
-    today_executable = 已分配且建议采购日期 ≤ 北京今天（「today」视图）；future_assigned = 已分配且日期在今天之后；
+    needs_attention = 置了「需要留意」提醒的任务数（不论状态）；today_executable = 已分配且建议采购日期 ≤ 北京今天（「today」视图）；future_assigned = 已分配且日期在今天之后；
     accounts.enabled = 未归档且采购开关开启；accounts.paused = 未归档且暂停执行；devices 只计未撤销的，
     online = 3 分钟内有心跳；recent_exceptions = 最近变为「异常」的任务（列表行形状）。
     """
@@ -28,6 +28,10 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
         (workspace_id,),
     ).fetchall():
         counts[r["status"]] = int(r["n"])
+    attention = conn.execute(
+        "SELECT count(*) AS n FROM procure.purchase_orders WHERE workspace_id = %s AND needs_attention",
+        (workspace_id,),
+    ).fetchone()["n"]
     dated = conn.execute(
         """
         SELECT count(*) FILTER (WHERE suggested_purchase_date <= %s) AS today_n,
@@ -59,6 +63,7 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
     return {
         "bj_date": today.isoformat(),
         "counts": counts,
+        "needs_attention": int(attention),
         "today_executable": int(dated["today_n"]),
         "future_assigned": int(dated["future_n"]),
         "accounts": {"total": int(acc["total"]), "enabled": int(acc["enabled"]), "paused": int(acc["paused"])},

@@ -1,15 +1,20 @@
 /** 错误码与中文说明（结构化错误码，不写自由文本）。
  *
- * 三组来源：
+ * 几组来源：
  *   · 服务端统一错误码（契约 §8 末尾），接口返回的 `code`；
  *   · 护栏拦截码（契约 §4），`/guard` 返回的 `code`，插件原样作为 `error_code` 上报；
- *   · 插件自己产生的码：一组描述「没说上话」（NETWORK / TIMEOUT / BAD_RESPONSE），
- *     一组是上报给服务端的尝试失败原因（契约 §5「结果处理」表里列的那些）。
+ *   · 尝试失败原因（契约 §5「结果处理」表，服务端 services/models.ERROR_CODES）；
+ *   · 进度 continue=false 的机读原因 cancel_code（契约 §5 第 7 步）；
+ *   · 插件本地的码：描述「没说上话」（NETWORK / TIMEOUT / BAD_RESPONSE）、没配对等。
+ *
+ * 原样的英文码（含认不出的）不进面板、弹出页与设置页：一律经 codeLabel / cancelLabel /
+ * stopReasonLabel / stageLabel 换成中文。
  *
  * 文案规则（EasyQuick README）：简体中文，不用感叹号；失败提示「动作 + 失败：原因」，
  * 这里只给「原因」那半句，动作由调用处拼。
  */
 
+/** 服务端统一错误码（契约 §8，顺序同契约与 web 的 API_ERROR_CODES）。 */
 export const SERVER_CODE_LABEL: Record<string, string> = {
   UNAUTHORIZED: "设备令牌无效或已撤销，请重新配对",
   FORBIDDEN: "没有权限",
@@ -23,8 +28,18 @@ export const SERVER_CODE_LABEL: Record<string, string> = {
   ACCOUNT_PAUSED: "账号已暂停执行，请在控制台恢复后再试",
   REAL_PURCHASE_DISABLED: "服务端当前只允许模拟执行",
   LEASE_LOST: "执行权已失效（租约过期或批次已被结束）",
+  FEISHU_NOT_CONFIGURED: "服务端还没有配置飞书应用",
+  FEISHU_ERROR: "飞书接口出错",
+  INVALID_TRANSITION: "任务状态不允许这次变更",
+  SOURCE_CHANGED: "领取后来源有变化，提交前中止",
+  // 既是服务端错误码（提交登记时按最新配置复核护栏不过），也是插件上报的兜底拦截码（护栏没给拦截码时）
+  GUARD_BLOCKED: "护栏拦截：结算信息没有通过护栏校验",
+  RATE_LIMITED: "尝试次数过多，请稍后再试",
+  METHOD_NOT_ALLOWED: "服务端不支持这个请求方法",
+  INTERNAL: "服务端内部错误",
 };
 
+/** 护栏拦截码（契约 §4，服务端 services/models.ERROR_CODES 的 guard 类）。 */
 export const GUARD_CODE_LABEL: Record<string, string> = {
   ITEM_MISMATCH: "商品或数量与任务不符",
   ZIP_MISMATCH: "收货邮编与任务不符",
@@ -35,14 +50,22 @@ export const GUARD_CODE_LABEL: Record<string, string> = {
   CARD_MISMATCH: "支付卡尾号与账号设置不符",
 };
 
-/** 插件上报给服务端的尝试失败原因（`result.error_code`）。 */
+/** 尝试失败原因（`result.error_code`，服务端 services/models.ERROR_CODES 的其余各类）。
+ *  插件本阶段上报的只是其中一部分；其余是真实驱动接入后会用到的，界面上（例如待补交的回执）也要有中文。 */
 export const ATTEMPT_CODE_LABEL: Record<string, string> = {
   OUT_OF_STOCK: "商品缺货",
+  QUANTITY_UNAVAILABLE: "无法选择所需数量",
+  ADDRESS_FAILED: "收货地址填写失败",
+  CART_MISMATCH: "购物车内容与任务不一致",
+  UNEXPECTED_PAGE: "页面结构与预期不符",
   PAGE_LOAD_FAILED: "页面加载失败",
+  LOGIN_REQUIRED: "买家账号登录失效",
+  ACCOUNT_RESTRICTED: "买家账号受限",
+  CARD_DECLINED: "银行卡被拒付",
   CAPTCHA_ENCOUNTERED: "遇到验证码或风控，转人工处理",
   ABORTED_UPSTREAM_CANCELLED: "上游已取消，未提交前中止",
-  ABORTED_BY_SERVER: "服务端要求中止（账号暂停、身份不符或来源有变化），未提交前中止",
-  GUARD_BLOCKED: "护栏拦截（服务端未给出拦截码）",
+  ABORTED_BY_USER: "插件端人工中止，未提交前中止",
+  ABORTED_BY_SERVER: "服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止",
   SUBMIT_REJECTED: "服务端拒绝了提交登记",
   PLUGIN_SIMULATION_ONLY: "插件当前只做模拟执行，拒绝执行非模拟尝试",
 };
@@ -59,16 +82,36 @@ export const LOCAL_CODE_LABEL: Record<string, string> = {
   NO_IDENTITY: "没有读到亚马逊登录状态",
 };
 
-/** 输入：任意错误码 → 输出：中文说明；认不出就原样返回码本身（不吞掉）。 */
+/** 认不出的错误码的说明：界面上不出现原样的英文码。 */
+export const UNKNOWN_CODE_LABEL = "其他原因（插件不认识这个错误码）";
+
+/** 输入：任意错误码 → 输出：中文说明。`HTTP_<状态码>`（服务端没给错误体）说状态码；
+ *  其他认不出的码给一句通用说明 —— 原样的英文码不进面板、弹出页与设置页。 */
 export function codeLabel(code: string | null | undefined): string {
   if (!code) return "未知原因";
-  return (
-    SERVER_CODE_LABEL[code] ??
-    GUARD_CODE_LABEL[code] ??
-    ATTEMPT_CODE_LABEL[code] ??
-    LOCAL_CODE_LABEL[code] ??
-    code
-  );
+  const known = SERVER_CODE_LABEL[code] ?? GUARD_CODE_LABEL[code] ?? ATTEMPT_CODE_LABEL[code] ?? LOCAL_CODE_LABEL[code];
+  if (known) return known;
+  const http = /^HTTP_(\d{3})$/.exec(code);
+  if (http) return Number(http[1]) >= 500 ? `服务端出错（状态码 ${http[1]}）` : `服务端拒绝了请求（状态码 ${http[1]}）`;
+  return UNKNOWN_CODE_LABEL;
+}
+
+/** 进度 `continue=false` 的机读原因（服务端 execution.CANCEL_CODES，契约 §5 第 7 步）的中文说明。
+ *  服务端同时给 cancel_reason（中文原话，更具体）；这里是它缺失时的兜底，也是日志里的分类。 */
+export const CANCEL_CODE_LABEL: Record<string, string> = {
+  UPSTREAM_CANCELLED: "上游已取消",
+  ACCOUNT_ARCHIVED: "账号已归档",
+  ACCOUNT_PAUSED: "账号已暂停执行",
+  IDENTITY_MISMATCH: "浏览器登录的买家账号与绑定账号不一致，或没有登录",
+  IDENTITY_STALE: "插件超过 10 分钟没有上报登录身份，身份信息已过期",
+  SOURCE_HOLD: "来源把这笔任务暂停了（有冲突待处理）",
+  SOURCE_CHANGED: "领取后来源有变化，提交前中止",
+  ATTEMPT_FINISHED: "本次采购尝试已结束",
+};
+
+/** 输入：进度返回的 cancel_code → 输出：中文说明；没给或认不出时为通用说明。 */
+export function cancelLabel(code: string | null | undefined): string {
+  return (code ? CANCEL_CODE_LABEL[code] : undefined) ?? "服务端要求中止";
 }
 
 /** 账号级错误：服务端收到后会暂停账号执行（契约 §5 结果处理表）。插件随后结束本批次。 */
@@ -120,6 +163,10 @@ export const STOP_REASON_LABEL: Record<string, string> = {
 
 /** 输入：停止原因码 → 输出：中文说明。 */
 export function stopReasonLabel(reason: string | null | undefined): string {
-  if (!reason) return "服务端要求停止";
-  return STOP_REASON_LABEL[reason] ?? reason;
+  return (reason ? STOP_REASON_LABEL[reason] : undefined) ?? "服务端要求停止";
+}
+
+/** 输入：执行阶段名 → 输出：中文名（认不出时为「执行中」，不显示原样的阶段名）。 */
+export function stageLabel(stage: string | null | undefined): string {
+  return (stage ? STAGE_LABEL[stage] : undefined) ?? "执行中";
 }

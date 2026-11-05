@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -45,7 +45,8 @@ from registry import settings
 from services import accounts, clock, devices, events, guard, orders, quota, settings_svc, writeback
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import (
-    ATTEMPT_INFLIGHT, ERROR_CODES, EXECUTION_FIELDS, PRE_EXECUTION_STATUSES, UpstreamRecord, money, money_cap,
+    ATTEMPT_INFLIGHT, ERROR_CODES, EXECUTION_FIELDS, PRE_EXECUTION_STATUSES, SIM_PREFIX, UpstreamRecord, money,
+    money_cap,
 )
 
 TRIGGERS = ("manual", "scheduled")
@@ -53,8 +54,6 @@ OUTCOMES = ("succeeded", "failed", "unknown")
 FINAL_STATUSES = ("succeeded", "failed", "unknown", "aborted")
 AMOUNT_KEYS = ("subtotal", "shipping", "tax", "total_before_tax", "total")
 PAUSE_MARKER_KIND = "account.paused_by_execution"
-SIM_PREFIX = "SIM-"
-_MAX_AMOUNT = Decimal("10000000000")       # 尝试的金额列是 numeric(12,2)：放不下的按读不出（None）
 
 _INFLIGHT = sorted(ATTEMPT_INFLIGHT)
 _PRE_SUBMIT = ("claimed", "checking", "guard_passed")
@@ -65,11 +64,11 @@ ATTEMPT_STATUS_ZH = {
 }
 END_REASON_ZH = {
     "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）", "device_revoked": "设备授权已撤销",
-    "account_paused": "账号已暂停执行", "simulation_reset": "已清除模拟结果",
+    "simulation_reset": "已清除模拟结果",
 }
 
 __all__ = [
-    "CLAIM_BUSY_RETRY_S", "PAUSE_MARKER_KIND", "apply_source_drift", "drift_updates", "end_run", "execution_gate",
+    "CANCEL_CODES", "PAUSE_MARKER_KIND", "apply_source_drift", "drift_updates", "end_run", "execution_gate",
     "finish_run", "mark_submitting", "mark_verifying", "next_attempt", "progress", "report_result", "run_heartbeat",
     "start_run", "submit_guard", "sweep",
 ]
@@ -314,8 +313,9 @@ def _pause_account(conn, workspace_id: int, account_id: int | None, reason: str,
 # - 提交登记前（进度、提交登记）：来源相对基线出现外部 AMZ 订单号、人审结论改变或执行相关字段被改 →
 #   进度 continue=false、提交登记 409 SOURCE_CHANGED（插件随后上报中止）。
 # - 采购没有完成就回到开始前 / 异常（中止、清扫、失败、护栏拦截、清除模拟结果）：apply_source_drift 把变化
-#   落到任务上：人审结论直接采用（撤回 → 待确认）；外部 AMZ 订单号、字段变化写进 conflict（incoming 为来源
-#   新值，控制台「接受 / 保留」），任务按派生规则转待确认 / 待核实（异常保持异常），并置 needs_attention。
+#   落到任务上：人审结论直接采用（撤回 → 待确认；任务由控制台人审时，领取后才出现的来源关联带来的「拒绝」
+#   不直接采用，写成人审冲突 kind review，与 ingest 一致）；外部 AMZ 订单号、字段变化写进 conflict（incoming
+#   为来源新值，控制台「接受 / 保留」），任务按派生规则转待确认 / 待核实（异常保持异常），并置 needs_attention。
 #   每笔尝试只落一次（task_snapshot.source_drift_checked_at）。
 
 _SOURCE_TEXT_FIELDS = frozenset({"recipient_name", "address1", "address2", "city", "state", "postal_code", "phone",
@@ -393,7 +393,7 @@ def _links(conn, order: dict[str, Any]) -> list[dict[str, Any]]:
 def _link_vals(link: dict[str, Any]) -> dict[str, Any] | None:
     try:
         return _source_vals(UpstreamRecord.from_json(link["normalized"] or {}))
-    except (TypeError, ValueError, KeyError):
+    except (TypeError, ValueError, KeyError, ArithmeticError):     # ArithmeticError：Decimal 换算失败
         return None
 
 
@@ -432,11 +432,14 @@ def _known_order_nos(conn, order: dict[str, Any]) -> set[str]:
 
 def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str, Any] | None:
     """输入：任务、尝试（task_snapshot 里有领取时的来源基线）→ 输出：领取之后来源在执行相关内容上的变化
-    {fields: {字段: [任务现值, 来源新值]}, incoming, review, external, source_kind, source}；没有变化、
-    或尝试没有基线（旧数据、外部尝试）→ None。
+    {fields: {字段: [任务现值, 来源新值]}, incoming, review, review_conflict, external, source_kind, source}；
+    没有变化、或尝试没有基线（旧数据、外部尝试）→ None。
 
     同一条来源关联与自己的基线比；领取后才出现的关联（如新一批文件）与同种来源最近的基线比（内容与任一
     基线相同就不算变化），没有同种基线时与任务现值比。另一种来源的空值不算变化（与 ingest 一致）。
+    人审（与 ingest 的规则一致）：只看同种来源；review 是直接采用的新结论。任务由控制台人审时，只有领取时就在的
+    那条来源记录自己的变化才直接采用；领取后才出现的关联带来「拒绝」→ review_conflict（人审冲突，需人工核实，
+    不悄悄改写控制台的通过结论），带来其他结论不算变化。
     """
     snap = att.get("task_snapshot") if isinstance(att.get("task_snapshot"), dict) else {}
     base = snap.get("source_baseline")
@@ -447,7 +450,8 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
     primary = order.get("primary_source_kind")
     fields: dict[str, list[Any]] = {}
     incoming: dict[str, Any] = {}
-    review = external = None
+    review = review_conflict = external = None
+    console = order.get("review_source") == "console"
     src_kind = src = None
     known_nos: set[str] | None = None
     for link in _links(conn, order):
@@ -476,10 +480,15 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
                 incoming["suggested_date_basis"] = cur.get("suggested_date_basis")
             found = True
         st = cur.get("review_status")
-        if (same_kind and st != ref.get("review_status") and st != order.get("review_status")
-                and not (order.get("review_source") == "console" and st == "unknown")):
-            review = {"review_status": st, "review_value": cur.get("review_value"), "source_kind": link["kind"]}
-            found = True
+        if same_kind and st != ref.get("review_status") and st != order.get("review_status"):
+            if console and b is None:
+                if st == "rejected":
+                    review_conflict = {"review_status": st, "review_value": cur.get("review_value"),
+                                       "source_kind": link["kind"], "source": _link_desc(link)}
+                    found = True
+            elif not (console and st == "unknown"):
+                review = {"review_status": st, "review_value": cur.get("review_value"), "source_kind": link["kind"]}
+                found = True
         no = cur.get("external_amz_order_no")
         if no and _canon("amazon_order_no", no) != _canon("amazon_order_no", ref.get("external_amz_order_no")):
             if known_nos is None:
@@ -490,10 +499,10 @@ def _source_drift(conn, order: dict[str, Any], att: dict[str, Any]) -> dict[str,
                 found = True
         if found:
             src_kind, src = link["kind"], _link_desc(link)
-    if not fields and review is None and external is None:
+    if not fields and review is None and review_conflict is None and external is None:
         return None
-    return {"fields": fields, "incoming": incoming, "review": review, "external": external,
-            "source_kind": src_kind, "source": src}
+    return {"fields": fields, "incoming": incoming, "review": review, "review_conflict": review_conflict,
+            "external": external, "source_kind": src_kind, "source": src}
 
 
 def _hold_reason(order: dict[str, Any]) -> str | None:
@@ -516,10 +525,11 @@ def _drift_text(drift: dict[str, Any]) -> str:
     parts = []
     if drift["external"]:
         parts.append(f"来源出现 AMZ 订单号 {drift['external']['external_amz_order_no']}")
-    if drift["review"]:
-        rv = drift["review"]
-        shown = rv["review_value"] or {"rejected": "拒绝", "unknown": "未知"}.get(rv["review_status"], rv["review_status"])
-        parts.append(f"人审结论变为「{shown}」")
+    for rv in (drift["review"], drift.get("review_conflict")):
+        if rv:
+            shown = rv["review_value"] or {"rejected": "拒绝", "unknown": "未知"}.get(rv["review_status"],
+                                                                                    rv["review_status"])
+            parts.append(f"人审结论变为「{shown}」")
     if drift["fields"]:
         labels = "、".join(orders.FIELD_LABELS.get(f, f) for f in drift["fields"])
         parts.append(_zh_join("来源修改了", labels))
@@ -571,6 +581,16 @@ def drift_updates(conn, order: dict[str, Any], att: dict[str, Any], *, actor_kin
         reason = _zh_join("采购过程中来源修改了", labels) + "，需人工核实"
         payload = {"kind": "fields", "source_kind": drift["source_kind"], "reason": reason,
                    "fields": drift["fields"], "incoming": drift["incoming"], "source": drift["source"], "at": now}
+    elif drift["review_conflict"]:
+        rc = drift["review_conflict"]
+        who = "飞书" if rc["source_kind"] == "feishu" else "文件"
+        shown = rc["review_value"] or "拒绝"
+        reason = f"{who}来源的人工审核为「{shown}」，与任务已有的通过结论不同，需人工核实"
+        payload = {"kind": "review", "source_kind": rc["source_kind"], "reason": reason,
+                   "fields": {"review_status": [order.get("review_status"), "rejected"]},
+                   "incoming": {"review_status": "rejected", "review_value": rc["review_value"],
+                                "review_source": rc["source_kind"]},
+                   "source": rc["source"], "at": now}
     if payload is not None and not order.get("conflict"):
         upd["conflict"] = payload
     note = f"{text}（采购未完成，已按来源最新内容转人工核实）"
@@ -580,7 +600,8 @@ def drift_updates(conn, order: dict[str, Any], att: dict[str, Any], *, actor_kin
     events.record(conn, order["workspace_id"], "order", order["id"], "order.source_changed_during_attempt",
                   actor_kind=actor_kind, actor_id=actor_id,
                   detail={"attempt_id": att["id"], "reason": text, "fields": drift["fields"],
-                          "review": drift["review"], "external": drift["external"], "source": drift["source"]})
+                          "review": drift["review"], "review_conflict": drift["review_conflict"],
+                          "external": drift["external"], "source": drift["source"]})
     return upd
 
 
@@ -719,9 +740,10 @@ def _settle_run_attempts(conn, run: dict[str, Any], cause: str, *, actor_kind: s
 
 
 def end_run(conn, run: dict[str, Any], end_reason: str, *, actor_kind: str = "system", actor_id: int | None = None,
-            cause: str | None = None, settle: bool = True) -> dict[str, Any]:
-    """输入：未结束的批次行（调用方已锁）、结束原因、操作者、是否按超时处理在途尝试 → 输出：
-    {run_id, end_reason, aborted, unknown}。
+            cause: str | None = None, settle: bool = True,
+            event_detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    """输入：未结束的批次行（调用方已锁）、结束原因、操作者、是否按超时处理在途尝试、run.ended 事件的附加细节
+    → 输出：{run_id, end_reason, aborted, unknown}。
 
     settle=True 时它的在途尝试按租约过期同样处理（见 _settle_inflight）；「清除模拟结果」传 settle=False，
     在途的模拟尝试由它统一清除。批次已结束 → 原样返回（不重复处理）。
@@ -738,8 +760,8 @@ def end_run(conn, run: dict[str, Any], end_reason: str, *, actor_kind: str = "sy
     ).fetchone()
     if row is not None:
         events.record(conn, ws, "run", run["id"], "run.ended", actor_kind=actor_kind, actor_id=actor_id,
-                      detail={"end_reason": end_reason, "account_id": run["account_id"], "device_id": run["device_id"],
-                              **counts})
+                      detail={**(event_detail or {}), "end_reason": end_reason, "account_id": run["account_id"],
+                              "device_id": run["device_id"], **counts})
     return {"run_id": run["id"], "end_reason": end_reason, **counts}
 
 
@@ -931,8 +953,6 @@ _CLAIMABLE_WHERE = """
                     WHERE pa.purchase_order_id = o.id AND pa.workspace_id = o.workspace_id
                       AND pa.status = ANY(%s))
 """
-#: 候选任务全被别的事务锁着（导入、同步、分配进行中）时，建议插件多少秒后再领取
-CLAIM_BUSY_RETRY_S = 5
 
 
 def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
@@ -1008,9 +1028,10 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
     locked = conn.execute(f"SELECT count(*) AS n FROM procure.purchase_orders o WHERE {_CLAIMABLE_WHERE}",
                           (ws, acc["id"], today, skipped, _INFLIGHT)).fetchone()["n"]
     if locked:
-        return {"attempt": None, "retry_after_s": CLAIM_BUSY_RETRY_S,
-                "reason": f"有 {locked} 笔可执行的任务正被其他操作（导入、同步或分配）占用，"
-                          f"请 {CLAIM_BUSY_RETRY_S} 秒后再领取"}
+        # 候选任务全被别的事务锁着（导入、同步、分配进行中）：建议插件 claim_busy_retry_s 秒后再领取
+        wait_s = int(settings.get().claim_busy_retry_s)
+        return {"attempt": None, "retry_after_s": wait_s,
+                "reason": f"有 {locked} 笔可执行的任务正被其他操作（导入、同步或分配）占用，请 {wait_s} 秒后再领取"}
     future = conn.execute(
         "SELECT count(*) AS n FROM procure.purchase_orders WHERE workspace_id = %s AND assigned_account_id = %s "
         "AND status = 'assigned' AND suggested_purchase_date > %s",
@@ -1030,12 +1051,50 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
 # ── 进度、护栏、提交登记、等待验证 ────────────────────────────────────────────
 
 
-def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detail: Any = None) -> dict[str, Any]:
-    """输入：设备、尝试、阶段名、细节 → 输出：{continue, cancel_reason}。
+#: 进度 continue=false 的原因码（契约 §5 第 7 步；插件按它决定上报哪个中止码）
+CANCEL_CODES = ("UPSTREAM_CANCELLED", "ACCOUNT_ARCHIVED", "ACCOUNT_PAUSED", "IDENTITY_MISMATCH", "IDENTITY_STALE",
+                "SOURCE_HOLD", "SOURCE_CHANGED", "ATTEMPT_FINISHED")
 
-    未登记提交时，上游已取消 / 账号已暂停或归档 / 身份不符或已过期 / 领取后来源有执行相关变化（外部 AMZ
-    订单号、人审结论、执行相关字段，见 _source_drift）→ continue=false（插件随后上报中止）；尝试已结束 →
-    continue=false。首次进度把尝试从 claimed 推进到 checking。
+
+def _progress_stop(conn, dev: dict[str, Any], att: dict[str, Any],
+                   order: dict[str, Any]) -> tuple[str, str] | None:
+    """输入：设备、在途且未登记提交的尝试、它的任务 → 输出：(cancel_code, 中文原因)；可以继续 → None。
+
+    依次看：上游取消、账号归档、账号暂停、身份不符、身份过期、来源写在任务上的暂停、领取后来源的执行相关变化。
+    """
+    acc = _account_row(conn, att["workspace_id"], att["account_id"])
+    if order["upstream_cancelled"] or order["status"] == "cancelled":
+        note = order["upstream_cancel_note"]
+        return "UPSTREAM_CANCELLED", (f"上游已取消（{note}）" if note else "上游已取消")
+    if acc is None or acc["archived_at"] is not None:
+        return "ACCOUNT_ARCHIVED", "账号已归档"
+    if acc["execution_paused"]:
+        return "ACCOUNT_PAUSED", f"账号已暂停执行：{acc['pause_reason'] or '人工暂停'}"
+    problem = _identity_problem(dev, acc)
+    if problem is not None:
+        return "IDENTITY_MISMATCH", problem[1]
+    stale = _identity_stale(dev)
+    if stale is not None:
+        return "IDENTITY_STALE", stale
+    hold = _hold_reason(order)
+    if hold is not None:
+        return "SOURCE_HOLD", f"{hold}，未提交前中止"
+    drift = _source_drift(conn, order, att)
+    if drift is not None:
+        return "SOURCE_CHANGED", f"{_drift_text(drift)}，未提交前中止"
+    return None
+
+
+def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detail: Any = None) -> dict[str, Any]:
+    """输入：设备、尝试、阶段名、细节 → 输出：{continue, cancel_reason, cancel_code}。
+
+    continue=false 时 cancel_code 是 CANCEL_CODES 之一（continue=true 时为 None）：尝试已结束 → ATTEMPT_FINISHED；
+    未登记提交时，上游已取消 → UPSTREAM_CANCELLED、账号已归档 → ACCOUNT_ARCHIVED、已暂停 → ACCOUNT_PAUSED、
+    身份不符 → IDENTITY_MISMATCH、身份超过 identity_fresh_s 没有上报 → IDENTITY_STALE、来源在执行期间把暂停写在
+    任务上（order.conflict）→ SOURCE_HOLD、领取后来源有执行相关变化（外部 AMZ 订单号、人审结论、执行相关字段，见
+    _source_drift）→ SOURCE_CHANGED。插件随后上报中止：UPSTREAM_CANCELLED → ABORTED_UPSTREAM_CANCELLED，
+    ATTEMPT_FINISHED 不再上报，其余 → ABORTED_BY_SERVER。已登记提交的尝试一律 continue=true。
+    首次进度把尝试从 claimed 推进到 checking；attempt.progress 事件记下 continue / cancel_reason / cancel_code。
     """
     dev = devices.require_active(conn, device)
     att, run, order = _attempt_for(conn, dev, attempt_id)
@@ -1044,31 +1103,10 @@ def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detai
     if st is None:
         raise validation("阶段名不能为空", field="stage")
     if att["status"] not in ATTEMPT_INFLIGHT:
-        return {"continue": False,
+        return {"continue": False, "cancel_code": "ATTEMPT_FINISHED",
                 "cancel_reason": f"本次采购尝试已结束（{ATTEMPT_STATUS_ZH.get(att['status'], att['status'])}）"}
-    cancel = None
-    if att["submitted_at"] is None:
-        acc = _account_row(conn, att["workspace_id"], att["account_id"])
-        if order["upstream_cancelled"] or order["status"] == "cancelled":
-            note = order["upstream_cancel_note"]
-            cancel = f"上游已取消（{note}）" if note else "上游已取消"
-        elif acc is None or acc["archived_at"] is not None:
-            cancel = "账号已归档"
-        elif acc["execution_paused"]:
-            cancel = f"账号已暂停执行：{acc['pause_reason'] or '人工暂停'}"
-        else:
-            problem = _identity_problem(dev, acc)
-            stale = _identity_stale(dev) if problem is None else None
-            hold = _hold_reason(order) if problem is None and stale is None else None
-            drift = _source_drift(conn, order, att) if problem is None and stale is None and hold is None else None
-            if problem is not None:
-                cancel = problem[1]
-            elif stale is not None:
-                cancel = stale
-            elif hold is not None:
-                cancel = f"{hold}，未提交前中止"
-            elif drift is not None:
-                cancel = f"{_drift_text(drift)}，未提交前中止"
+    stop = _progress_stop(conn, dev, att, order) if att["submitted_at"] is None else None
+    code, cancel = stop if stop is not None else (None, None)
     cols: dict[str, Any] = {"stage": st, "heartbeat_at": clock.now()}
     if att["status"] == "claimed":
         cols["status"] = "checking"
@@ -1076,8 +1114,8 @@ def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detai
     events.record(conn, att["workspace_id"], "attempt", att["id"], "attempt.progress", actor_kind="device",
                   actor_id=dev["id"], order_id=order["id"],
                   detail={"stage": st, "detail": _small(detail) if detail is not None else None,
-                          "continue": cancel is None, "cancel_reason": cancel})
-    return {"continue": cancel is None, "cancel_reason": cancel}
+                          "continue": cancel is None, "cancel_reason": cancel, "cancel_code": code})
+    return {"continue": cancel is None, "cancel_reason": cancel, "cancel_code": code}
 
 
 def _evaluate_guard(conn, facts: dict[str, Any], order: dict[str, Any], acc: dict[str, Any]) -> dict[str, Any]:
@@ -1178,7 +1216,7 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
     drift = _source_drift(conn, order, att)
     if drift is not None:
         raise conflict(f"{_drift_text(drift)}，不能提交", code="SOURCE_CHANGED", fields=sorted(drift["fields"]),
-                       review=drift["review"], external=drift["external"])
+                       review=drift["review"] or drift["review_conflict"], external=drift["external"])
     recheck = _evaluate_guard(conn, att["guard_input"] if isinstance(att["guard_input"], dict) else {}, order, acc)
     if recheck["verdict"] != "pass":
         why = recheck["reasons"][0] if recheck["reasons"] else (
@@ -1227,11 +1265,9 @@ def _parse_result(payload: Any, site: str) -> dict[str, Any]:
     amounts: dict[str, Decimal | None] = {}
     for k in AMOUNT_KEYS:
         v = amounts_in.get(k)
-        try:
-            d = None if isinstance(v, bool) or not isinstance(v, (str, int, float, Decimal)) else money(v)
-        except (InvalidOperation, ValueError, OverflowError):    # 位数大到无法取两位小数 → 读不出
-            d = None
-        amounts[k] = d if d is not None and d >= 0 and d < _MAX_AMOUNT else None
+        # money 从不抛异常：读不出、超出 numeric(12,2) → None（按读不出处理，不当 0）
+        d = None if isinstance(v, bool) or not isinstance(v, (str, int, float, Decimal)) else money(v)
+        amounts[k] = d if d is not None and d >= 0 else None
     card = payload.get("card_last4")
     card_s = "".join(ch for ch in str(card) if ch.isdigit()) if card is not None else ""
     delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
@@ -1259,7 +1295,12 @@ def _parse_result(payload: Any, site: str) -> dict[str, Any]:
 
 
 def _order_no_problem(conn, att: dict[str, Any], no: str | None) -> str | None:
-    """输入：尝试、上报的亚马逊订单号 → 输出：不能据此登记成功的原因；合格 → None。"""
+    """输入：尝试、上报的亚马逊订单号 → 输出：不能据此登记成功的原因；合格 → None。
+
+    真实尝试的单号不得已登记在工作区里**任何别的**成功真实尝试上（含本任务之前的尝试，例如亚马逊取消后同意
+    重采、新尝试却报回旧单号；也含人工接受的外部单号）。与库里的唯一索引（工作区 + 单号，限非模拟的成功尝试）
+    同一口径；并发漏网的由 report_result 的 SAVEPOINT 兜底。
+    """
     if not no:
         return "上报成功但没有亚马逊订单号"
     if att["simulated"]:
@@ -1268,16 +1309,19 @@ def _order_no_problem(conn, att: dict[str, Any], no: str | None) -> str | None:
         return f"真实尝试不能使用模拟单号（收到 {no}）"
     dup = conn.execute(
         """
-        SELECT o.upstream_order_no FROM procure.purchase_attempts a
+        SELECT a.id, a.attempt_no, a.purchase_order_id, o.upstream_order_no FROM procure.purchase_attempts a
         JOIN procure.purchase_orders o ON o.id = a.purchase_order_id AND o.workspace_id = a.workspace_id
         WHERE a.workspace_id = %s AND a.amazon_order_no = %s AND NOT a.simulated AND a.status = 'succeeded'
-          AND a.purchase_order_id <> %s LIMIT 1
+          AND a.id <> %s
+        ORDER BY a.id LIMIT 1
         """,
-        (att["workspace_id"], no, att["purchase_order_id"]),
+        (att["workspace_id"], no, att["id"]),
     ).fetchone()
-    if dup is not None:
-        return f"亚马逊订单号 {no} 已登记在任务 {dup['upstream_order_no']}"
-    return None
+    if dup is None:
+        return None
+    if dup["purchase_order_id"] == att["purchase_order_id"]:
+        return f"亚马逊订单号 {no} 已登记在本任务之前的第 {dup['attempt_no']} 次成功尝试，需人工核实是否重新下单"
+    return f"亚马逊订单号 {no} 已登记在任务 {dup['upstream_order_no']}"
 
 
 def _target_status(conn, att: dict[str, Any], r: dict[str, Any]) -> tuple[str, str | None]:
@@ -1412,7 +1456,15 @@ def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -
     cols = _result_cols(r, now)
 
     if target == "succeeded":
-        att = _set_attempt(conn, att, status="succeeded", stage="done", amazon_order_no=r["amazon_order_no"], **cols)
+        try:
+            with conn.transaction():         # SAVEPOINT：单号唯一索引冲突（并发漏网）→ 按结果待核实处理，不报 500
+                done = _set_attempt(conn, att, status="succeeded", stage="done", amazon_order_no=r["amazon_order_no"],
+                                    **cols)
+        except psycopg.errors.UniqueViolation:
+            target, problem = "unknown", f"亚马逊订单号 {r['amazon_order_no']} 已登记在别的成功尝试"
+        else:
+            att = done
+    if target == "succeeded":
         upd: dict[str, Any] = {"purchased_attempt_id": att["id"], "current_attempt_id": None,
                                "result_version": order["result_version"] + 1, "page_load_retries": 0}
         if order["upstream_cancelled"]:
@@ -1480,17 +1532,38 @@ def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -
 # ── 结束批次与清扫 ────────────────────────────────────────────────────────────
 
 
-def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finished") -> dict[str, Any]:
-    """输入：设备、批次、结束原因（插件给的短码，缺省 finished）→ 输出：{run_id, ended_at, end_reason, stats}。
+_PLUGIN_DETAIL_MAX = 200
 
+
+def _plugin_detail(v: Any) -> str | None:
+    """输入：插件结束批次时给的说明（任意 JSON）→ 输出：去掉首尾空白、最多 200 字的文本；非字符串先转成 JSON
+    文本再截；空 → None。"""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        try:
+            v = json.dumps(_jsonable(v), ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            v = str(v)
+    return v.strip()[:_PLUGIN_DETAIL_MAX] or None
+
+
+def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finished",
+               detail: Any = None) -> dict[str, Any]:
+    """输入：设备、批次、结束原因（插件给的短码，缺省 finished）、说明（可选，任意 JSON）→ 输出：
+    {run_id, ended_at, end_reason, stats}；end_reason 恒为 finished，插件的短码记进 run.ended 事件的 plugin_reason。
+
+    说明记进 run.ended 事件的 plugin_detail（字符串去掉首尾空白后截到 200 字；非字符串先转成 JSON 文本再截）。
     还有在途尝试时按租约过期同样处理（未登记提交 → 中止、任务回已分配；已登记提交 → 结果待核实、暂停账号）。
     批次已结束或租约已过期 → LEASE_LOST。
     """
     dev = devices.require_active(conn, device)
     run = _run_for(conn, dev, run_id)
     _require_active(run)
-    end_reason = _text(reason, 64) or "finished"
-    end_run(conn, run, end_reason, actor_kind="device", actor_id=dev["id"], cause="插件结束了执行批次")
+    # end_reason 是封闭取值（finished / lease_expired / device_revoked / simulation_reset）；插件给的短码
+    # 记在 run.ended 事件的 plugin_reason 里
+    end_run(conn, run, "finished", actor_kind="device", actor_id=dev["id"], cause="插件结束了执行批次",
+            event_detail={"plugin_reason": _text(reason, 64) or "finished", "plugin_detail": _plugin_detail(detail)})
     row = conn.execute("SELECT * FROM procure.execution_runs WHERE id = %s AND workspace_id = %s",
                        (run["id"], run["workspace_id"])).fetchone()
     return {"run_id": row["id"], "ended_at": _iso(row["ended_at"]), "end_reason": row["end_reason"],

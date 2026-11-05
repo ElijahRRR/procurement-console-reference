@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from registry import db
@@ -15,15 +16,16 @@ from services import execution
 log = logging.getLogger(__name__)
 
 
-def run(conn=None) -> dict[str, Any]:
-    """输入：可选外部连接 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}。
+def run(conn=None, *, now: datetime | None = None) -> dict[str, Any]:
+    """输入：可选外部连接、可选「现在」（缺省 services/clock 的当前时刻）→ 输出：清扫摘要
+    {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}。
 
     不传 conn 时自己开一个事务（正常结束提交）；传入 conn 时在它上面执行且不提交。
     """
     if conn is not None:
-        return execution.sweep(conn)
+        return execution.sweep(conn, now=now)
     with db.pg_conn() as c:
-        summary = execution.sweep(c)
+        summary = execution.sweep(c, now=now)
     if summary["expired_runs"] or summary["revoked_runs"] or summary["orphan_attempts"]:
         log.info("租约清扫：%s", summary)
     return summary

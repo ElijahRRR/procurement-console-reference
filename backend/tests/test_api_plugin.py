@@ -50,7 +50,7 @@ def test_pair_heartbeat_identity_run_claim_guard_submit_result_purchased(owner, 
 
     pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress",
                         json={"stage": "checkout", "detail": {"page": "spc"}}, headers=h))
-    assert pr == {"continue": True, "cancel_reason": None}
+    assert pr == {"continue": True, "cancel_reason": None, "cancel_code": None}
     err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h), 409, "CONFLICT")  # 护栏前
 
     verdict = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=good_facts(att), headers=h))

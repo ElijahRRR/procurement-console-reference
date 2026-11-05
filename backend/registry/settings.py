@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,7 @@ class Settings:
     cookie_secure: bool
     lease_ttl_s: int
     identity_fresh_s: int
+    claim_busy_retry_s: int
     pairing_ttl_s: int
     sweep_interval_s: int
     writeback_interval_s: int
@@ -43,7 +45,11 @@ class Settings:
 
 
 def _load_dotenv(path: Path) -> None:
-    """输入：.env 路径 → 输出：无（把未设置的 KEY=VALUE 写进 os.environ）。"""
+    """输入：.env 路径 → 输出：无（把未设置的 KEY=VALUE 写进 os.environ）。
+
+    规则：# 开头的行是注释；可写 export KEY=VALUE；值可用成对的单 / 双引号括起（引号里原样保留）；
+    不带引号的值里「空白 + #」之后是行尾注释；值为空等于没写（用缺省值）。已存在的环境变量优先。
+    """
     if not path.is_file():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -52,9 +58,20 @@ def _load_dotenv(path: Path) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        if key and value and key not in os.environ:
             os.environ[key] = value
+
+
+def _str(name: str, default: str) -> str:
+    raw = os.environ.get(name, "").strip()
+    return raw or default
 
 
 def _int(name: str, default: int) -> int:
@@ -80,21 +97,22 @@ def get() -> Settings:
     if _loaded is None:
         _load_dotenv(paths.BACKEND_DIR / ".env")
         _loaded = Settings(
-            pg_dsn=os.environ.get("PC_PG_DSN", "dbname=procurement"),
-            host=os.environ.get("PC_HOST", "127.0.0.1"),
+            pg_dsn=_str("PC_PG_DSN", "dbname=procurement"),
+            host=_str("PC_HOST", "127.0.0.1"),
             port=_int("PC_PORT", 8790),
-            feishu_app_id=os.environ.get("FEISHU_APP_ID") or None,
-            feishu_app_secret=os.environ.get("FEISHU_APP_SECRET") or None,
-            feishu_base_url=os.environ.get("FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/"),
+            feishu_app_id=os.environ.get("FEISHU_APP_ID", "").strip() or None,
+            feishu_app_secret=os.environ.get("FEISHU_APP_SECRET", "").strip() or None,
+            feishu_base_url=_str("FEISHU_BASE_URL", "https://open.feishu.cn").rstrip("/"),
             session_days=_int("PC_SESSION_DAYS", 14),
             cookie_secure=_bool("PC_COOKIE_SECURE", False),
             lease_ttl_s=_int("PC_LEASE_TTL_S", 180),
             identity_fresh_s=_int("PC_IDENTITY_FRESH_S", 600),
+            claim_busy_retry_s=_int("PC_CLAIM_BUSY_RETRY_S", 5),
             pairing_ttl_s=_int("PC_PAIRING_TTL_S", 600),
             sweep_interval_s=_int("PC_SWEEP_INTERVAL_S", 30),
             writeback_interval_s=_int("PC_WRITEBACK_INTERVAL_S", 60),
             intake_check_s=_int("PC_INTAKE_CHECK_S", 30),
-            web_dist=Path(os.environ.get("PC_WEB_DIST", str(paths.REPO_DIR / "web" / "dist"))),
+            web_dist=Path(_str("PC_WEB_DIST", str(paths.REPO_DIR / "web" / "dist"))),
             login_fail_limit=_int("PC_LOGIN_FAIL_LIMIT", 10),
             pair_fail_limit=_int("PC_PAIR_FAIL_LIMIT", 20),
             rate_window_s=_int("PC_RATE_WINDOW_S", 600),

@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { FINISH_REASON, PluginClient, RETRY_ON_5XX, RETRY_POLICY, httpError, parseBusyHolder } from "../build/core/client.js";
+import { FINISH_REASON, PluginClient, RETRY_ON_5XX, RETRY_POLICY, httpError, pairFailureText, parseBusyHolder, parseRetryAfter, retryAfterSeconds } from "../build/core/client.js";
 
 const BASE = "http://127.0.0.1:8790/";
 
@@ -66,11 +66,17 @@ test("错误映射：FastAPI 原生 {detail: {...}} 与 {detail: '...'}，码缺
   assert.deepEqual(a.detail, { holder_device_name: "PC-DEMO" });
   const b = httpError(404, { detail: "Not Found" });
   assert.equal(b.code, "NOT_FOUND");
-  assert.equal(b.message, "Not Found");
+  assert.equal(b.message, "服务端没有这个接口或资源", "框架层的英文短语不直接给人看");
+  assert.equal(httpError(404, { detail: "采购尝试不存在" }).message, "采购尝试不存在", "中文原话照用");
   const c = httpError(401, null);
   assert.equal(c.code, "UNAUTHORIZED");
   assert.match(c.message, /重新配对/);
-  assert.equal(httpError(503, null).code, "HTTP_503");
+  const d = httpError(503, null);
+  assert.equal(d.code, "HTTP_503");
+  assert.equal(d.message, "服务端出错（状态码 503）");
+  assert.equal(httpError(500, { code: "INTERNAL", message: "Internal Server Error" }).message, "服务端内部错误");
+  assert.equal(httpError(405, null).code, "METHOD_NOT_ALLOWED");
+  assert.equal(httpError(429, null).code, "RATE_LIMITED");
 });
 
 test("ACCOUNT_BUSY 的 detail 带持有者设备名与开始时间", async () => {
@@ -277,4 +283,41 @@ test("进度：cancel_code 读出（没给为 null）；领取：retry_after_s �
   assert.equal(p2.data.cancel_code, null);
   const n = await client(scripted(json(200, { attempt: null, retry_after_s: 5, reason: "被占用" })).fetch).next(9);
   assert.deepEqual(n.data, { attempt: null, reason: "被占用", retry_after_s: 5 });
+});
+
+test("领取：retry_after_s 只要是不小于 0 的数（整数、小数、数字字符串）就算「稍后再领」", async () => {
+  for (const [v, want] of [[5, 5], [2.5, 2.5], ["3", 3], [0, 0], [-1, null], ["soon", null], [null, null]]) {
+    const r = await client(scripted(json(200, { attempt: null, reason: "占用", retry_after_s: v })).fetch).next(9);
+    assert.equal(r.data.retry_after_s, want, String(v));
+  }
+});
+
+test("Retry-After：detail.retry_after_s 优先，其次响应头；配对限速给出秒数", async () => {
+  const s = scripted(new Response(JSON.stringify({ code: "RATE_LIMITED", message: "尝试次数过多，请稍后再试", detail: {} }), { status: 429, headers: { "retry-after": "17" } }));
+  const r = await client(s.fetch, { token: null }).pair("DEMO2345", "Mac-DEMO", "chrome");
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, "RATE_LIMITED");
+  assert.equal(r.error.retry_after_s, 17);
+  assert.equal(retryAfterSeconds(r.error), 17);
+  assert.equal(pairFailureText(r.error, "http://127.0.0.1:8790"), "配对失败：尝试次数过多，请 17 秒后再试");
+  const d = httpError(429, { code: "RATE_LIMITED", message: "尝试次数过多，请稍后再试", detail: { retry_after_s: 42 } }, "17");
+  assert.equal(retryAfterSeconds(d), 42);
+  assert.equal(pairFailureText(httpError(429, null), "http://127.0.0.1:8790"), "配对失败：尝试次数过多，请稍后再试");
+  assert.equal(parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT"), null, "HTTP 日期格式不认");
+});
+
+test("配对被 Host 允许名单拒绝（403 FORBIDDEN）：提示改用 127.0.0.1 / localhost，或请管理员加进 PC_ALLOWED_HOSTS", () => {
+  const e = httpError(403, { code: "FORBIDDEN", message: "不接受这个主机名的请求：只接受本机地址；其他地址请在 PC_ALLOWED_HOSTS 里登记", detail: {} });
+  const t = pairFailureText(e, "http://localhost:9001");
+  assert.match(t, /^配对失败：服务端不接受主机名 localhost 的请求/);
+  assert.match(t, /http:\/\/127\.0\.0\.1:9001 或 http:\/\/localhost:9001/);
+  assert.match(t, /请管理员把 localhost 加进服务端的 PC_ALLOWED_HOSTS/);
+  assert.equal(pairFailureText(httpError(400, { code: "VALIDATION", message: "配对码无效或已过期" }), "http://127.0.0.1:8790"), "配对失败：配对码无效或已过期");
+});
+
+test("没说上话：给人看的原因是中文，不带浏览器的英文报错", async () => {
+  const r = await client(scripted(new TypeError("Failed to fetch")).fetch, { retryDelaysMs: [] }).heartbeat(null);
+  assert.equal(r.error.kind, "network");
+  assert.doesNotMatch(r.error.message, /[A-Za-z]{4,}/);
+  assert.match(r.error.message, /^无法连接服务端/);
 });

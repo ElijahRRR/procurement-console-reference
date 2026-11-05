@@ -4,6 +4,7 @@
  *
  * 用法：node tests/visual/screenshots.ts [输出目录]
  *   输出目录默认 ./screenshots；环境变量 SHOTS_ONLY=overview,orders 只截部分页面。
+ *   名字以 phone- 开头的场景用 390 × 844 视口，页面出现横向滚动即判失败。
  * Playwright 不在本项目依赖里：用全局安装的 playwright（require('playwright')）。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -49,9 +50,12 @@ function startPreview(): ChildProcess {
   return child
 }
 
-async function newPage(browser: Browser, theme: 'light' | 'dark', opts: MockOptions = {}) {
+const DESKTOP = { width: 1440, height: 900 }
+const PHONE = { width: 390, height: 844 }
+
+async function newPage(browser: Browser, theme: 'light' | 'dark', opts: MockOptions = {}, viewport = DESKTOP) {
   const context = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
+    viewport,
     deviceScaleFactor: 1,
     colorScheme: theme,
     locale: 'zh-CN',
@@ -90,17 +94,39 @@ async function newPage(browser: Browser, theme: 'light' | 'dark', opts: MockOpti
   return { context, page, problems }
 }
 
+/** 输入：页面 → 输出：无；页面比视口宽（出现横向滚动）时抛错，并列出超出视口的元素 */
+async function assertNoHorizontalScroll(page: Page) {
+  const res = await page.evaluate(() => {
+    const vw = document.documentElement.clientWidth
+    const sw = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth)
+    const wide: string[] = []
+    if (sw > vw) {
+      for (const el of Array.from(document.querySelectorAll('body *'))) {
+        const r = el.getBoundingClientRect()
+        if (r.right > vw + 1 && r.width > 0) {
+          // 只报最外层的：父元素没有超出
+          const parent = el.parentElement?.getBoundingClientRect()
+          if (!parent || parent.right <= vw + 1) wide.push(`${el.tagName.toLowerCase()}.${(el.getAttribute('class') ?? '').split(' ').slice(0, 3).join('.')} → ${Math.round(r.right)}px`)
+        }
+        if (wide.length >= 8) break
+      }
+    }
+    return { vw, sw, wide }
+  })
+  if (res.sw > res.vw) throw new Error(`页面宽 ${res.sw}px，超出视口 ${res.vw}px：${res.wide.join('；')}`)
+}
+
 async function settle(page: Page) {
   await page.waitForLoadState('networkidle')
   await page.waitForTimeout(450)
 }
 
-async function shot(page: Page, name: string, fullPage = true) {
+async function shot(page: Page, name: string, fullPage = true, viewport = DESKTOP) {
   const file = resolve(outDir, `${name}.png`)
   if (fullPage) {
     // 固定定位的侧边栏与背景只覆盖视口：把视口拉到内容高度再截，整页图才和真实浏览一致
     const height = await page.evaluate(() => document.documentElement.scrollHeight)
-    await page.setViewportSize({ width: 1440, height: Math.max(900, Math.min(height, 4000)) })
+    await page.setViewportSize({ width: viewport.width, height: Math.max(viewport.height, Math.min(height, 4000)) })
     await page.waitForTimeout(250)
   }
   await page.screenshot({ path: file })
@@ -172,6 +198,31 @@ const scenes: Scene[] = [
     },
   },
   {
+    name: 'order-drawer-unknown',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/exceptions?view=result_unknown`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('.el-drawer .pc-section')
+      await page.getByRole('button', { name: '核实结果' }).click()
+      await page.waitForSelector('text=已按插件上报的回执预填')
+    },
+  },
+  {
+    name: 'order-drawer-conflict-external',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=conflict`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row', { hasText: '格式不对' }).first().click()
+      await page.waitForSelector('text=只能保留当前')
+      await page.getByRole('heading', { name: '来源冲突' }).scrollIntoViewIfNeeded()
+    },
+  },
+  {
     name: 'records',
     themes: ['light'],
     run: async (page) => {
@@ -206,6 +257,19 @@ const scenes: Scene[] = [
       await page.waitForTimeout(300)
       await page.getByRole('button', { name: '下一步' }).click()
       await page.waitForSelector('.el-dialog .el-table__row')
+    },
+  },
+  {
+    name: 'sources-feishu-restore-failed',
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/sources?tab=feishu`)
+      await page.getByRole('button', { name: '写回验收' }).first().click()
+      await page.locator('.el-message-box input').fill('recDEMOrestorefail')
+      await page.getByRole('button', { name: '开始验收' }).click()
+      await page.waitForSelector('text=里还留着测试值')
+      // 通知不自动关闭；截卡片上的提示
+      await page.locator('.el-notification__closeBtn').first().click().catch(() => {})
     },
   },
   {
@@ -294,6 +358,54 @@ const scenes: Scene[] = [
       await page.waitForSelector('text=首次设置')
     },
   },
+  // ── 手机宽度（390px）：不出现横向滚动 ──
+  ...(
+    [
+      ['phone-overview', '/', '.stat-card'],
+      ['phone-orders', '/orders?view=today', '.el-table__row'],
+      ['phone-exceptions', '/exceptions?view=needs_attention', '.el-table__row'],
+      ['phone-records', '/records?view=purchased', '.el-table__row'],
+      ['phone-sources-feishu', '/sources?tab=feishu', '.el-card'],
+      ['phone-sources-file', '/sources?tab=file', '.el-upload-dragger'],
+      ['phone-accounts', '/accounts?tab=accounts', '#pane-accounts .el-table__row'],
+      ['phone-devices', '/accounts?tab=devices', '#pane-devices .el-table__row'],
+      ['phone-settings', '/settings', '.el-card'],
+    ] as const
+  ).map(
+    ([name, path, ready]): Scene => ({
+      name,
+      themes: ['light'],
+      run: async (page) => {
+        await page.goto(`${BASE}${path}`)
+        await page.waitForSelector(ready)
+      },
+    }),
+  ),
+  {
+    name: 'phone-order-drawer',
+    themes: ['light'],
+    fullPage: false,
+    run: async (page) => {
+      await page.goto(`${BASE}/exceptions?view=result_unknown`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('.el-drawer .pc-section')
+      await page.getByRole('button', { name: '核实结果' }).click()
+      await page.waitForSelector('text=已按插件上报的回执预填')
+    },
+  },
+  {
+    name: 'phone-order-drawer-conflict',
+    themes: ['light'],
+    fullPage: false,
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=conflict`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('.el-drawer .pc-section')
+      await page.getByRole('heading', { name: '来源冲突' }).scrollIntoViewIfNeeded()
+    },
+  },
   {
     name: 'collapsed-sidebar',
     themes: ['dark'],
@@ -317,11 +429,14 @@ async function main() {
     for (const scene of scenes) {
       if (only.length && !only.includes(scene.name)) continue
       for (const theme of scene.themes ?? (['light', 'dark'] as const)) {
-        const { context, page, problems } = await newPage(browser, theme, scene.opts)
+        const phone = scene.name.startsWith('phone-')
+        const viewport = phone ? PHONE : DESKTOP
+        const { context, page, problems } = await newPage(browser, theme, scene.opts, viewport)
         try {
           await scene.run(page)
           await settle(page)
-          await shot(page, `${scene.name}-${theme}`, scene.fullPage ?? true)
+          if (phone) await assertNoHorizontalScroll(page)
+          await shot(page, `${scene.name}-${theme}`, scene.fullPage ?? true, viewport)
         } catch (e) {
           failures += 1
           console.error(`场景 ${scene.name}-${theme} 失败：${e instanceof Error ? e.message : String(e)}`)

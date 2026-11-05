@@ -58,13 +58,6 @@ export function formatAmountRange(min: unknown, max: unknown): string {
   return `${formatMoney(lo ?? 0)}–${formatMoney(hi)}`
 }
 
-/** 输入：小数比例或百分数 → 输出："72%"；空值 "—" */
-export function formatPercent(v: unknown, digits = 0): string {
-  const n = typeof v === 'number' && Number.isFinite(v) ? v : null
-  if (n === null) return EMPTY
-  return `${n.toFixed(digits)}%`
-}
-
 function partsInTz(d: Date, tz: string): Record<string, string> {
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,

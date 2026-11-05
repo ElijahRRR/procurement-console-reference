@@ -79,11 +79,26 @@ describe('写回验收（{ok, mismatches, written, restored, restore_error, erro
     expect(s.title).toBe('写回验收失败：飞书接口报错')
     expect(s.warnings).toEqual(['写回验收失败：飞书返回 1254045'])
   })
-  it('通过了但测试记录没能恢复原值，也要提醒', () => {
-    const s = verifySummary({ ...ok, restored: false, restore_error: '飞书限流' })
+  it('通过了但测试记录没能恢复原值：标题写明，提醒放在最前面并单独给出', () => {
+    const s = verifySummary({ ...ok, restored: false, restore_error: '恢复测试记录原值失败：飞书限流（飞书错误码 99991400）。' }, 'recDEMO0001')
     expect(s.ok).toBe(true)
-    expect(s.warnings).toEqual(['测试记录的原值没能恢复：飞书限流，请到飞书里手动改回'])
+    expect(s.title).toBe('写回验收通过，但测试记录的原值没能恢复')
+    expect(s.restoreProblem).toBe('测试记录 recDEMO0001 里还留着测试值，请到飞书里手动改回原值。恢复测试记录原值失败：飞书限流（飞书错误码 99991400）')
+    expect(s.warnings).toEqual([s.restoreProblem])
     expect(verifySummary({ ...ok, restored: false }).warnings).toEqual(['测试记录的原值没有恢复，请到飞书里核对这条记录'])
+    expect(verifySummary(ok).restoreProblem).toBe('')
+  })
+  it('没通过且没能恢复原值：恢复的问题排在不一致的列前面', () => {
+    const s = verifySummary({
+      ...ok,
+      ok: false,
+      restored: false,
+      restore_error: '飞书返回 1254291',
+      mismatches: [{ result_field: 'total', column: '总额', expected: 0, actual: null }],
+    })
+    expect(s.title).toBe('写回验收失败：读回的值与写入的不一致')
+    expect(s.warnings[0]).toBe('测试记录里还留着测试值，请到飞书里手动改回原值。飞书返回 1254291')
+    expect(s.warnings[1]).toBe('「总额」写入 0，读回 —')
   })
 })
 

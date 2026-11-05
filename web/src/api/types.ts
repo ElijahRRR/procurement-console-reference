@@ -99,7 +99,7 @@ export type SyncTrigger = (typeof SYNC_TRIGGERS)[number]
 export const RUN_TRIGGERS = ['manual', 'scheduled'] as const
 export type RunTrigger = (typeof RUN_TRIGGERS)[number]
 
-export const RUN_END_REASONS = ['finished', 'lease_expired', 'account_paused', 'device_revoked'] as const
+export const RUN_END_REASONS = ['finished', 'lease_expired', 'device_revoked', 'simulation_reset'] as const
 export type RunEndReason = (typeof RUN_END_REASONS)[number]
 
 export const ALLOCATION_TRIGGERS = ['intake', 'import', 'manual', 'account_change', 'daily'] as const
@@ -165,6 +165,7 @@ export const PLUGIN_ERROR_CODES = [
   'ABORTED_BY_USER',
   'SUBMIT_REJECTED',
   'PLUGIN_SIMULATION_ONLY',
+  'ABORTED_BY_SERVER',
 ] as const
 export type PluginErrorCode = (typeof PLUGIN_ERROR_CODES)[number]
 
@@ -185,8 +186,37 @@ export const API_ERROR_CODES = [
   'FEISHU_NOT_CONFIGURED',
   'FEISHU_ERROR',
   'INVALID_TRANSITION',
+  'SOURCE_CHANGED',
+  'GUARD_BLOCKED',
+  'RATE_LIMITED',
+  'METHOD_NOT_ALLOWED',
+  'INTERNAL',
 ] as const
 export type ApiErrorCode = (typeof API_ERROR_CODES)[number]
+
+/**
+ * 插件进度上报被叫停的原因（POST /plugin/v1/attempts/{id}/progress 的 cancel_code，services/execution.CANCEL_CODES）。
+ * attempt.progress 事件的 detail 里也记着它。
+ */
+export const PROGRESS_CANCEL_CODES = [
+  'UPSTREAM_CANCELLED',
+  'ACCOUNT_ARCHIVED',
+  'ACCOUNT_PAUSED',
+  'IDENTITY_MISMATCH',
+  'IDENTITY_STALE',
+  'SOURCE_HOLD',
+  'SOURCE_CHANGED',
+  'ATTEMPT_FINISHED',
+] as const
+export type ProgressCancelCode = (typeof PROGRESS_CANCEL_CODES)[number]
+
+/** 任务上冲突的种类（purchase_orders.conflict.kind，services/orders._CONFLICT_RANK） */
+export const CONFLICT_KINDS = ['fields', 'review', 'external_order_no', 'source_key_changed', 'admission'] as const
+export type ConflictKind = (typeof CONFLICT_KINDS)[number]
+
+/** 账号暂停的起因（账号输出的 pause_cause，services/accounts.PAUSE_CAUSES；未暂停为 null） */
+export const PAUSE_CAUSES = ['result_unknown', 'account_error', 'manual'] as const
+export type PauseCause = (typeof PAUSE_CAUSES)[number]
 
 // ── 通用 ──────────────────────────────────────────────────────────────────────
 
@@ -312,10 +342,23 @@ export interface OrderOverride {
   at: Timestamp | null
 }
 
+/**
+ * 任务上的冲突（契约 §2）。kind 决定 resolve-conflict 的 accept 做什么：fields / review → 写入来源新值；
+ * external_order_no → 登记为已采购（单号格式不对或仍属别的任务时服务端 422，只能保留）；admission → 取消任务；
+ * source_key_changed → 取消原任务并解除那条来源关联。
+ */
 export interface OrderConflict {
+  /** 旧数据可能没有（按 fields 处理） */
+  kind?: ConflictKind | string | null
   source_kind: SourceKind | string
+  /** 中文原因 */
+  reason?: string | null
   /** {字段: [当前值, 来源新值]} */
   fields: Record<string, [unknown, unknown]>
+  /** 接受时写入的来源新值 {字段: 值} */
+  incoming?: Record<string, unknown> | null
+  /** 送来冲突的来源 {kind, connection_id, record_id} 或 {kind, batch_id, row_no} */
+  source?: Record<string, unknown> | null
   at: Timestamp | null
 }
 
@@ -473,6 +516,8 @@ export interface AllocationSummary {
 export interface Overview {
   bj_date: DateStr
   counts: Partial<Record<OrderStatus, number>>
+  /** 置了「需要留意」提醒的任务数（不论状态） */
+  needs_attention?: number
   today_executable: number
   future_assigned: number
   accounts: { total: number; enabled: number; paused: number }
@@ -523,6 +568,10 @@ export interface Account {
   execution_paused: boolean
   pause_reason: string | null
   paused_at: Timestamp | null
+  /** 当前暂停的起因；未暂停为 null */
+  pause_cause?: PauseCause | null
+  /** 这个账号当前处在「结果待核实」的任务数 */
+  open_result_unknown?: number
   purchase_mode: PurchaseMode
   schedule_times: string[]
   default_device_id: number | null
@@ -874,6 +923,10 @@ export interface ImportBatch {
   mapping?: Record<string, string | null> | null
   /** 原文件字节数（已放弃的批次为 0） */
   size?: number | null
+  /** GET /imports/{id}：原文件的全部工作表（读不到原文件时为空列表） */
+  sheets?: ImportSheet[]
+  /** GET /imports/{id}：批次所选工作表的表头（按原文件顺序；读不到原文件时为空列表） */
+  headers?: string[]
   created_at: Timestamp
   committed_at: Timestamp | null
   uploaded_by_name: string | null

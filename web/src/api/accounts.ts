@@ -6,7 +6,7 @@ import type { Account, AccountInput, Page, PageQuery } from './types'
 export const listAccounts = async (query: PageQuery = { page: 1, page_size: 200 }): Promise<Page<Account>> =>
   asPage(await get<Page<Account>>('/accounts', { ...query }))
 
-/** 输入：账号 id → 输出：账号 */
+/** 输入：账号 id → 输出：账号（含 pause_cause、open_result_unknown；恢复执行前重新读一次） */
 export const getAccount = (id: number) => get<Account>(`/accounts/${id}`)
 
 /** 输入：账号配置 → 输出：新账号 */

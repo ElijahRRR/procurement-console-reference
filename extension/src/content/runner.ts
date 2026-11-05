@@ -11,17 +11,26 @@
  *
  * 开始之前先请后台让**每个**亚马逊标签页重读身份、对账、上报（pc.prepareStart）：
  * 只重读本页不够 —— 本页可能是几小时前打开的，别的标签页里已经登录了另一个买家号。
+ * 执行中引擎还会在提交登记之前、以及每隔几分钟请后台再来一遍（pc.refreshIdentity，不发心跳）：
+ * 服务端在领取、进度与提交登记时都要求身份 10 分钟内上报过。
  */
 
 import { codeLabel } from "../core/codes.js";
 import { RunEngine, type EngineView, type RunSummary } from "../core/engine.js";
 import { SingleFlight } from "../core/gates.js";
-import type { LeaseReply, Msg, PrepareReply, ScheduledReply } from "../core/messages.js";
+import type { LeaseReply, Msg, PrepareReply, RefreshIdentityReply, ScheduledReply } from "../core/messages.js";
 import type { Trigger } from "../core/types.js";
 import { fetchState, swLog, toSw } from "../ui/bridge.js";
 import { RemoteApi } from "./remote-api.js";
 
 const LEASE_RENEW_MS = 60_000;
+/** 执行中请后台重读、上报身份的答复上界（每个标签页 5 秒，并行）。 */
+const REFRESH_IDENTITY_MS = 20_000;
+
+/** 输入：无 → 输出：后台的答复。后台没有响应时抛错（引擎记一行，照常走；服务端按身份新鲜度裁决）。 */
+function refreshIdentity(): Promise<RefreshIdentityReply> {
+  return toSw<RefreshIdentityReply>({ type: "pc.refreshIdentity" }, REFRESH_IDENTITY_MS);
+}
 
 export class RunHost {
   private readonly flight = new SingleFlight();
@@ -74,7 +83,10 @@ export class RunHost {
             if (!res.ran) reply({ result: "busy", message: codeLabel("ALREADY_RUNNING") });
             else reply({ result: "rejected", message: res.value?.message ?? "执行已结束" });
           },
-          (e: unknown) => reply({ result: "rejected", message: `开始执行失败：${e instanceof Error ? e.message : String(e)}` }),
+          (e: unknown) => {
+            console.error("采购助手执行出错", e); // 原始的英文报错只进控制台，不进界面
+            reply({ result: "rejected", message: "开始执行失败：页面内部错误，请刷新页面后再试" });
+          },
         );
     });
   }
@@ -119,6 +131,7 @@ export class RunHost {
       log: (level, text) => swLog(level, text),
       onView: (v) => this.sendView(v, v.phase !== "ended"),
       ownDeviceId: state.device.device_id,
+      refreshIdentity,
     });
     this.engine = engine;
     this.emit();

@@ -3,13 +3,18 @@
  * 落地方案 v1 §4：「插件与服务端均保存必要的结果回执，服务恢复后补交」。插件这一侧：
  *   · 后台在把一笔结果发给服务端**之前**先存一份回执（chrome.storage.local，后台重启、浏览器重启都在）；
  *   · 送达（200，含服务端认出是重复上报的 duplicate）或服务端明确不收（4xx）之后删掉；
- *   · 没说上话（断网、超时、后台被回收）或服务端 5xx：留着，后台按退避节奏补交，最多保留 24 小时。
+ *     尝试已是「结果待核实」时送到的不同结果，服务端记成迟到回执（409，detail.late_receipt_recorded）—— 也算送达；
+ *   · 没说上话（断网、超时、后台被回收）或服务端 5xx：留着补交，最多保留 24 小时。补交的时机：
+ *     后台启动时、每一次心跳成功时（服务端连得上：不等退避，立即补交）、以及回执闹钟（30 秒一次，按退避节奏）。
+ *     发起上报的那一路（引擎）还在自己重发的回执（还没被后台补交过、补交时间未到）不抢着发。
+ * 提交登记（/submitting）永远不进回执、永远不补发：登记即「可能已下单」。
  * 补交发的是**同一份**请求体：单号、错误码都不变，服务端按「重复上报」认出来，不会登记两次。
  * 服务端已经把这一笔判成「结果待核实」后才送到的回执，服务端照样记下（409，detail.late_receipt_recorded），
  * 这也算送达：交给人工核实时参考。
  */
 
 import type { ApiError, ApiResult } from "./client.js";
+import { codeLabel } from "./codes.js";
 import type { ResultIn } from "./types.js";
 
 export interface Receipt {
@@ -98,10 +103,14 @@ export function settleReceipt(
   return cur;
 }
 
-/** 输入：回执仓库、当前时刻 → 输出：到了补交时间的回执（先存的在前）。过期的不在里面。 */
-export function dueReceipts(store: ReceiptStore | null | undefined, now: number): Receipt[] {
+/** 输入：回执仓库、当前时刻、是否不看退避 → 输出：该补交的回执（先存的在前）。过期的不在里面。
+ *
+ *  ignoreBackoff（后台启动、心跳成功 = 服务端连得上）：后台补交过的回执不等退避，立即再发；
+ *  还没被后台补交过的（tries = 0）仍等宽限期过去 —— 那段时间发起上报的那一路自己在送。 */
+export function dueReceipts(store: ReceiptStore | null | undefined, now: number, opts: { ignoreBackoff?: boolean } = {}): Receipt[] {
   return Object.values(store ?? {})
-    .filter((r) => r.next_at <= now && now - r.created_at <= RECEIPT_MAX_AGE_MS)
+    .filter((r) => (opts.ignoreBackoff && r.tries > 0) || r.next_at <= now)
+    .filter((r) => now - r.created_at <= RECEIPT_MAX_AGE_MS)
     .sort((a, b) => a.created_at - b.created_at);
 }
 
@@ -151,7 +160,7 @@ const OUTCOME_TEXT: Record<ResultIn["outcome"], string> = { succeeded: "成功",
 
 /** 输入：界面上的一条回执 → 输出：一行中文说明。 */
 export function receiptText(r: ReceiptView): string {
-  const what = r.outcome === "succeeded" && r.amazon_order_no ? `成功 ${r.amazon_order_no}` : OUTCOME_TEXT[r.outcome] + (r.error_code ? `（${r.error_code}）` : "");
+  const what = r.outcome === "succeeded" && r.amazon_order_no ? `成功 ${r.amazon_order_no}` : OUTCOME_TEXT[r.outcome] + (r.error_code ? `（${codeLabel(r.error_code)}）` : "");
   const tail = r.last_error ? `，最近一次：${r.last_error}` : "";
   return `尝试 #${r.attempt_id}：${what}${r.tries ? `，已补交 ${r.tries} 次` : ""}${tail}`;
 }

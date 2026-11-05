@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS procure.purchase_orders (
     status_reason            text,
     status_changed_at        timestamptz NOT NULL DEFAULT now(),
     missing_fields           text[] NOT NULL DEFAULT '{}',
-    conflict                 jsonb,                           -- {source_kind, fields: {字段: [当前, 来源]}, at}
+    conflict                 jsonb,                           -- {kind, source_kind, reason, fields, incoming, source, at}（契约 §2）
     needs_attention          boolean NOT NULL DEFAULT false,
     attention_note           text,
     primary_source_kind      text NOT NULL CHECK (primary_source_kind IN ('feishu', 'file')),
@@ -301,7 +301,7 @@ CREATE TABLE IF NOT EXISTS procure.execution_runs (
     heartbeat_at      timestamptz NOT NULL DEFAULT now(),
     lease_expires_at  timestamptz NOT NULL,
     ended_at          timestamptz,
-    end_reason        text,                                   -- finished / lease_expired / account_paused / device_revoked
+    end_reason        text,                                   -- finished / lease_expired / device_revoked / simulation_reset
     stats             jsonb NOT NULL DEFAULT '{}'
 );
 

@@ -187,3 +187,13 @@ def test_scheduler_intake_interval_comes_from_settings(monkeypatch):
     monkeypatch.setattr(settings, "_loaded", dataclasses.replace(settings.get(), intake_check_s=45))
     s = scheduler.Scheduler()
     assert s._feishu[0].name == "feishu_intake" and s._feishu[0].interval_s == 45
+
+
+def test_run_sweep_passes_its_now_to_the_sweep(monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(execution, "sweep", lambda conn, now=None: seen.append(now) or {
+        "expired_runs": [], "revoked_runs": [], "orphan_attempts": [], "aborted": 0, "unknown": 0})
+    at = NOW + timedelta(minutes=5)
+    scheduler.run_sweep(at)
+    scheduler.run_jobs_once(at)
+    assert seen == [at, at]

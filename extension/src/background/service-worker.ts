@@ -16,7 +16,7 @@
  *     多个标签页的读数按页面加载先后对账（core/identity.reconcileIdentity）。
  */
 
-import { PluginClient, type ApiError, type ApiResult } from "../core/client.js";
+import { PluginClient, pairFailureText, type ApiError, type ApiResult } from "../core/client.js";
 import { codeLabel, stopReasonLabel } from "../core/codes.js";
 import { custodyStep, helloEndsRun, pingSaysAlive } from "../core/custody.js";
 import { leaseMinutes } from "../core/engine.js";
@@ -51,6 +51,7 @@ import {
   type LeaseReply,
   type Msg,
   type PrepareReply,
+  type RefreshIdentityReply,
   type RunViewRecord,
   type ScheduledReply,
   type StateSnapshot,
@@ -317,8 +318,8 @@ async function heartbeat(reason: string): Promise<boolean> {
     if (prevConn?.ok !== false || prevConn.code !== r.error.code) await log("err", `心跳失败：${r.error.message}`);
     return false;
   });
-  // 服务端连上了：顺带补交还没送到的回执（不占心跳闸）。
-  if (ok && Object.keys((await lget<ReceiptStore>(KEYS.receipts)) ?? {}).length) void drainReceipts();
+  // 服务端连上了：顺带补交还没送到的回执（不等退避；不占心跳闸）。
+  if (ok && Object.keys((await lget<ReceiptStore>(KEYS.receipts)) ?? {}).length) void drainReceipts({ ignoreBackoff: true });
   return ok;
 }
 
@@ -406,23 +407,28 @@ async function reconcileAndStore(): Promise<ReconciledIdentity | null> {
 }
 
 /** 输入：对账结论、是否强制 → 输出：无。单独上报身份（同一份 60 秒内不重复，强制时照发）。 */
-async function reportIdentity(snap: ReconciledIdentity, force: boolean): Promise<void> {
+async function reportIdentity(snap: ReconciledIdentity, force: boolean): Promise<boolean> {
   const client = await makeClient();
-  if (!client) return;
+  if (!client) return false;
+  // 一份几分钟前读的结论（这一轮哪个标签页都没读到）不当成「刚读到」再报：服务端看到的「最近上报」得是真的。
+  // 有分歧的结论例外 —— 它只会让服务端拒绝，不会放行。
+  if (!snap.conflict && !isFresh(snap, Date.now())) return false;
   const sig = JSON.stringify([snap.signed_in, snap.customer_id]);
   const sent = await sget<{ sig: string; at: number }>(KEYS.identitySent);
-  if (!force && sent && sent.sig === sig && Date.now() - sent.at < IDENTITY_DEDUPE_MS) return;
+  if (!force && sent && sent.sig === sig && Date.now() - sent.at < IDENTITY_DEDUPE_MS) return true;
   const r = await client.identity(toIdentity(snap));
   if (r.ok) {
     await sset(KEYS.identitySent, { sig, at: Date.now() });
     if (r.data.identity_status) await setIdentityStatus(r.data.identity_status);
-  } else if (r.error.kind === "http" && (r.error.status === 404 || r.error.status === 405 || r.error.status === 422)) {
+    return true;
+  }
+  if (r.error.kind === "http" && (r.error.status === 404 || r.error.status === 405 || r.error.status === 422)) {
     // 服务端没有单独的身份接口：改由心跳捎带（契约 §5.2 的 identity?）。
     await sset(KEYS.identitySent, { sig, at: Date.now() });
-    await heartbeat("身份上报");
-  } else {
-    await log("warn", `身份上报失败：${r.error.message}`);
+    return heartbeat("身份上报");
   }
+  await log("warn", `身份上报失败：${r.error.message}`);
+  return false;
 }
 
 /** 输入：内容脚本读到的身份、是否强制上报、发送的标签页 → 输出：服务端给的身份状态（拿不到为 null）与有没有分歧。 */
@@ -463,9 +469,9 @@ async function setIdentityStatus(st: IdentityStatus): Promise<void> {
   await log(st === "match" ? "ok" : "warn", `身份状态：${t.short}（${t.long}）`);
 }
 
-/** 开始执行前（以及刚配对完）：请每个亚马逊标签页重读身份（不在亚马逊页面上的、没答复的不算），
- *  对账、强制上报、同步心跳。 */
-async function onPrepareStart(reason = "开始执行前"): Promise<PrepareReply> {
+/** 请每个亚马逊标签页重读身份（不在亚马逊页面上的、没答复的不算），对账、强制上报。
+ *  返回对账结论（一份读数都没有为 null）与这一次有没有报上去。 */
+async function readAllTabsAndReport(): Promise<{ snap: ReconciledIdentity | null; reported: boolean }> {
   const tabs = await amazonTabs();
   const readings = await Promise.all(
     tabs.map(async (t) => {
@@ -486,7 +492,13 @@ async function onPrepareStart(reason = "开始执行前"): Promise<PrepareReply>
     }
     return reconcileAndStore();
   });
-  if (snap) await reportIdentity(snap, true);
+  const reported = snap ? await reportIdentity(snap, true) : false;
+  return { snap, reported };
+}
+
+/** 开始执行前（以及刚配对完）：每个亚马逊标签页重读身份、对账、强制上报，再同步心跳。 */
+async function onPrepareStart(reason = "开始执行前"): Promise<PrepareReply> {
+  const { snap } = await readAllTabsAndReport();
   await heartbeat(reason);
   const cfg = await lget<ConfigCache>(KEYS.config);
   const conflict = snap?.conflict ?? false;
@@ -497,6 +509,14 @@ async function onPrepareStart(reason = "开始执行前"): Promise<PrepareReply>
       ? "开始执行失败：本浏览器的亚马逊标签页显示的登录账号不一致（较早打开的页面还停在之前的登录状态），请刷新或关闭较早打开的亚马逊标签页后再试"
       : null,
   };
+}
+
+/** 执行中（提交登记之前、以及每隔几分钟）：每个亚马逊标签页重读身份、对账、强制上报（不发心跳，快）。
+ *  服务端在领取、进度、提交登记时都要求身份 10 分钟内上报过。 */
+async function onRefreshIdentity(): Promise<RefreshIdentityReply> {
+  const { snap, reported } = await readAllTabsAndReport();
+  const cfg = await lget<ConfigCache>(KEYS.config);
+  return { reported, conflict: snap?.conflict ?? false, identity_status: cfg?.heartbeat.identity_status ?? null };
 }
 
 // ── 配对 ─────────────────────────────────────────────────────────────────
@@ -515,8 +535,9 @@ async function onPair(m: Extract<Msg, { type: "pc.pair" }>): Promise<{ ok: boole
   const client = new PluginClient({ baseUrl: url, extVersion: EXT_VERSION });
   const r = await client.pair(code, name, browser);
   if (!r.ok) {
-    await log("err", `配对失败：${r.error.message}`);
-    return { ok: false, message: `配对失败：${r.error.message}` };
+    const message = pairFailureText(r.error, url);
+    await log("err", message);
+    return { ok: false, message };
   }
   if (!(await writeToken(r.data.device_token))) {
     await log("err", "配对失败：插件的密钥库写不进去（浏览器存储不可用）");
@@ -675,7 +696,7 @@ async function orphanRun(ar: ActiveRun, reason: string, text: string): Promise<v
 async function settleOrphan(): Promise<void> {
   const ar = await sget<ActiveRun>(KEYS.activeRun);
   if (!ar || ar.orphaned_at === null) return;
-  await drainReceipts(ar.run_id);
+  await drainReceipts({ runId: ar.run_id });
   const pending = pendingForRun(await lget<ReceiptStore>(KEYS.receipts), ar.run_id);
   const client = await makeClient();
   if (!client) {
@@ -768,8 +789,10 @@ async function settleReply(attemptId: number, r: ApiResult<unknown>, byDrain: bo
   return verdict;
 }
 
-/** 输入：只补交某个批次的回执（不看补交时间）或全部到时间的 → 输出：无。断网时停在第一条，下一轮再试。 */
-async function drainReceipts(runId?: number): Promise<void> {
+/** 输入：只补交某个批次的回执（不看补交时间），或全部该补交的（ignoreBackoff：后台启动、心跳成功时不等退避）
+ *  → 输出：无。断网时停在第一条，下一轮再试。 */
+async function drainReceipts(opts: { runId?: number; ignoreBackoff?: boolean } = {}): Promise<void> {
+  const runId = opts.runId;
   await drainGate.run(async () => {
     const client = await makeClient();
     if (!client) return;
@@ -781,7 +804,7 @@ async function drainReceipts(runId?: number): Promise<void> {
     });
     for (const rc of expired) await log("warn", `尝试 #${rc.attempt_id} 的结果回执超过 24 小时仍没送到，不再补交（请在控制台核实）`);
     const store = (await lget<ReceiptStore>(KEYS.receipts)) ?? {};
-    const due = runId === undefined ? dueReceipts(store, now) : Object.values(store).filter((r) => r.run_id === runId);
+    const due = runId === undefined ? dueReceipts(store, now, { ignoreBackoff: opts.ignoreBackoff }) : Object.values(store).filter((r) => r.run_id === runId);
     for (const rc of due) {
       const r = await client.result(rc.attempt_id, rc.body);
       const v = await settleReply(rc.attempt_id, r, true);
@@ -1011,6 +1034,8 @@ async function handle(msg: Msg, sender: chrome.runtime.MessageSender): Promise<u
       return snapshot();
     case "pc.prepareStart":
       return onPrepareStart();
+    case "pc.refreshIdentity":
+      return onRefreshIdentity();
     case "pc.pair":
       return onPair(msg);
     case "pc.unpair":
@@ -1048,7 +1073,10 @@ async function handle(msg: Msg, sender: chrome.runtime.MessageSender): Promise<u
 }
 
 chrome.runtime.onMessage.addListener((msg: Msg, sender, respond) => {
-  handle(msg, sender).then(respond, (e: unknown) => respond({ ok: false, message: e instanceof Error ? e.message : String(e) }));
+  handle(msg, sender).then(respond, (e: unknown) => {
+    console.error("采购助手后台处理消息出错", e); // 原始的英文报错只进控制台，不进界面
+    respond({ ok: false, message: "插件后台处理失败，请重新加载插件后再试" });
+  });
   return true; // 异步答复：通道保持打开
 });
 
@@ -1096,5 +1124,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   })();
 });
 
-// 每次后台被唤醒都确认一次闹钟还在（浏览器重启可能清掉闹钟）。
+// 每次后台被唤醒都确认一次闹钟还在（浏览器重启可能清掉闹钟），并补交还没送到的结果回执（不等退避）。
 void ensureAlarms();
+void (async () => {
+  if (Object.keys((await lget<ReceiptStore>(KEYS.receipts)) ?? {}).length) await drainReceipts({ ignoreBackoff: true });
+})().catch(() => undefined);

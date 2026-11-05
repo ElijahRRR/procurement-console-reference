@@ -62,7 +62,7 @@ _MAX_NUMBER = 10 ** 12           # 金额 / 数量的绝对值上限（库里金
 
 
 def _usd(v: Decimal | None) -> str:
-    return "—" if v is None else f"${v:.2f}"
+    return "未知金额" if v is None else f"${v:.2f}"
 
 
 def _s(v: Decimal | None) -> str | None:
@@ -76,10 +76,7 @@ def _amount(v: Any, *, signed: bool = False) -> Any:
         return _ABSENT
     if isinstance(v, bool) or not isinstance(v, (str, int, float, Decimal)):
         return None
-    try:
-        d = money(v)
-    except (InvalidOperation, ValueError, OverflowError):     # 位数大到无法取两位小数
-        d = None
+    d = money(v)            # 从不抛异常：读不出、指数写法、超出 numeric(12,2) → None
     if d is None or (d < 0 and not signed):
         return None
     return d

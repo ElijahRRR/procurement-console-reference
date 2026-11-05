@@ -54,3 +54,59 @@ def test_feishu_grant_grant_list_transfer_and_revoke(conn, workspace):
         feishu_grant.run(app_token="bascnDEMOGRANT01", conn=conn)            # 缺工作区
     with pytest.raises(DomainError):
         feishu_grant.run(workspace_id=ws_a, link="https://example-demo.feishu.cn/wiki/wikcnDEMO0001", conn=conn)
+
+
+# ── db_init：库不存在时先建库 ─────────────────────────────────────────────────
+
+
+def _drop(name: str) -> None:
+    import psycopg
+    from psycopg import sql
+
+    from tests.conftest import ADMIN_DSN
+
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
+def test_db_init_creates_missing_database_then_is_idempotent(capsys):
+    import secrets
+
+    from psycopg.conninfo import make_conninfo
+
+    from tests.conftest import ADMIN_DSN
+    from workflows import db_init
+
+    name = f"procure_init-Demo_{secrets.token_hex(3)}"          # 带连字符与大写：须按标识符加引号
+    dsn = make_conninfo(ADMIN_DSN, dbname=name)
+    try:
+        out = db_init.run(dsn=dsn)
+        assert out["ok"] is True and out["database"] == name and out["database_created"] is True
+        assert f"数据库 {name} 不存在，已创建" in capsys.readouterr().err
+        with db.pg_conn(dsn) as conn:
+            n = conn.execute("SELECT count(*) AS n FROM pg_tables WHERE schemaname = 'procure'").fetchone()["n"]
+            assert n > 10
+        assert cli.main(["db_init", "-p", f"dsn={dsn}"]) == 0
+        captured = capsys.readouterr()
+        assert '"database_created": false' in captured.out and "已创建" not in captured.err
+    finally:
+        _drop(name)
+
+
+def test_db_init_does_not_create_when_server_unreachable():
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    from tests.conftest import ADMIN_DSN
+    from workflows import db_init
+
+    dsn = make_conninfo(ADMIN_DSN, dbname="procure_init_unreachable_demo", port="1", connect_timeout="2")
+    with pytest.raises(psycopg.OperationalError):
+        db_init.run(dsn=dsn)
+
+
+def test_admin_conn_targets_maintenance_db_with_same_conninfo(clean_db):
+    assert db.dsn_dbname(clean_db) and db.dsn_dbname(clean_db) != db.MAINTENANCE_DB
+    with db.admin_conn(clean_db) as admin:
+        assert admin.execute("SELECT current_database() AS d").fetchone()["d"] == db.MAINTENANCE_DB
+        assert admin.autocommit is True

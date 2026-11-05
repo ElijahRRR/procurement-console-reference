@@ -64,7 +64,7 @@ test("回执最多保留 24 小时；界面上一行一条", () => {
   assert.deepEqual(Object.keys(store), ["8"]);
   const lines = receiptViews(settleReceipt(s, 7, "retry", "无法连接服务端", NOW, true)).map(receiptText);
   assert.equal(lines[0], "尝试 #7：成功 SIM-20261105-7，已补交 1 次，最近一次：无法连接服务端");
-  assert.equal(lines[1], "尝试 #8：失败（OUT_OF_STOCK）");
+  assert.equal(lines[1], "尝试 #8：失败（商品缺货）", "错误码换成中文，不原样显示");
 });
 
 test("后台没有响应：结果、进度、批次心跳、结束批次有界地原样再发；开始批次、领取、护栏、提交登记绝不", async () => {
@@ -101,4 +101,25 @@ test("后台一直没有响应：再发有上限；后台答复了（哪怕是�
   const r2 = await callSw(async () => { m++; return netErr; }, "result", [7, ok], { sleep: async () => {} });
   assert.equal(r2.error.code, "NETWORK", "后台说服务端连不上：交给引擎的重发与后台的回执，不在这一层叠加");
   assert.equal(m, 1);
+});
+
+test("回执的补交时机：后台启动、心跳成功时不等退避；引擎自己还在送的（没被后台补交过、宽限未到）不抢着发", () => {
+  let s = putReceipt(null, 7, 9, ok, NOW); // 引擎刚存的，宽限 30 秒
+  s = putReceipt(s, 8, 9, { ...ok, amazon_order_no: "SIM-20261105-8" }, NOW - 600_000);
+  s = settleReceipt(s, 8, "retry", "无法连接服务端", NOW - 1_000, true); // 后台补交过一次，退避到 NOW + 29 秒
+  assert.deepEqual(dueReceipts(s, NOW).map((r) => r.attempt_id), [], "闹钟按退避：都还没到时间");
+  assert.deepEqual(dueReceipts(s, NOW, { ignoreBackoff: true }).map((r) => r.attempt_id), [8], "连得上服务端：后台补交过的立即再发");
+  assert.deepEqual(dueReceipts(s, NOW + RECEIPT_GRACE_MS, { ignoreBackoff: true }).map((r) => r.attempt_id), [8, 7], "宽限过后引擎那份也补交");
+  assert.deepEqual(dueReceipts(s, NOW - 600_000 + RECEIPT_MAX_AGE_MS + 1, { ignoreBackoff: true }).map((r) => r.attempt_id), [7], "超过 24 小时的不再补交");
+});
+
+test("回执的结论覆盖真实服务端的几种答复：200 duplicate 送达；409 迟到回执送达；其他 409 与 401 不再发；5xx 与断网留着", () => {
+  assert.equal(classifyResultReply({ ok: true, status: 200, data: { attempt_status: "succeeded", duplicate: true } }), "delivered");
+  assert.equal(classifyResultReply(httpErr(409, "CONFLICT", { attempt_status: "unknown", order_status: "result_unknown", late_receipt_recorded: true })), "delivered");
+  assert.equal(classifyResultReply(httpErr(409, "CONFLICT", { attempt_status: "succeeded", reported: "failed" })), "drop");
+  assert.equal(classifyResultReply(httpErr(409, "LEASE_LOST")), "drop");
+  assert.equal(classifyResultReply(httpErr(401, "UNAUTHORIZED")), "drop");
+  assert.equal(classifyResultReply(httpErr(500, "INTERNAL")), "retry");
+  assert.equal(classifyResultReply(httpErr(503, "HTTP_503")), "retry");
+  assert.equal(classifyResultReply(netErr), "retry");
 });

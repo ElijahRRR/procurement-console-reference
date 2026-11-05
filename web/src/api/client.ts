@@ -81,6 +81,7 @@ export function fallbackMessage(status: number): string {
   if (status === 409) return '操作与当前状态冲突，请刷新后重试'
   if (status === 413) return '文件太大，请控制在 10 MB 以内'
   if (status === 422) return '提交的内容不符合要求'
+  if (status === 429) return '尝试次数过多，请稍后再试'
   if (status >= 500) return `服务器出错（HTTP ${status}），请稍后重试`
   return `请求失败（HTTP ${status}）`
 }

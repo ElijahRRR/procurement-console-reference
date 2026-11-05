@@ -175,7 +175,7 @@ async function resume(b: ImportBatch) {
     upload.value = {
       batch_id: batch.id,
       filename: batch.filename,
-      sheets: [{ name: state.sheet, row_count: batch.stats?.total ?? null, headers: state.headers }],
+      sheets: state.sheets,
       sheet: state.sheet,
       headers: state.headers,
       suggested_mapping: state.mapping,

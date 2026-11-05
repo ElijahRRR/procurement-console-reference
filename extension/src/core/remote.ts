@@ -35,8 +35,9 @@ export async function callSw<T>(
       const r = await send(op, args);
       if (r && typeof r === "object" && "ok" in r) return r as ApiResult<T>;
       return unavailable("插件后台没有给出答复");
-    } catch (e) {
-      return unavailable(`插件后台没有响应（${e instanceof Error ? e.message : String(e)}）`);
+    } catch {
+      // 浏览器给的原因是英文（Could not establish connection 等），不往界面上放
+      return unavailable("插件后台没有响应");
     }
   };
   let r = await once();

@@ -51,6 +51,7 @@ class StartRunBody(_Body):
 
 class FinishBody(_Body):
     reason: Any = "finished"
+    detail: Any = None
 
 
 class ProgressBody(_Body):
@@ -124,14 +125,23 @@ def next_attempt(run_id: int, ctx: deps.Plugin = Depends(deps.plugin)):
 
 @router.post("/runs/{run_id}/finish")
 def finish_run(run_id: int, body: FinishBody | None = None, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：批次 id、{reason} → 输出：{run_id, ended_at, end_reason, stats}。"""
+    """输入：批次 id、{reason, detail?} → 输出：{run_id, ended_at, end_reason, stats}。
+
+    detail（可选）记进 run.ended 事件的 plugin_detail：字符串去掉首尾空白后截到 200 字，其他 JSON 先转成文本再截。
+    """
     b = body or FinishBody()
-    return respond(execution.finish_run(ctx.conn, ctx.device, run_id, b.reason))
+    return respond(execution.finish_run(ctx.conn, ctx.device, run_id, b.reason, b.detail))
 
 
 @router.post("/attempts/{attempt_id}/progress")
 def progress(attempt_id: int, body: ProgressBody | None = None, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：尝试 id、{stage, detail} → 输出：{continue, cancel_reason}（上游已取消且未登记提交时 continue=false）。"""
+    """输入：尝试 id、{stage, detail} → 输出：{continue, cancel_reason, cancel_code}。
+
+    continue=true 时 cancel_code 为 null；continue=false 时 cancel_code 是 UPSTREAM_CANCELLED / ACCOUNT_ARCHIVED /
+    ACCOUNT_PAUSED / IDENTITY_MISMATCH / IDENTITY_STALE / SOURCE_HOLD / SOURCE_CHANGED（都只在未登记提交时出现）
+    或 ATTEMPT_FINISHED（尝试已结束）。插件随后上报：UPSTREAM_CANCELLED → ABORTED_UPSTREAM_CANCELLED，
+    ATTEMPT_FINISHED → 不再上报，其余 → ABORTED_BY_SERVER。
+    """
     b = body or ProgressBody()
     return respond(execution.progress(ctx.conn, ctx.device, attempt_id, stage=b.stage, detail=b.detail))
 

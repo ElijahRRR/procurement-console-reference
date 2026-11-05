@@ -177,7 +177,7 @@ def test_lease_lost_after_expiry_or_finish(conn, workspace):
     execution.sweep(conn)
     run2 = fx.start(conn, dev)
     out = execution.finish_run(conn, dev, run2, "completed")
-    assert out["end_reason"] == "completed" and out["ended_at"]
+    assert out["end_reason"] == "finished" and out["ended_at"]
     assert _err(execution.next_attempt, conn, dev, run2).code == "LEASE_LOST"
     assert _err(execution.finish_run, conn, dev, run2).code == "LEASE_LOST"
 
@@ -405,7 +405,7 @@ def test_progress_moves_to_checking_and_continues(conn, workspace):
     fx.assigned_order(conn, ws, acc)
     a = fx.claim(conn, dev, fx.start(conn, dev))
     out = execution.progress(conn, dev, a["attempt_id"], stage="started", detail={"outcome": "pass"})
-    assert out == {"continue": True, "cancel_reason": None}
+    assert out == {"continue": True, "cancel_reason": None, "cancel_code": None}
     att = fx.attempt_row(conn, a["attempt_id"])
     assert att["status"] == "checking" and att["stage"] == "started"
     assert _err(execution.progress, conn, dev, a["attempt_id"], stage=" ").code == "VALIDATION"

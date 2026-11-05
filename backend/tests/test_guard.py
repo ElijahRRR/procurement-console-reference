@@ -252,3 +252,15 @@ def test_absurd_amounts_never_crash_and_block_as_data_unreliable(total):
     for facts in (_facts(total=total), guard.sanitize_facts(_facts(total=total))):
         v = _eval(facts)
         assert v["verdict"] == "block" and v["code"] == "DATA_UNRELIABLE"
+
+
+@pytest.mark.parametrize("total", ["1e3", "1,234.5,0", "12,50", "10000000000.00"])
+def test_exponent_bad_commas_and_overflow_amounts_block_as_data_unreliable(total):
+    """指数写法、逗号不是千分位、超出 numeric(12,2)：按读不出拦截（NULL 不是 0）。"""
+    v = _eval(_facts(total=total))
+    assert v["verdict"] == "block" and v["code"] == "DATA_UNRELIABLE"
+    assert v["checks"]["price_cap"]["ok"] is None
+
+
+def test_usd_renders_none_as_unknown_amount():
+    assert guard._usd(None) == "未知金额" and guard._usd(Decimal("5")) == "$5.00"

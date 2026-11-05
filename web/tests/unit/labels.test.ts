@@ -2,7 +2,7 @@
  * 标签表覆盖每一个后端枚举值：先核对前端枚举与 schema.sql 的 CHECK 约束、services/models.py、开发契约一致，
  * 再核对每张标签表的键恰好等于对应枚举。
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import * as T from '@/api/types'
@@ -15,20 +15,28 @@ const contractPath = resolve(repo, 'docs/development/开发契约-v2.md')
 const servicesDir = resolve(repo, 'backend/services')
 const ordersPath = resolve(servicesDir, 'orders.py')
 const importsPath = resolve(servicesDir, 'imports.py')
-const haveRepo = existsSync(schemaPath) && existsSync(modelsPath) && existsSync(contractPath) && existsSync(ordersPath)
+const executionPath = resolve(servicesDir, 'execution.py')
+const accountsPath = resolve(servicesDir, 'accounts.py')
+const haveRepo = [schemaPath, modelsPath, contractPath, ordersPath, executionPath, accountsPath].every((p) => existsSync(p))
 
-/** 输入：无 → 输出：services/*.py 与 workflows/*.py 里写进事件的全部 kind（「对象.动作」形式的字面量） */
+/** 输入：目录 → 输出：其下（含子目录，跳过 __pycache__ 与 tests）的全部 .py 文件 */
+function pyFiles(dir: string): string[] {
+  if (!existsSync(dir)) return []
+  return readdirSync(dir).flatMap((f) => {
+    const p = resolve(dir, f)
+    if (f === '__pycache__' || f === 'tests') return []
+    if (statSync(p).isDirectory()) return pyFiles(p)
+    return f.endsWith('.py') ? [p] : []
+  })
+}
+
+/** 输入：无 → 输出：services、server、workflows 里写进事件的全部 kind（「对象.动作」形式的字面量） */
 function backendEventKinds(): string[] {
-  const dirs = [servicesDir, resolve(repo, 'backend/workflows')]
+  const files = ['services', 'server', 'workflows'].flatMap((d) => pyFiles(resolve(repo, 'backend', d)))
   const prefixes = ['order', 'attempt', 'account', 'device', 'run', 'connection', 'batch', 'settings', 'simulation', 'feishu', 'import_template']
   const re = new RegExp(`"((?:${prefixes.join('|')})\\.[a-z_]+)"`, 'g')
   const kinds = new Set<string>()
-  for (const dir of dirs) {
-    for (const f of readdirSync(dir)) {
-      if (!f.endsWith('.py')) continue
-      for (const m of readFileSync(resolve(dir, f), 'utf8').matchAll(re)) kinds.add(m[1])
-    }
-  }
+  for (const f of files) for (const m of readFileSync(f, 'utf8').matchAll(re)) kinds.add(m[1])
   // 同样形状但不是事件的字面量（飞书域名）
   for (const notKind of ['feishu.cn']) kinds.delete(notKind)
   return [...kinds].sort()
@@ -46,10 +54,10 @@ function checkValues(sql: string, table: string, column: string): string[] {
   return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1])
 }
 
-/** 输入：models.py 文本、元组名 → 输出：元组里的字符串 */
+/** 输入：Python 源文件文本、元组名 → 输出：元组里的字符串 */
 function pyTuple(src: string, name: string): string[] {
-  const m = new RegExp(`${name} = \\(([\\s\\S]*?)\\)\\n`).exec(src)
-  if (!m) throw new Error(`models.py 里没有 ${name}`)
+  const m = new RegExp(`^${name} = \\(([\\s\\S]*?)\\)\\n`, 'm').exec(src)
+  if (!m) throw new Error(`没有元组 ${name}`)
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
 }
 
@@ -108,8 +116,24 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
   it('统一错误码与契约 §8 一致', () => {
     const line = contract.split('\n').find((l) => l.startsWith('统一错误码'))
     expect(line).toBeTruthy()
-    const codes = [...(line ?? '').matchAll(/`([A-Z_]+)`/g)].map((m) => m[1]).filter((c) => c !== 'code')
-    expect(sorted(T.API_ERROR_CODES)).toEqual(sorted(codes))
+    const codes = [...(line ?? '').matchAll(/`([A-Z_]+)`/g)].map((m) => m[1])
+    // 顺序也一致（前端错误码表按契约的顺序排）
+    expect([...T.API_ERROR_CODES]).toEqual(codes)
+  })
+
+  it('服务端会返回的错误码都在统一错误码里（services、server、api 里的 DomainError / code= / error_response）', () => {
+    const files = ['services', 'server', 'api'].flatMap((d) => pyFiles(resolve(repo, 'backend', d)))
+    const used = new Set<string>()
+    const re = /(?:code=|DomainError\(|error_response\(|error_body\()"([A-Z_]+)"/g
+    for (const f of files) {
+      const text = readFileSync(f, 'utf8')
+      for (const m of text.matchAll(re)) used.add(m[1])
+      const http = /_HTTP_CODES = \{([^}]*)\}/.exec(text)?.[1]
+      if (http) for (const m of http.matchAll(/"([A-Z_]+)"/g)) used.add(m[1])
+    }
+    expect(used.size).toBeGreaterThan(10)
+    const missing = [...used].filter((c) => !(T.API_ERROR_CODES as readonly string[]).includes(c))
+    expect(missing).toEqual([])
   })
 
   it('任务列表视图与契约 §8 一致', () => {
@@ -119,12 +143,36 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
   })
 
   it('allowed_actions 与 services/orders.allowed_actions 能给出的动作一致', () => {
-    // 服务端代码为准（契约 §10 的列表随后同步）：只取 allowed_actions 函数体里 append 的取值
+    // 只取 allowed_actions 函数体里 append 的取值
     const src = readFileSync(ordersPath, 'utf8')
     const body = /def allowed_actions\([\s\S]*?\n    return acts\n/.exec(src)?.[0] ?? ''
     const actions = [...body.matchAll(/acts\.append\("(\w+)"\)/g)].map((m) => m[1])
     expect(actions.length).toBeGreaterThan(0)
     expect(sorted(T.ORDER_ACTIONS)).toEqual(sorted([...new Set(actions)]))
+  })
+
+  it('allowed_actions 与契约 §10 任务详情列出的动作一致', () => {
+    const line = contract.split('\n').find((l) => l.startsWith('**任务详情**') && l.includes('`allowed_actions`'))
+    expect(line).toBeTruthy()
+    const list = (line ?? '').split('`allowed_actions`（')[1]?.split('的子集')[0] ?? ''
+    const actions = [...list.matchAll(/`(\w+)`/g)].map((m) => m[1])
+    expect(actions.length).toBeGreaterThan(0)
+    expect(sorted(T.ORDER_ACTIONS)).toEqual(sorted(actions))
+  })
+
+  it('进度叫停码与 services/execution.CANCEL_CODES 一致', () => {
+    expect(sorted(T.PROGRESS_CANCEL_CODES)).toEqual(sorted(pyTuple(readFileSync(executionPath, 'utf8'), 'CANCEL_CODES')))
+  })
+
+  it('账号暂停起因与 services/accounts.PAUSE_CAUSES 一致', () => {
+    expect(sorted(T.PAUSE_CAUSES)).toEqual(sorted(pyTuple(readFileSync(accountsPath, 'utf8'), 'PAUSE_CAUSES')))
+  })
+
+  it('冲突种类与 services/orders._CONFLICT_RANK 一致', () => {
+    const body = /^_CONFLICT_RANK = \{([^}]*)\}/m.exec(readFileSync(ordersPath, 'utf8'))?.[1] ?? ''
+    const kinds = [...body.matchAll(/"(\w+)":/g)].map((m) => m[1])
+    expect(kinds.length).toBeGreaterThan(0)
+    expect(sorted(T.CONFLICT_KINDS)).toEqual(sorted(kinds))
   })
 
   it('每个事件 kind 都有中文名（services 里 events.record 的全部取值）', () => {
@@ -192,6 +240,9 @@ describe('每张标签表恰好覆盖对应枚举', () => {
     ['RESOLUTION_LABEL', T.RESOLUTIONS, L.RESOLUTION_LABEL],
     ['GUARD_CODE_LABEL', T.GUARD_CODES, L.GUARD_CODE_LABEL],
     ['PLUGIN_ERROR_LABEL', T.PLUGIN_ERROR_CODES, L.PLUGIN_ERROR_LABEL],
+    ['PROGRESS_CANCEL_LABEL', T.PROGRESS_CANCEL_CODES, L.PROGRESS_CANCEL_LABEL],
+    ['CONFLICT_KIND_LABEL', T.CONFLICT_KINDS, L.CONFLICT_KIND_LABEL],
+    ['PAUSE_CAUSE_LABEL', T.PAUSE_CAUSES, L.PAUSE_CAUSE_LABEL],
     ['API_ERROR_LABEL', T.API_ERROR_CODES, L.API_ERROR_LABEL],
     ['REVIEW_STATUS_LABEL', T.REVIEW_STATUSES, L.REVIEW_STATUS_LABEL],
     ['REVIEW_STATUS_TAG', T.REVIEW_STATUSES, L.REVIEW_STATUS_TAG],

@@ -36,9 +36,6 @@ export const previewFeishu = (body: FeishuPreviewInput) => post<FeishuPreview>('
 export const listConnections = async (query: PageQuery = { page: 1, page_size: 100 }): Promise<Page<FeishuConnection>> =>
   asPage(await get<Page<FeishuConnection>>('/feishu/connections', { ...query }))
 
-/** 输入：连接 id → 输出：连接 */
-export const getConnection = (id: number) => get<FeishuConnection>(`/feishu/connections/${id}`)
-
 /** 输入：连接配置 → 输出：新连接 */
 export const createConnection = (body: FeishuConnectionInput) => post<FeishuConnection>('/feishu/connections', body)
 

@@ -24,8 +24,8 @@ def _frozen(clean_db):
 def test_overview_shape_and_counts(conn, workspace):
     ws = workspace["id"]
     empty = overview.overview(conn, ws)
-    assert set(empty) == {"bj_date", "counts", "today_executable", "future_assigned", "accounts", "devices",
-                          "recent_exceptions", "last_allocation", "simulation_only", "feishu_configured"}
+    assert set(empty) == {"bj_date", "counts", "needs_attention", "today_executable", "future_assigned", "accounts",
+                          "devices", "recent_exceptions", "last_allocation", "simulation_only", "feishu_configured"}
     assert empty["bj_date"] == "2026-10-31" and empty["last_allocation"] is None
     assert empty["simulation_only"] is True and isinstance(empty["feishu_configured"], bool)
     assert set(empty["counts"]) == set(orders.ORDER_STATUS_ZH) and sum(empty["counts"].values()) == 0

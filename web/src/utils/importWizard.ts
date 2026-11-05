@@ -1,7 +1,7 @@
 /**
  * 文件导入向导的纯函数：字段对应签名（判断预览是否过期）、套用模板、从批次恢复向导、重复上传提醒。
  */
-import type { ImportBatch, ImportTemplate, PreviousUpload } from '@/api/types'
+import type { ImportBatch, ImportSheet, ImportTemplate, PreviousUpload } from '@/api/types'
 import { formatDateTime } from './format'
 import { BATCH_STATUS_LABEL, labelOf } from './labels'
 
@@ -31,20 +31,41 @@ export interface ResumeState {
   sheet: string
   headers: string[]
   mapping: ImportMapping
+  /** 原文件的全部工作表（服务端读不到原文件时只有批次所选的那一张） */
+  sheets: ImportSheet[]
+}
+
+/** 输入：任意值 → 输出：字符串列表（不是列表为空列表，非字符串项去掉） */
+function strings(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
 }
 
 /**
- * 输入：GET /imports/{id} 的批次 → 输出：恢复向导用的工作表、表头与对应；批次没有记下对应时为 null。
- * 批次的 mapping 以该工作表的全部表头为键（上传时是建议对应，预览后是预览用的对应）。
+ * 输入：GET /imports/{id} 的批次 → 输出：恢复向导用的工作表、表头、对应与工作表列表；凑不出工作表与表头时为 null。
+ *
+ * 表头优先用服务端从原文件读出的 headers（原文件顺序）；读不到原文件（headers 为空）时退回 mapping 的键
+ * （jsonb 不保证顺序）。mapping 以该工作表的全部表头为键（上传时是建议对应，预览后是预览用的对应）。
+ * 工作表列表用 sheets，空时只给批次所选的那一张（行数取批次统计）。
  */
-export function resumeFromBatch(b: Pick<ImportBatch, 'sheet_name' | 'mapping'>): ResumeState | null {
-  const m = b.mapping
-  if (!m || typeof m !== 'object' || !b.sheet_name) return null
-  const headers = Object.keys(m)
+export function resumeFromBatch(
+  b: Pick<ImportBatch, 'sheet_name' | 'mapping'> & Partial<Pick<ImportBatch, 'sheets' | 'headers' | 'stats'>>,
+): ResumeState | null {
+  const m = b.mapping && typeof b.mapping === 'object' ? b.mapping : {}
+  const sheets = (Array.isArray(b.sheets) ? b.sheets : [])
+    .filter((s) => s && typeof s.name === 'string')
+    .map((s) => ({ name: s.name, row_count: typeof s.row_count === 'number' ? s.row_count : null, headers: strings(s.headers) }))
+  const sheet = b.sheet_name || sheets.find((s) => s.headers.length)?.name || ''
+  if (!sheet) return null
+  const fromFile = strings(b.headers).length ? strings(b.headers) : (sheets.find((s) => s.name === sheet)?.headers ?? [])
+  const headers = fromFile.length ? fromFile : Object.keys(m)
   if (!headers.length) return null
   const mapping: ImportMapping = {}
   for (const h of headers) mapping[h] = typeof m[h] === 'string' && m[h] ? m[h] : null
-  return { sheet: b.sheet_name, headers, mapping }
+  const listed = sheets.some((s) => s.name === sheet)
+  const all = listed
+    ? sheets.map((s) => (s.name === sheet && !s.headers.length ? { ...s, headers } : s))
+    : [{ name: sheet, row_count: b.stats?.total ?? null, headers }, ...sheets]
+  return { sheet, headers, mapping, sheets: all }
 }
 
 /** 输入：上次同一文件的上传 → 输出：提醒文案 */

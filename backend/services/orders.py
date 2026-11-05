@@ -38,6 +38,7 @@ from services.models import (
     ORDER_STATUSES,
     PRE_EXECUTION_STATUSES,
     REQUIRED_FOR_EXECUTION,
+    SIM_PREFIX,
     SourceRef,
     UpstreamRecord,
     money,
@@ -482,6 +483,21 @@ def _amazon_no_owner(conn, workspace_id: int, amazon_order_no: str, exclude_orde
         LIMIT 1
         """,
         (workspace_id, amazon_order_no, exclude_order_id),
+    ).fetchone()
+
+
+def _amazon_no_taken(conn, workspace_id: int, amazon_order_no: str, exclude_attempt_id: int) -> dict | None:
+    """输入：亚马逊订单号、要排除的尝试 → 输出：已把它登记为真实成功结果的另一笔尝试
+    {purchase_order_id, upstream_order_no}（含本任务之前的尝试，与唯一索引同一口径），没有 → None。"""
+    return conn.execute(
+        """
+        SELECT a.purchase_order_id, o.upstream_order_no FROM procure.purchase_attempts a
+        JOIN procure.purchase_orders o ON o.id = a.purchase_order_id AND o.workspace_id = a.workspace_id
+        WHERE a.workspace_id = %s AND a.amazon_order_no = %s AND NOT a.simulated AND a.status = 'succeeded'
+          AND a.id <> %s
+        ORDER BY a.id LIMIT 1
+        """,
+        (workspace_id, amazon_order_no, exclude_attempt_id),
     ).fetchone()
 
 
@@ -1747,6 +1763,8 @@ def resolve_unknown(conn, workspace_id: int, order_id: int, outcome: str, *, ama
     - ordered：待核实尝试 → succeeded（resolution='ordered'，记单号与金额）；任务 → purchased，结果版本 +1，
       记 purchased_attempt_id，并调用 writeback.enqueue_for_order。单号已登记在别的任务 → VALIDATION。
     - not_ordered：尝试 → failed（resolution='not_ordered'，释放额度）；任务回开始前的派生状态，保留分配。
+      回去之前先把领取后被挡住的来源变化落到任务上（execution.apply_source_drift：人审撤回 → 待确认，
+      外部 AMZ 订单号 / 执行相关字段变化 → 待核实），任务不会带着旧值再被领取。
     - 都**不**自动恢复被暂停的账号（由控制台显式恢复）。尝试仍在途 → ATTEMPT_IN_FLIGHT。
     """
     if outcome not in ("ordered", "not_ordered"):
@@ -1770,10 +1788,18 @@ def resolve_unknown(conn, workspace_id: int, order_id: int, outcome: str, *, ama
         no = (amazon_order_no or "").strip() if isinstance(amazon_order_no, str) else ""
         if not no:
             raise validation("核实已下单需要填写亚马逊订单号", field="amazon_order_no")
-        if not att["simulated"]:
-            dup = _amazon_no_owner(conn, workspace_id, no, order_id)
+        if att["simulated"]:
+            if not no.startswith(SIM_PREFIX):
+                raise validation(f"模拟尝试的单号应以 {SIM_PREFIX} 开头", field="amazon_order_no")
+        else:
+            if no.upper().startswith(SIM_PREFIX) or not normalize.amazon_order_no_ok(no):
+                raise validation("亚马逊订单号格式不对（应为 3-7-7 位数字，如 112-0000000-0000000）",
+                                 field="amazon_order_no")
+            dup = _amazon_no_taken(conn, workspace_id, no, att["id"])
             if dup:
-                raise validation(f"亚马逊订单号 {no} 已登记在任务 {dup['upstream_order_no']}", field="amazon_order_no")
+                where = ("本任务之前的成功尝试" if dup["purchase_order_id"] == order_id
+                         else f"任务 {dup['upstream_order_no']}")
+                raise validation(f"亚马逊订单号 {no} 已登记在{where}", field="amazon_order_no")
         amts: dict[str, Decimal | None] = {}
         for k, v in (amounts or {}).items():
             if k not in _AMOUNT_KEYS:
@@ -1810,6 +1836,9 @@ def resolve_unknown(conn, workspace_id: int, order_id: int, outcome: str, *, ama
         row = transition(conn, order, first, reason="人工核实未下单", actor_kind=ak, actor_id=aid,
                          updates={"current_attempt_id": None},
                          event_detail={"action": "resolve_unknown", "outcome": outcome})
+        from services import execution      # 延迟导入：execution 在模块级导入本模块
+
+        row = execution.apply_source_drift(conn, row, att, actor_kind=ak, actor_id=aid)
         _rederive(conn, workspace_id, row, {}, actor_kind=ak, actor_id=aid)
     return get_detail(conn, workspace_id, order_id)
 
@@ -1834,7 +1863,9 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
     """输入：工作区、任务、approve / decline、备注、操作人 → 输出：任务详情。
 
     approve：解除原分配、清掉外部单号标记，按派生规则回到待分配等（下一次尝试的种类为 'repurchase'，
-    由 execution 领取时判定）；decline：→ closed。
+    由 execution 领取时判定）；已采购期间被挡住的来源变化（相对成功尝试领取时的来源基线）一并落到任务上
+    （execution.drift_updates：人审撤回 → 待确认，外部 AMZ 订单号 / 执行相关字段变化 → 待核实；外部单号尝试、
+    没有基线的尝试不处理）。decline：→ closed。
     """
     if decision not in ("approve", "decline"):
         raise validation("重采决定只能是 approve 或 decline", field="decision")
@@ -1846,9 +1877,17 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
     _record_action(conn, workspace_id, order_id, "order.repurchase_decided", actor_user_id,
                    {"decision": decision, "note": note})
     if decision == "approve":
+        extra: dict[str, Any] = {}
+        if order["purchased_attempt_id"] is not None:
+            att = conn.execute("SELECT * FROM procure.purchase_attempts WHERE id = %s AND workspace_id = %s",
+                               (order["purchased_attempt_id"], workspace_id)).fetchone()
+            if att is not None:
+                from services import execution      # 延迟导入：execution 在模块级导入本模块
+
+                extra = execution.drift_updates(conn, order, att, actor_kind=ak, actor_id=aid) or {}
         _rederive(conn, workspace_id, order,
                   {**_CLEAR_ASSIGNMENT, "external_amz_order_no": None, "page_load_retries": 0,
-                   "current_attempt_id": None},
+                   "current_attempt_id": None, **extra},
                   actor_kind=ak, actor_id=aid, event_detail={"action": "repurchase", "decision": decision})
     else:
         transition(conn, order, "closed", reason=f"人工决定不重采：{note}" if note else "人工决定不重采",
@@ -1999,6 +2038,8 @@ def revert_simulation(conn, workspace_id: int, order_id: int, *, actor_kind: str
 
     调用前须先把该任务的模拟尝试改成 aborted；任务有真实尝试（成功 / 待核实 / 在途）→ CONFLICT。
     开始前或已取消的任务只清掉模拟留下的页面错误重试计数与当前尝试指针（状态不变）。
+    状态有变化时写 'order.status_changed' 事件 {from, to, reason: 已清除模拟结果, simulation_reset: true}
+    （与 transition() 的事件同名，事件流水里看得到每一次回退）。
     """
     order = get_row(conn, workspace_id, order_id, for_update=True)
     if order["status"] in PRE or order["status"] == "cancelled":
@@ -2041,9 +2082,10 @@ def revert_simulation(conn, workspace_id: int, order_id: int, *, actor_kind: str
         "WHERE id = %s AND workspace_id = %s RETURNING *",
         [target, now, now, *params, order_id, workspace_id],
     ).fetchone()
-    events.record(conn, workspace_id, "order", order_id, "order.status_changed", actor_kind=actor_kind,
-                  actor_id=actor_id, detail={"from": order["status"], "to": target, "reason": "已清除模拟结果",
-                                             "simulation_reset": True})
+    if target != order["status"]:
+        events.record(conn, workspace_id, "order", order_id, "order.status_changed", actor_kind=actor_kind,
+                      actor_id=actor_id, detail={"from": order["status"], "to": target, "reason": "已清除模拟结果",
+                                                 "simulation_reset": True})
     return row
 
 

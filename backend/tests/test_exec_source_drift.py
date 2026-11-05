@@ -144,7 +144,7 @@ def test_change_reverted_before_submit_is_not_drift(conn, workspace):
     _reingest(conn, e, asin="B0DEMO0X01")
     _reingest(conn, e)                                   # 又改回领取时的内容
     p = execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="before_submit")
-    assert p == {"continue": True, "cancel_reason": None}
+    assert p == {"continue": True, "cancel_reason": None, "cancel_code": None}
     assert execution.mark_submitting(conn, e["dev"], e["a"]["attempt_id"])["ok"] is True
 
 
