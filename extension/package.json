@@ -1,0 +1,20 @@
+{
+  "name": "procurement-assistant-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "采购助手：采购控制台的浏览器插件（Chrome MV3，AdsPower 与 Chrome 均可加载）",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build --mode background && vite build --mode content && vite build --mode options && vite build --mode popup && node tools/copy-static.mjs",
+    "build:node": "tsc -p tsconfig.node.json",
+    "test": "npm run build:node && node --test \"test/*.test.mjs\"",
+    "pack": "npm run build && node tools/pack.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "linkedom": "^0.18.5",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

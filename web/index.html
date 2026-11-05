@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>采购控制台</title>
+    <script>
+      // 首屏主题：在样式加载前设置 html.dark 与 data-theme，避免深色模式闪白。与 src/composables/useTheme.ts 使用同一个键。
+      ;(function () {
+        var dark = false
+        try {
+          var saved = window.localStorage.getItem('pc-theme')
+          if (saved === 'dark') dark = true
+          else if (saved !== 'light') dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+        } catch (e) {
+          dark = false
+        }
+        var root = document.documentElement
+        if (dark) {
+          root.classList.add('dark')
+          root.setAttribute('data-theme', 'dark')
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

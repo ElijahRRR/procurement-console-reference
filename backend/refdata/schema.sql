@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS procure.workspace_settings (
 CREATE TABLE IF NOT EXISTS procure.buyer_accounts (
     id                   bigserial PRIMARY KEY,
     workspace_id         bigint NOT NULL REFERENCES procure.workspaces(id),
-    name                 text NOT NULL,                       -- 与飞书「买家号」取值一致，如 环境97招商
+    name                 text NOT NULL,                       -- 与飞书「买家号」取值一致，如 环境-DEMO-A
     amazon_customer_id   text CHECK (amazon_customer_id IS NULL OR amazon_customer_id ~ '^A[0-9A-Z]{8,}$'),
     site                 text NOT NULL DEFAULT 'US' CHECK (site IN ('US')),
     min_amount           numeric(12,2) NOT NULL DEFAULT 0 CHECK (min_amount >= 0),
@@ -427,3 +427,9 @@ CREATE TABLE IF NOT EXISTS procure.events (
 
 CREATE INDEX IF NOT EXISTS events_entity ON procure.events (workspace_id, entity, entity_id, at DESC);
 CREATE INDEX IF NOT EXISTS events_order ON procure.events (order_id, at DESC) WHERE order_id IS NOT NULL;
+
+-- ── 订单来源模块追加（幂等）──────────────────────────────────────────────────────
+
+-- 写回列的飞书字段类型 {飞书列名: 字段类型}：建连接 / 改写回对应 / 写回验收时从飞书读取，
+-- 入队时按列类型转换写回值（数字列写数字、单选写选项文本），入队本身不访问飞书。
+ALTER TABLE procure.feishu_connections ADD COLUMN IF NOT EXISTS writeback_field_types jsonb NOT NULL DEFAULT '{}';
