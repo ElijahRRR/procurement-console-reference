@@ -123,11 +123,32 @@ def test_ship_days_invalid(raw):
 
 @pytest.mark.parametrize("raw,expected", [
     (41.97, "41.97"), ("41.97", "41.97"), ("$1,041.9", "1041.90"), ("USD 52", "52.00"), ("52 usd", "52.00"),
-    (Decimal("78.686"), "78.69"), (45, "45.00"), ([19.5], "19.50"),
+    (Decimal("78.686"), "78.69"), (78.685, "78.69"), (45, "45.00"), ([19.5], "19.50"),
 ])
 def test_money_ok(raw, expected):
+    """普通金额四舍五入到分（采购单价、销售总额）。"""
+    r = rec(unit_price=raw)
+    assert r.unit_price == Decimal(expected) and r.issues == []
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (78.685, "78.68"), ("78.685", "78.68"), (Decimal("78.686"), "78.68"), (78.69, "78.69"), (78.68999999, "78.69"),
+    ("$1,041.9", "1041.90"), (45, "45.00"),
+])
+def test_price_cap_rounds_down_after_float_noise_removal(raw, expected):
+    """限价是上限：先抹浮点噪声，再向下取整到分（宁可少放行 1 美分）。"""
     r = rec(price_cap=raw)
     assert r.price_cap == Decimal(expected) and r.issues == []
+
+
+@pytest.mark.parametrize("raw", ["12,5", "1.234,50", "1e3", "1E+25", "1e30", "99999999999999999999999", 1e25,
+                                 Decimal("1E+30"), "12,34", "1,23,456"])
+def test_unreliable_or_absurd_money_is_none_with_issue(raw):
+    """逗号只能是千分位；指数写法不认；超出 numeric(12,2) 的数一律当没读到（不抛异常、不当 0）。"""
+    r = rec(price_cap=raw, unit_price=raw)
+    assert r.price_cap is None and r.unit_price is None
+    assert any(i.startswith("限价不是有效金额") for i in r.issues)
+    assert any(i.startswith("采购单价不是有效金额") for i in r.issues)
 
 
 @pytest.mark.parametrize("raw,prefix", [("abc", "限价不是有效金额"), (True, "限价不是有效金额"),
@@ -200,9 +221,18 @@ def test_postal_code_keeps_leading_zero_and_flags_short():
     assert rec(postal_code="02134").postal_code == "02134"
     assert rec(postal_code="32960-1234").issues == []
     assert rec(postal_code=32960.0).postal_code == "32960"
-    r = rec(postal_code=2134)
+    r = rec(postal_code="2134")
     assert r.postal_code == "2134"
     assert r.issues == ["邮编不足 5 位：2134"]
+
+
+def test_numeric_us_zip_gets_leading_zero_back():
+    """Excel 数字格式 / 飞书数字列把 02134 变成 2134：美国地址补回前导 0 并记问题；非美国不补。"""
+    r = rec(postal_code=2134)
+    assert r.postal_code == "02134" and r.issues == ["邮编 2134 是数字格式，已补前导 0 为 02134"]
+    assert rec(postal_code=501.0).postal_code == "00501"
+    assert rec(postal_code=2134, country="CA").postal_code == "2134"
+    assert rec(postal_code=12).postal_code == "12"
 
 
 def test_country_and_state():
@@ -315,3 +345,67 @@ def test_compact_numeric_date_and_scalar_admission_values():
     assert rec(suggested_purchase_date=20261031).suggested_purchase_date == date(2026, 10, 31)
     assert rec(suggested_purchase_date="20261031").suggested_purchase_date == date(2026, 10, 31)
     assert effective_admission({"approved_values": 1})["approved_values"] == ["1"]
+
+
+# ── 多选、表格错误值、不可用的平台订单号、离谱的天数与年份、AMZ 订单号（D4-12 / D4-07 / D4-02 / D4-04）────────
+
+
+def test_multi_select_values_match_admission_by_membership():
+    adm = {"cancel_after_sale_values": ["已取消"]}
+    assert normalize({"upstream_order_no": "P", "after_sale_value": ["已取消", "退款中"]}, adm).upstream_cancelled
+    assert not normalize({"upstream_order_no": "P", "after_sale_value": ["退款中"]}, adm).upstream_cancelled
+    assert normalize({"upstream_order_no": "P", "review_value": ["通过", "钓鱼"]}).review == "rejected"
+    assert normalize({"upstream_order_no": "P", "review_value": ["通过", "待定"]}).review == "unknown"
+    assert normalize({"upstream_order_no": "P", "review_value": ["通过", "通过"]}).review == "approved"
+
+
+def test_multi_select_purchase_status_hits_skip_values():
+    from services.normalize import admission_hold, admission_skip_reason
+
+    r = normalize({"upstream_order_no": "P", "purchase_status_value": ["待拍单", "已拍单"], "review_value": "通过"})
+    assert "已拍单" in admission_skip_reason(r, None)
+    assert admission_hold(r, None)["kind"] == "purchase_status"
+
+
+@pytest.mark.parametrize("raw,needle", [
+    ("#N/A", "表格错误值"), ("#REF!", "表格错误值"), (["PO-DEMO-1", "PO-DEMO-2"], "多个值"),
+    ("1.23457E+12", "科学计数法"),
+])
+def test_unusable_order_numbers_are_invalid_with_reason(raw, needle):
+    r = normalize({"upstream_order_no": raw})
+    assert r.upstream_order_no == "" and needle in r.issues[0]
+
+
+def test_same_order_number_twice_in_a_list_is_one_value():
+    assert normalize({"upstream_order_no": ["PO-DEMO-1", " PO-DEMO-1 "]}).upstream_order_no == "PO-DEMO-1"
+
+
+def test_excel_error_values_in_text_fields_count_as_missing():
+    r = normalize({"upstream_order_no": "P", "recipient_name": "#N/A", "city": "#VALUE!"})
+    assert r.recipient_name is None and r.city is None
+    assert sum("表格错误值" in i for i in r.issues) == 2
+
+
+@pytest.mark.parametrize("field,raw,needle", [
+    ("ship_days", 20261031, "配送天数超出合理范围"), ("ship_days", 61, "配送天数超出合理范围"),
+    ("order_time", "9999-12-31", "下单时间年份不合理"), ("suggested_purchase_date", "1900-01-01", "建议采购日期年份不合理"),
+])
+def test_absurd_days_and_years_are_none_with_issue(field, raw, needle):
+    r = normalize({"upstream_order_no": "P", field: raw})
+    assert getattr(r, field) is None and any(needle in i for i in r.issues)
+    assert normalize({"upstream_order_no": "P", "ship_days": 60}).ship_days == 60
+
+
+@pytest.mark.parametrize("raw", ["—", "-", "无", "N/A", "null", "0"])
+def test_placeholder_amz_numbers_become_none(raw):
+    r = normalize({"upstream_order_no": "P", "external_amz_order_no": raw})
+    assert r.external_amz_order_no is None and any("不是订单号" in i for i in r.issues)
+
+
+def test_malformed_amz_number_is_kept_but_flagged_and_not_historical():
+    from services.normalize import admission_skip_reason, amazon_order_no_ok
+
+    r = normalize({"upstream_order_no": "P", "external_amz_order_no": "缺货待补", "review_value": "通过"})
+    assert r.external_amz_order_no == "缺货待补" and any("格式不对" in i for i in r.issues)
+    assert admission_skip_reason(r, None) is None            # 不当历史采购跳过：交给 ingest 建成待核实
+    assert amazon_order_no_ok("111-0000000-0000001") and not amazon_order_no_ok("111-000-1")

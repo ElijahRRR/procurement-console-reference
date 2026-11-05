@@ -9,7 +9,8 @@ import AppIcon from '@/components/AppIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import OrderListCard, { type OrderTab } from '@/components/orders/OrderListCard.vue'
 import { formatDate, formatNumber } from '@/utils/format'
-import { confirmAction, notifyFailure, notifySuccess } from '@/utils/feedback'
+import { ORDER_VIEW_LABEL, labelOf } from '@/utils/labels'
+import { confirmAction, notifyFailure, notifySuccess, runDownload } from '@/utils/feedback'
 
 const overview = ref<Overview | null>(null)
 const list = ref<InstanceType<typeof OrderListCard>>()
@@ -37,6 +38,13 @@ const tabs = computed<OrderTab[]>(() => {
   ]
 })
 
+/** 导出当前打开的标签页（与列表同一视图） */
+const exportView = computed(() => list.value?.currentView ?? 'today')
+function exportCurrent() {
+  const view = exportView.value
+  void runDownload('导出', () => downloadOrdersExport({ view }))
+}
+
 async function reallocate() {
   const ok = await confirmAction({ message: '确定要重新分配吗？自动分配的任务会按当前账号配置重算，人工改派的任务保持不动。' })
   if (!ok) return
@@ -55,13 +63,15 @@ async function reallocate() {
 
 <template>
   <div>
-    <PageHeader title="待采购">
+    <PageHeader :title="overview ? `今日可采购 ${formatNumber(overview.today_executable)} 笔` : '今日可采购'">
       <template #description>
-        <template v-if="overview">北京日期 {{ formatDate(overview.bj_date) }} · 今日可采购 {{ formatNumber(overview.today_executable) }} 笔，未来日期 {{ formatNumber(overview.future_assigned) }} 笔</template>
+        <template v-if="overview">北京日期 {{ formatDate(overview.bj_date) }} · 未来日期 {{ formatNumber(overview.future_assigned) }} 笔 · 建议采购日期不晚于今天的已分配任务才会被插件领取</template>
         <template v-else>建议采购日期不晚于今天的已分配任务才会被插件领取</template>
       </template>
       <template #actions>
-        <el-button @click="downloadOrdersExport({ view: 'all' })"><AppIcon name="download" size="sm" class="mr-1.5" />导出</el-button>
+        <el-tooltip :content="`导出「${labelOf(ORDER_VIEW_LABEL, exportView)}」的全部任务`" placement="bottom">
+          <el-button @click="exportCurrent"><AppIcon name="download" size="sm" class="mr-1.5" />导出当前列表</el-button>
+        </el-tooltip>
         <el-button type="primary" :loading="allocating" @click="reallocate"><AppIcon name="swap" size="sm" class="mr-1.5" />重新分配</el-button>
       </template>
     </PageHeader>

@@ -20,6 +20,7 @@ from tests.fake_feishu import (
     DEMO_TABLE,
     FakeFeishuClient,
     create_demo_connection,
+    ms,
     order_fields,
     text,
 )
@@ -154,9 +155,11 @@ def test_known_task_still_receives_review_revocation(conn, workspace, fake):
     _run(conn, ws, c["id"], fake)
     fake.edit_record(DEMO_APP, DEMO_TABLE, "recDEMO0001", 人工审核="拒绝", 采购方="外采购DEMO")
     stats = _run(conn, ws, c["id"], fake)
-    assert stats["update"] == 1 and stats["skipped"] == 0
+    # 人审撤回照常应用；采购方移走另外转「待核实」（admission 冲突），二者都传达到已有任务，不算 skipped
+    assert stats["conflict"] == 1 and stats["skipped"] == 0
     o = _order(conn, ws, "PO-DEMO-E01")
     assert o["status"] == "pending_review" and o["review_status"] == "rejected"
+    assert o["conflict"]["kind"] == "admission" and o["assigned_account_id"] is None
 
 
 def test_cancel_value_cancels_pre_execution_task(conn, workspace, fake):
@@ -290,8 +293,10 @@ def test_workflow_reads_due_connections_in_own_transactions(conn, workspace, fak
     ws_b = f.make_workspace(conn)["id"]
     _add(fake, "recDEMO0001", "PO-DEMO-J01")
     ok = create_demo_connection(conn, ws, fake)
-    fake2 = FakeFeishuClient.with_order_table(table_id="tblDEMOOTHER9")
-    bad = fc.create(conn, ws_b, _demo_data(fake2, "tblDEMOOTHER9"), None, client=fake2)
+    other_app = "bascnDEMOOTHERAPP1"
+    fake2 = FakeFeishuClient.with_order_table(app_token=other_app, table_id="tblDEMOOTHER9")
+    fc.grant_base(conn, ws_b, other_app)            # 乙的表格由部署所有者授权给乙
+    bad = fc.create(conn, ws_b, _demo_data(fake2, "tblDEMOOTHER9", other_app), None, client=fake2)
     conn.commit()
     # 后台任务用同一个客户端：乙的表在这个客户端里不存在 → 乙失败、甲成功
     out = intake_workflow.run()
@@ -307,12 +312,12 @@ def test_workflow_reads_due_connections_in_own_transactions(conn, workspace, fak
     assert out["connections"][str(ok["id"])]["unchanged"] == 1
 
 
-def _demo_data(client, table_id):
+def _demo_data(client, table_id, app_token=DEMO_APP):
     from services import feishu_fields
 
-    fields = client.list_fields(DEMO_APP, table_id)
-    return {"name": "DEMO 乙订单表", "link": f"https://example-demo.feishu.cn/base/{DEMO_APP}?table={table_id}",
-            "app_token": DEMO_APP, "source_table_id": table_id, "source_view_id": None,
+    fields = client.list_fields(app_token, table_id)
+    return {"name": "DEMO 乙订单表", "link": f"https://example-demo.feishu.cn/base/{app_token}?table={table_id}",
+            "app_token": app_token, "source_table_id": table_id, "source_view_id": None,
             "field_map": feishu_fields.suggest_field_map([x["field_name"] for x in fields]),
             "writeback_map": feishu_fields.suggest_writeback_map(fields)}
 
@@ -323,4 +328,102 @@ def test_workflow_skips_when_feishu_not_configured(monkeypatch):
 
     monkeypatch.setattr(fc, "make_client", boom)
     out = intake_workflow.run()
-    assert out == {"skipped": fc.NOT_CONFIGURED_MESSAGE, "connections": {}}
+    assert out == {"due": 0, "connections": {}}                  # 没有到期连接：根本不建客户端
+    with db.pg_conn() as conn:
+        create_demo_connection(conn, f.make_workspace(conn)["id"], FakeFeishuClient.with_order_table())
+    out = intake_workflow.run()
+    assert out == {"due": 1, "connections": {}, "skipped": fc.NOT_CONFIGURED_MESSAGE}
+
+
+# ── 坏数据与意外异常不能拖垮整次读取（D4-02）────────────────────────────────────
+
+
+def test_one_absurd_record_does_not_block_the_whole_read(conn, workspace, fake):
+    ws = workspace["id"]
+    _add(fake, "recDEMO0001", "PO-DEMO-Z01")
+    _add(fake, "recDEMO0002", "PO-DEMO-Z02", 建议采购日期=None, 下单时间=ms(datetime(9999, 12, 31, tzinfo=timezone.utc)))
+    _add(fake, "recDEMO0003", "PO-DEMO-Z03", 限价=1e25)
+    c = create_demo_connection(conn, ws, fake)
+    stats = _run(conn, ws, c["id"], fake)
+    assert stats["read"] == 3 and stats["new"] == 3
+    assert _order(conn, ws, "PO-DEMO-Z01")["status"] in ("queued", "assigned")
+    assert _order(conn, ws, "PO-DEMO-Z02")["status"] == "needs_info"
+    assert _order(conn, ws, "PO-DEMO-Z03")["status"] == "needs_info"
+
+
+def test_unexpected_error_for_one_record_only_invalidates_it(conn, workspace, fake, monkeypatch):
+    from services import orders
+
+    ws = workspace["id"]
+    _add(fake, "recDEMO0001", "PO-DEMO-Z11")
+    _add(fake, "recDEMO0002", "PO-DEMO-Z12")
+    c = create_demo_connection(conn, ws, fake)
+    real = orders.ingest
+
+    def flaky(conn_, ws_, rec, src, **kw):
+        if rec.upstream_order_no == "PO-DEMO-Z12":
+            raise OverflowError("date value out of range")
+        return real(conn_, ws_, rec, src, **kw)
+
+    monkeypatch.setattr(orders, "ingest", flaky)
+    stats = _run(conn, ws, c["id"], fake)
+    assert stats["new"] == 1 and stats["invalid"] == 1
+    assert "OverflowError" in next(p["reason"] for p in stats["problems"] if p["upstream_order_no"] == "PO-DEMO-Z12")
+
+
+def test_unexpected_error_in_intake_is_recorded_as_failed_run(conn, workspace, fake, monkeypatch):
+    """接收阶段意外出错：回滚本次接收、记失败的读取记录与 last_error、last_sync_at 前进（不每 30 秒重读）。"""
+    ws = workspace["id"]
+    _add(fake, "recDEMO0001", "PO-DEMO-Z21")
+    c = create_demo_connection(conn, ws, fake)
+    conn.commit()
+
+    def boom(*a, **kw):
+        raise RuntimeError("DEMO 意外")
+
+    monkeypatch.setattr(feishu_intake, "evaluate_records", boom)
+    with pytest.raises(DomainError) as e:
+        _run(conn, ws, c["id"], fake)
+    assert e.value.code == "INTERNAL" and e.value.detail["run_id"]
+    conn.commit()
+    run = conn.execute("SELECT * FROM procure.feishu_sync_runs WHERE id = %s", (e.value.detail["run_id"],)).fetchone()
+    got = fc.get_row(conn, ws, c["id"])
+    assert run["ok"] is False and "RuntimeError" in run["error"] and got["last_error"] == run["error"]
+    assert got["last_sync_at"] is not None and _order(conn, ws, "PO-DEMO-Z21") is None
+    assert (ws, c["id"]) not in feishu_intake.due_connections(conn, clock.now())
+
+
+def test_writeback_test_record_is_never_ingested(conn, workspace, fake):
+    ws = workspace["id"]
+    _add(fake, "recDEMO0001", "PO-DEMO-Z31")
+    _add(fake, "recDEMOTEST", "PO-DEMO-TEST", AMZ订单号=text("回填验收 2026-10-31 10:00:00"), 采购状态="已拍单")
+    c = create_demo_connection(conn, ws, fake)
+    conn.execute("UPDATE procure.feishu_connections SET writeback_test_record = 'recDEMOTEST' WHERE id = %s",
+                 (c["id"],))
+    stats = _run(conn, ws, c["id"], fake)
+    assert stats["new"] == 1 and stats["skipped"] == 1 and _order(conn, ws, "PO-DEMO-TEST") is None
+    prev = fc.preview(conn, ws, app_token=DEMO_APP, table_id=DEMO_TABLE, field_map=c["field_map"],
+                      admission=c["admission"], client=fake)
+    assert next(r for r in prev["records"] if r["record_id"] == "recDEMOTEST")["verdict"] == "skipped"
+
+
+# ── 已有任务的采购方 / 采购状态变化（D4-01 / D1-03）──────────────────────────────
+
+
+def test_purchaser_change_or_bought_elsewhere_pauses_assigned_task(conn, workspace, fake):
+    ws = workspace["id"]
+    f.make_account(conn, ws, name="环境-DEMO-A")
+    _add(fake, "recDEMO0001", "PO-DEMO-Q01")
+    _add(fake, "recDEMO0002", "PO-DEMO-Q02")
+    c = create_demo_connection(conn, ws, fake)
+    _run(conn, ws, c["id"], fake)
+    assert _order(conn, ws, "PO-DEMO-Q01")["status"] == "assigned"
+    fake.edit_record(DEMO_APP, DEMO_TABLE, "recDEMO0001", 采购方="外采购DEMO")
+    fake.edit_record(DEMO_APP, DEMO_TABLE, "recDEMO0002", 采购状态="已拍单")
+    stats = _run(conn, ws, c["id"], fake)
+    assert stats["conflict"] == 2 and stats["unchanged"] == 0
+    for no in ("PO-DEMO-Q01", "PO-DEMO-Q02"):
+        o = _order(conn, ws, no)
+        assert o["status"] == "conflict" and o["assigned_account_id"] is None and o["conflict"]["kind"] == "admission"
+    again = _run(conn, ws, c["id"], fake)
+    assert again["unchanged"] == 2 and again["conflict"] == 0

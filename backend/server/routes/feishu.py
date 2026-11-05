@@ -2,7 +2,8 @@
 立即读取、写回验收、读取记录。
 
 飞书客户端一律由 services/feishu_connections.make_client 创建（服务函数不传 client 时自己调用它；测试 monkeypatch
-它换成假客户端）。未配置应用凭证 → 409 FEISHU_NOT_CONFIGURED；飞书接口报错 → 502 FEISHU_ERROR。
+它换成假客户端）。未配置应用凭证 → 409 FEISHU_NOT_CONFIGURED；飞书接口报错 → 502 FEISHU_ERROR；
+多维表格没有授权给当前工作区（链接只用来定位）→ 403 FORBIDDEN。
 DELETE 连接 = 停用（契约 §8），不删数据。
 """
 
@@ -88,13 +89,13 @@ def system_fields(ctx: deps.Console = Depends(deps.console)):
 @router.post("/resolve-link")
 def resolve_link(body: LinkBody, ctx: deps.Console = Depends(deps.console)):
     """输入：{link} → 输出：{app_token, table_id, view_id, tables: [{table_id, name}]}。"""
-    return respond(feishu_connections.resolve_link(body.link))
+    return respond(feishu_connections.resolve_link(ctx.conn, ctx.workspace_id, body.link))
 
 
 @router.post("/fields")
 def list_fields(body: FieldsBody, ctx: deps.Console = Depends(deps.console)):
     """输入：{app_token, table_id} → 输出：{fields: [...], suggested_field_map, suggested_writeback_map}。"""
-    return respond(feishu_connections.fields(body.app_token, body.table_id))
+    return respond(feishu_connections.fields(ctx.conn, ctx.workspace_id, body.app_token, body.table_id))
 
 
 @router.post("/preview")

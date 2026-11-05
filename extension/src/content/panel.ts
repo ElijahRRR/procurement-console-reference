@@ -1,8 +1,10 @@
 /** 页面内面板（Shadow DOM，closed）：订单历史页默认展开，其余亚马逊页面是收起的悬浮按钮。
  *
  * 显示：服务端连接、设备名、绑定账号、身份状态、模拟模式标签、今日额度、执行时间、
- * 当前尝试进度、最近 50 行日志；按钮「开始执行（模拟）」「刷新身份」。
+ * 当前尝试进度、待补交的结果回执、最近 50 行日志；按钮「开始执行（模拟）」「刷新身份」。
  * 数据来源：后台的状态快照（chrome.storage.local 变化即刷新）+ 本页引擎的实时状态。
+ * 面板挂上、页面回到前台、点「刷新身份」都会让后台马上同步一次心跳；已配对还没绑定账号时，
+ * 页面看得见就每 10 秒同步一次 —— 控制台里一绑定，这里几秒内显示账号、「开始执行」可以点。
  * 所有动态文本走 textContent，不拼 innerHTML。
  */
 
@@ -11,15 +13,18 @@ import { isOrderHistoryPath, type IdentitySnapshot } from "../core/identity.js";
 import type { StateSnapshot } from "../core/messages.js";
 import { SIM_OUTCOMES } from "../core/simulate.js";
 import { LOGO_SVG, themeCss } from "../ui/theme.js";
-import { fetchState, onStateChange, toSw } from "../ui/bridge.js";
+import { fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
 import {
   accountText,
   canStart,
   connectionText,
   h,
+  identityConflictText,
   identityText,
   quotaText,
+  receiptLines,
   renderLogLines,
+  runActive,
   scheduleText,
   type Tone,
 } from "../ui/view.js";
@@ -116,13 +121,13 @@ export function mountPanel(host: RunHost, readIdentity: (force: boolean) => Prom
 
   function runBlock(s: StateSnapshot): HTMLElement | null {
     const local = host.view();
-    const remote = s.run?.active ? s.run.view : null;
+    const remote = runActive(s) ? s.run?.view ?? null : null;
     const v: EngineView | null = local ?? remote;
     if (!v) {
       const last = host.last();
       return last ? h("div", { class: "run" }, h("div", { class: "pc-caption" }, last.message)) : null;
     }
-    const elsewhere = !local && s.run?.active;
+    const elsewhere = !local && runActive(s);
     const c = v.counts;
     return h(
       "div",
@@ -214,8 +219,22 @@ export function mountPanel(host: RunHost, readIdentity: (force: boolean) => Prom
       ),
     );
 
-    if (s.identity_status === "mismatch") {
+    const conflict = identityConflictText(s);
+    if (conflict) {
+      body.append(h("div", { class: "pc-notice pc-notice-danger notice-gap" }, conflict));
+    } else if (s.identity_status === "mismatch") {
       body.append(h("div", { class: "pc-notice pc-notice-danger notice-gap" }, "当前浏览器登录的亚马逊账号不是绑定账号，服务端不会下发任务。请切换回绑定账号后点「刷新身份」。"));
+    }
+    const receipts = receiptLines(s);
+    if (receipts.length) {
+      body.append(
+        h(
+          "div",
+          { class: "pc-notice pc-notice-warning notice-gap" },
+          h("div", {}, `有 ${receipts.length} 条结果回执还没送到服务端，服务端恢复后自动补交：`),
+          ...receipts.map((t) => h("div", { class: "pc-caption" }, t)),
+        ),
+      );
     }
     if (notice) body.append(h("div", { class: `pc-notice pc-notice-${notice.tone} notice-gap` }, notice.text));
 
@@ -252,6 +271,7 @@ export function mountPanel(host: RunHost, readIdentity: (force: boolean) => Prom
   onStateChange(() => void refresh());
   render();
   void refresh();
+  keepFresh("打开亚马逊页面", () => state);
   // 连接状态的「多久没心跳」是按时间变化的：每 30 秒重画一次。
   setInterval(() => render(), 30_000);
 }

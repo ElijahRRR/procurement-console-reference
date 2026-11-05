@@ -40,5 +40,28 @@ def test_record_roundtrip_and_money():
 def test_events_record(conn, workspace):
     eid = events.record(conn, workspace["id"], "settings", workspace["id"], "settings.updated",
                         actor_kind="user", actor_id=workspace["user_id"], detail={"x": Decimal("1.50")})
-    rows = events.list_for(conn, workspace["id"], entity="settings")
-    assert rows[0]["id"] == eid and rows[0]["detail"] == {"x": "1.50"}
+    out = events.list_for(conn, workspace["id"], entity="settings")
+    assert out["total"] == 1 and out["rows"][0]["id"] == eid and out["rows"][0]["detail"] == {"x": "1.50"}
+    assert out["rows"][0]["actor_name"] == "测试所有者"
+
+
+def test_events_list_pages_exactly_with_names_and_workspace_scope(conn, workspace):
+    """K6：分页按偏移精确取（total 是全部条数），操作者名：用户 → 显示名，设备 → 设备名，其他 → None。"""
+    from tests import factories as f
+
+    ws = workspace["id"]
+    dev = f.make_device(conn, ws, name="Mac-DEMO-EV")
+    for i in range(5):
+        events.record(conn, ws, "settings", ws, f"demo.{i}", actor_kind="user", actor_id=workspace["user_id"])
+    events.record(conn, ws, "device", dev["id"], "demo.device", actor_kind="device", actor_id=dev["id"])
+    events.record(conn, ws, "settings", ws, "demo.system")
+    other = f.make_workspace(conn)
+    events.record(conn, other["id"], "settings", other["id"], "demo.other", actor_kind="user",
+                  actor_id=other["user_id"])
+    page1 = events.list_for(conn, ws, limit=3, offset=0)
+    page3 = events.list_for(conn, ws, limit=3, offset=6)
+    assert page1["total"] == 7 and [r["kind"] for r in page1["rows"]] == ["demo.system", "demo.device", "demo.4"]
+    assert page1["rows"][0]["actor_name"] is None and page1["rows"][1]["actor_name"] == "Mac-DEMO-EV"
+    assert page1["rows"][2]["actor_name"] == "测试所有者"
+    assert [r["kind"] for r in page3["rows"]] == ["demo.0"]
+    assert events.list_for(conn, ws, entity="device", entity_id=dev["id"])["total"] == 1

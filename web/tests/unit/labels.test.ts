@@ -2,7 +2,7 @@
  * 标签表覆盖每一个后端枚举值：先核对前端枚举与 schema.sql 的 CHECK 约束、services/models.py、开发契约一致，
  * 再核对每张标签表的键恰好等于对应枚举。
  */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import * as T from '@/api/types'
@@ -12,7 +12,27 @@ const repo = resolve(process.cwd(), '..')
 const schemaPath = resolve(repo, 'backend/refdata/schema.sql')
 const modelsPath = resolve(repo, 'backend/services/models.py')
 const contractPath = resolve(repo, 'docs/development/开发契约-v2.md')
-const haveRepo = existsSync(schemaPath) && existsSync(modelsPath) && existsSync(contractPath)
+const servicesDir = resolve(repo, 'backend/services')
+const ordersPath = resolve(servicesDir, 'orders.py')
+const importsPath = resolve(servicesDir, 'imports.py')
+const haveRepo = existsSync(schemaPath) && existsSync(modelsPath) && existsSync(contractPath) && existsSync(ordersPath)
+
+/** 输入：无 → 输出：services/*.py 与 workflows/*.py 里写进事件的全部 kind（「对象.动作」形式的字面量） */
+function backendEventKinds(): string[] {
+  const dirs = [servicesDir, resolve(repo, 'backend/workflows')]
+  const prefixes = ['order', 'attempt', 'account', 'device', 'run', 'connection', 'batch', 'settings', 'simulation', 'feishu', 'import_template']
+  const re = new RegExp(`"((?:${prefixes.join('|')})\\.[a-z_]+)"`, 'g')
+  const kinds = new Set<string>()
+  for (const dir of dirs) {
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.py')) continue
+      for (const m of readFileSync(resolve(dir, f), 'utf8').matchAll(re)) kinds.add(m[1])
+    }
+  }
+  // 同样形状但不是事件的字面量（飞书域名）
+  for (const notKind of ['feishu.cn']) kinds.delete(notKind)
+  return [...kinds].sort()
+}
 
 /** 输入：schema.sql 文本、表名、列名 → 输出：该列 CHECK (col IN (...)) 的取值 */
 function checkValues(sql: string, table: string, column: string): string[] {
@@ -98,10 +118,36 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
     expect(sorted(T.ORDER_VIEWS)).toEqual(sorted(views))
   })
 
-  it('allowed_actions 与契约 §10 一致', () => {
-    const line = contract.split('\n').find((l) => l.includes('`allowed_actions`（'))
-    const actions = [...(line ?? '').split('`allowed_actions`（')[1].split('的子集')[0].matchAll(/`(\w+)`/g)].map((m) => m[1])
-    expect(sorted(T.ORDER_ACTIONS)).toEqual(sorted(actions))
+  it('allowed_actions 与 services/orders.allowed_actions 能给出的动作一致', () => {
+    // 服务端代码为准（契约 §10 的列表随后同步）：只取 allowed_actions 函数体里 append 的取值
+    const src = readFileSync(ordersPath, 'utf8')
+    const body = /def allowed_actions\([\s\S]*?\n    return acts\n/.exec(src)?.[0] ?? ''
+    const actions = [...body.matchAll(/acts\.append\("(\w+)"\)/g)].map((m) => m[1])
+    expect(actions.length).toBeGreaterThan(0)
+    expect(sorted(T.ORDER_ACTIONS)).toEqual(sorted([...new Set(actions)]))
+  })
+
+  it('每个事件 kind 都有中文名（services 里 events.record 的全部取值）', () => {
+    const kinds = backendEventKinds()
+    expect(kinds.length).toBeGreaterThan(40)
+    const missing = kinds.filter((k) => !(k in L.EVENT_KIND_LABEL))
+    expect(missing).toEqual([])
+    for (const k of kinds) expect(L.eventKindLabel(k)).not.toBe(k)
+  })
+
+  it('预览结论的中文名与 services/imports.VERDICT_ZH 一致', () => {
+    const src = readFileSync(importsPath, 'utf8')
+    const body = /VERDICT_ZH = \{([\s\S]*?)\}/.exec(src)?.[1] ?? ''
+    const zh = Object.fromEntries([...body.matchAll(/"(\w+)": "([^"]+)"/g)].map((m) => [m[1], m[2]]))
+    expect(Object.keys(zh).sort()).toEqual(sorted(T.IMPORT_VERDICTS))
+    for (const v of T.IMPORT_VERDICTS) expect(L.IMPORT_VERDICT_LABEL[v]).toBe(zh[v])
+  })
+
+  it('执行所需字段的中文名与 models.REQUIRED_FOR_EXECUTION 一致（与状态说明「缺少：…」用同一套字）', () => {
+    const body = /REQUIRED_FOR_EXECUTION = \(([\s\S]*?)\n\)/.exec(models)?.[1] ?? ''
+    const pairs = [...body.matchAll(/\("(\w+)", "([^"]+)"\)/g)].map((m) => [m[1], m[2]])
+    expect(pairs.length).toBe(11)
+    for (const [k, zh] of pairs) expect(L.fieldLabel(k)).toBe(zh)
   })
 
   it('飞书预览结论与契约 §10 一致', () => {
@@ -174,6 +220,7 @@ describe('每张标签表恰好覆盖对应枚举', () => {
     ['EVENT_ENTITY_LABEL', T.EVENT_ENTITIES, L.EVENT_ENTITY_LABEL],
     ['ACTOR_KIND_LABEL', T.ACTOR_KINDS, L.ACTOR_KIND_LABEL],
     ['ORDER_ACTION_LABEL', T.ORDER_ACTIONS, L.ORDER_ACTION_LABEL],
+    ['GUARD_CHECK_LABEL', [...T.GUARD_CHECK_KEYS, 'fulfillment'], L.GUARD_CHECK_LABEL],
   ]
   it.each(cases)('%s', (_name, values, map) => {
     expect(sorted(Object.keys(map))).toEqual(sorted(values))
@@ -184,7 +231,7 @@ describe('每张标签表恰好覆盖对应枚举', () => {
   })
 
   it('中文标签不含感叹号与 emoji', () => {
-    const all = cases.flatMap(([, , map]) => Object.values(map))
+    const all = [...cases.flatMap(([, , map]) => Object.values(map)), ...Object.values(L.EVENT_KIND_LABEL)]
     for (const s of all) {
       expect(s).not.toMatch(/[!！]/)
       expect(s).not.toMatch(/\p{Extended_Pictographic}/u)

@@ -1,3 +1,10 @@
+# 安装依赖（在 backend/ 里）：pip install -r requirements.txt（或 pip install -e ".[dev]"）。
+# 应用从源码目录运行（python cli.py …），refdata/schema.sql 按源码路径读取，所以不支持非 editable 的打包安装。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "procurement-console"
 version = "0.1.0"
@@ -18,3 +25,7 @@ dev = ["pytest==8.3.5"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.setuptools]
+packages = ["api", "registry", "server", "server.routes", "services", "workflows"]
+py-modules = ["cli", "scheduler"]

@@ -79,6 +79,14 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     simulation_only: true,
     logistics_sync_time: '08:30',
     real_purchase_available: false,
+    file_admission: {
+      approved_values: ['通过'],
+      rejected_values: ['拒绝', '建议拒绝', '钓鱼'],
+      purchaser_values: [],
+      skip_purchase_status_values: ['已拍单', '拿回'],
+      cancel_after_sale_values: ['已取消'],
+      import_historical: true,
+    },
   }
 
   // ── 设备与账号 ──────────────────────────────────────────────────────────────
@@ -493,19 +501,23 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       resolution: null,
     }
     if (la.status === 'succeeded') {
+      // 形状同 services/guard.evaluate：checks 以检查名为键，ok 为 true / false / null
       base.guard_verdict = {
         verdict: 'pass',
         code: null,
         reasons: [],
-        checks: [
-          { name: 'item', ok: true, detail: `${r.asin_eff} × ${r.quantity_eff}` },
-          { name: 'zip', ok: true, detail: `${r.postal_code} 前 5 位一致` },
-          { name: 'subtotal_range', ok: true, detail: `${r.subtotal_eff} 在账号区间内` },
-          { name: 'price_cap', ok: true, detail: `$${la.total} ≤ $${r.price_cap_eff}` },
-          { name: 'delivery', ok: true, detail: '4 天 ≤ 10 天' },
-          { name: 'card', ok: true, detail: '卡尾号 1234' },
-          { name: 'fulfillment', detail: 'amazon' },
-        ],
+        checks: {
+          item: { ok: true, expected: { asin: r.asin_eff, quantity: r.quantity_eff }, actual: { asin: r.asin_eff, quantity: r.quantity_eff } },
+          zip: { ok: true, expected: r.postal_code, actual: r.postal_code },
+          subtotal: { ok: true, expected: { min: '20.00', max: '50.00' }, actual: r.subtotal_eff },
+          price_cap: { ok: true, expected: r.price_cap_eff, actual: la.total },
+          delivery: { ok: true, expected: 10, actual: 4 },
+          data: { ok: true, expected: 'USD；小计、总额可解析；配送天数可得', actual: [] },
+          card: { ok: true, expected: '1234', actual: '1234' },
+        },
+        delivery_days: 4,
+        total_for_cap: la.total,
+        fulfillment: 'amazon',
       }
     }
     if (la.error_code === 'PRICE_OVER_CAP') {
@@ -513,16 +525,19 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       base.guard_verdict = {
         verdict: 'block',
         code: 'PRICE_OVER_CAP',
-        reasons: ['结算总额 $52.00 超过有效限价 $50.00'],
-        checks: [
-          { name: 'item', ok: true, detail: `${r.asin_eff} × 1` },
-          { name: 'zip', ok: true, detail: `${r.postal_code} 前 5 位一致` },
-          { name: 'subtotal_range', ok: true, detail: '$48.00 在 $20.00–$50.00 内' },
-          { name: 'price_cap', ok: false, detail: '$52.00 > $50.00' },
-          { name: 'delivery', ok: true, detail: '5 天 ≤ 7 天' },
-          { name: 'data', ok: true, detail: '金额与配送日期可解析，币种 USD' },
-          { name: 'fulfillment', detail: 'amazon' },
-        ],
+        reasons: ['结算总额 $52.00 超过限价 $50.00'],
+        checks: {
+          item: { ok: true, expected: { asin: r.asin_eff, quantity: 1 }, actual: { asin: r.asin_eff, quantity: 1 } },
+          zip: { ok: true, expected: r.postal_code, actual: r.postal_code },
+          subtotal: { ok: true, expected: { min: '20.00', max: '50.00' }, actual: '48.00' },
+          price_cap: { ok: false, expected: '50.00', actual: '52.00' },
+          delivery: { ok: true, expected: 7, actual: 5 },
+          data: { ok: true, expected: 'USD；小计、总额可解析；配送天数可得', actual: [] },
+          card: { ok: true, expected: null, actual: '1234' },
+        },
+        delivery_days: 5,
+        total_for_cap: '52.00',
+        fulfillment: 'amazon',
       }
       base.shipping = '0.00'
       base.tax = '4.00'
@@ -581,12 +596,14 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       kind,
       detail,
     })
-    const list: EventRecord[] = [ev(r.id * 10 + 1, 60 * 30, 'created', 'source', '订单中心 · 采购订单（DEMO）', { from: null, to: 'queued' })]
-    if (r.assigned_account) list.push(ev(r.id * 10 + 2, 60 * 29, 'assigned', 'system', null, { account_name: r.assigned_account.name, reason: r.assignment_note }))
-    if (r.has_override) list.push(ev(r.id * 10 + 3, 60 * 4, 'override_set', 'user', 'DEMO 所有者', { note: '上游限价与结算口径不一致，按 $50.00 执行' }))
-    if (r.latest_attempt) list.push(ev(r.id * 10 + 4, 60, 'attempt_claimed', 'device', 'Mac-AdsPower-DEMO-01', { attempt_id: r.latest_attempt.id }))
-    if (r.status === 'exception') list.push(ev(r.id * 10 + 5, 40, 'guard_blocked', 'system', null, { from: 'executing', to: 'exception', reason: r.status_reason }))
-    if (r.status === 'conflict') list.push(ev(r.id * 10 + 6, 30, 'conflict', 'source', '文件 orders-demo-1105.xlsx', { reason: r.status_reason }))
+    // kind 与服务端 events.record 的取值一致（order.* / attempt.*）；操作者名由服务端按用户或设备填 actor_name
+    const list: EventRecord[] = [ev(r.id * 10 + 1, 60 * 30, 'order.created', 'source', null, { from: null, to: 'queued' })]
+    if (r.assigned_account) list.push(ev(r.id * 10 + 2, 60 * 29, 'order.assigned', 'system', null, { account_name: r.assigned_account.name, reason: r.assignment_note, kind: 'auto' }))
+    if (r.has_override) list.push(ev(r.id * 10 + 3, 60 * 4, 'order.override_set', 'user', 'DEMO 所有者', { note: '上游限价与结算口径不一致，按 $50.00 执行' }))
+    if (r.latest_attempt) list.push(ev(r.id * 10 + 4, 60, 'attempt.claimed', 'device', 'Mac-AdsPower-DEMO-01', { attempt_id: r.latest_attempt.id }))
+    if (r.status === 'exception') list.push(ev(r.id * 10 + 5, 40, 'order.status_changed', 'device', 'Mac-AdsPower-DEMO-01', { from: 'executing', to: 'exception', reason: r.status_reason }))
+    if (r.status === 'conflict') list.push(ev(r.id * 10 + 6, 30, 'order.source_conflict', 'source', null, { reason: r.status_reason }))
+    if (r.needs_attention) list.push(ev(r.id * 10 + 7, 20, 'order.upstream_changed_after_start', 'source', null, { note: r.attention_note }))
     return list.reverse()
   }
 
@@ -602,7 +619,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
             batch_id: null,
             row_no: null,
             filename: null,
-            is_writeback_target: true,
+            // 文件为主的任务不自动写回飞书，需人工把飞书记录设为回填目标（v1 §6.2）
+            is_writeback_target: r.primary_source_kind === 'feishu',
             first_seen_at: ago(60 * 30),
             last_seen_at: ago(12),
             snapshot: {
@@ -677,7 +695,11 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       sources,
       attempts: attemptsFor(r),
       events: eventsFor(r),
-      allowed_actions: ACTIONS[r.status],
+      allowed_actions: [
+        ...ACTIONS[r.status],
+        ...(r.needs_attention ? (['clear_attention'] as OrderAction[]) : []),
+        ...(r.primary_source_kind !== 'feishu' && r.source_kinds.includes('feishu') ? (['set_writeback_target'] as OrderAction[]) : []),
+      ],
     }
   }
 
@@ -726,7 +748,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       source_table_id: 'tblDEMOsource01',
       source_view_id: 'vewDEMO0001',
       result_table_id: 'tblDEMOsource01',
-      field_map: { upstream_order_no: '平台订单号', asin: 'ASIN', quantity: '数量', price_cap: '限价', review_value: '人工审核' },
+      // 多个候选列按顺序回退（services/feishu_fields.DEFAULT_FIELD_MAP）
+      field_map: { upstream_order_no: '平台订单号', asin: ['ASIN', '来源码'], quantity: ['数量', '数量1'], price_cap: '限价', review_value: '人工审核' },
       admission: {
         approved_values: ['通过'],
         rejected_values: ['拒绝', '建议拒绝', '钓鱼'],
@@ -864,7 +887,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
   ]
   const feishuFields: FeishuFieldsResult = {
     fields: fieldNames.map(([n, type, ui, writable], i) => ({ field_id: `fldDEMO${String(i).padStart(4, '0')}`, field_name: n, type, ui_type: ui, is_primary: i === 0, writable })),
-    suggested_field_map: { upstream_order_no: '平台订单号', asin: 'ASIN', quantity: '数量', unit_price: '采购单价', price_cap: '限价', order_time: '下单时间', suggested_purchase_date: '建议采购日期', review_value: '人工审核', purchaser: '采购方', purchase_status_value: '采购状态', recipient_name: '收货人姓名', postal_code: '邮编' },
+    suggested_field_map: { upstream_order_no: '平台订单号', asin: ['ASIN', '来源码'], quantity: ['数量', '数量1'], unit_price: '采购单价', price_cap: '限价', order_time: '下单时间', suggested_purchase_date: '建议采购日期', review_value: '人工审核', purchaser: '采购方', purchase_status_value: '采购状态', recipient_name: '收货人姓名', postal_code: '邮编' },
     suggested_writeback_map: { buyer_account: '买家号', amazon_order_no: 'AMZ订单号', purchase_status: '采购状态', total_before_tax: '税前总额USD' },
   }
 
@@ -963,6 +986,19 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       uploaded_by_name: 'DEMO 所有者',
     },
     {
+      // 上传后没有提交也没有放弃：批次列表里可以「继续」或「放弃」
+      id: 43,
+      filename: 'orders-demo-draft.xlsx',
+      sheet_name: '采购订单',
+      status: 'uploaded',
+      stats: null,
+      mapping: { 平台订单号: 'upstream_order_no', ASIN: 'asin', 数量: 'quantity', 限价: 'price_cap', 备注: null },
+      size: 18_240,
+      created_at: ago(30),
+      committed_at: null,
+      uploaded_by_name: 'DEMO 所有者',
+    },
+    {
       id: 40,
       filename: 'orders-demo-1104.csv',
       sheet_name: null,
@@ -1018,6 +1054,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     suggested_mapping: suggested,
     system_fields: systemFields.source_fields,
     templates: templates.map((t) => ({ id: t.id, name: t.name })),
+    matched_template_id: null,
+    previous_upload: { id: 41, status: 'committed', created_at: ago(60 * 5) },
   }
 
   const verdicts: ImportRow['verdict'][] = ['new', 'new', 'update', 'new', 'unchanged', 'historical', 'invalid', 'new', 'conflict', 'new']
@@ -1034,6 +1072,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
             : i === 7
               ? ['缺少收货人电话 → 资料待补齐']
               : [],
+    reason: v === 'invalid' ? '与第 2 行的平台订单号重复，同一批次只导入第一行' : v === 'historical' ? '带 AMZ 订单号，按历史采购登记' : null,
+    status: v === 'invalid' ? null : v === 'historical' ? 'purchased' : i === 3 ? 'pending_review' : i === 7 ? 'needs_info' : 'queued',
     upstream_order_no: `PO-DEMO-${20261200 + (v === 'invalid' ? 1 : i + 1)}-SKU${String(i + 1).padStart(2, '0')}`,
     normalized: { asin: `B0DEMO${String(200 + i).padStart(4, '0')}`, quantity: 1 + (i % 2), price_cap: (25 + i * 3.5).toFixed(2) },
     raw: { 平台订单号: `PO-DEMO-${20261200 + i + 1}`, 数量: String(1 + (i % 2)) },

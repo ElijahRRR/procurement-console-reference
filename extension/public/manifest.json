@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "采购控制台的浏览器插件：配对、心跳、亚马逊登录身份识别与模拟执行。本版本不产生真实订单。",
   "minimum_chrome_version": "103",
-  "permissions": ["storage", "alarms", "tabs"],
+  "permissions": ["storage", "alarms"],
   "host_permissions": [
     "https://www.amazon.com/*",
     "http://127.0.0.1/*",

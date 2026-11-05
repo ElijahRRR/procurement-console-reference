@@ -1,5 +1,8 @@
 <script setup lang="ts">
-/** 统计卡（.stat-card）：图标框 + 标签 + 数值 + 可选趋势 / 说明。点击时触发 click（可用于跳转）。 */
+/**
+ * 统计卡（.stat-card）：图标框 + 标签 + 数值 + 可选趋势 / 说明。点击时触发 click（可用于跳转）。
+ * 涨跌趋势（hintTone 为 up / down）紧跟数值；说明文字（muted）放在数值下方，可换行，不截断。
+ */
 import { computed } from 'vue'
 import AppIcon, { type IconName } from './AppIcon.vue'
 
@@ -47,8 +50,9 @@ const hintClass = computed(() => HINT_CLASS[props.hintTone])
       <p class="stat-label truncate">{{ label }}</p>
       <div class="mt-1 flex items-baseline gap-2">
         <p class="stat-value">{{ value }}</p>
-        <span v-if="hint" :class="hintClass" class="truncate">{{ hint }}</span>
+        <span v-if="hint && hintTone !== 'muted'" :class="hintClass" class="truncate">{{ hint }}</span>
       </div>
+      <p v-if="hint && hintTone === 'muted'" class="mt-1 text-xs leading-5 text-gray-500 dark:text-dark-400">{{ hint }}</p>
     </div>
   </div>
 </template>

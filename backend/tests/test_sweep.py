@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -106,20 +107,81 @@ def test_submitted_then_lease_expiry_is_unknown_paused_and_not_reclaimable(conn,
     assert f.count(conn, "purchase_attempts", "purchase_order_id = %s", (order["id"],)) == 1
 
 
-def test_late_result_after_sweep_is_conflict_not_success(conn, env):
+def test_late_result_after_sweep_is_recorded_not_applied(conn, env):
+    """清扫后才送到的成功回执（v1 §4「插件与服务端均保存必要的结果回执」）：不改状态、不恢复账号、不自动核实，
+    但回执（单号、金额）记在尝试与事件里，供人工核实时参考；同样的回执再送一次不重复记录。"""
     order = fx.assigned_order(conn, env["ws"], env["acc"])
     run_id = fx.start(conn, env["dev"])
     a = fx.claim(conn, env["dev"], run_id)
     fx.to_submitted(conn, env["dev"], a)
     clock.freeze(LATER)
     execution.sweep(conn)
-    with pytest.raises(DomainError) as e:
-        execution.report_result(conn, env["dev"], a["attempt_id"], fx.success_payload(a))
-    assert e.value.code == "CONFLICT"
-    assert fx.order_row(conn, order["id"])["status"] == "result_unknown"
+    no = fx.sim_order_no(a)
+    res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.success_payload(a))
+    assert res["late_receipt"] is True and res["attempt_status"] == "unknown"
+    assert res["order_status"] == "result_unknown" and "迟到" in res["message"]
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["status"] == "unknown" and att["amazon_order_no"] == no and att["total"] == Decimal("26.50")
+    o = fx.order_row(conn, order["id"])
+    assert o["status"] == "result_unknown" and o["current_attempt_id"] == a["attempt_id"]
+    assert no in o["status_reason"] and o["needs_attention"] is True and no in o["attention_note"]
+    assert fx.account_row(conn, env["acc"]["id"])["execution_paused"] is True
+    ev = conn.execute("SELECT detail FROM procure.events WHERE kind = 'attempt.late_result'").fetchall()
+    assert len(ev) == 1 and ev[0]["detail"]["amazon_order_no"] == no and ev[0]["detail"]["outcome"] == "succeeded"
+    assert ev[0]["detail"]["amounts"]["total"] == "26.50"
+    # 插件补交同一份回执：照样回 late_receipt，不重复记录
+    again = execution.report_result(conn, env["dev"], a["attempt_id"], fx.success_payload(a))
+    assert again["late_receipt"] is True
+    assert f.count(conn, "events", "kind = 'attempt.late_result'") == 1
     # 同样是「结果不明」的迟到上报：与已登记的一致，原样返回
     res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload(None, outcome="unknown"))
     assert res["duplicate"] is True
+    # 人工据回执核实已下单
+    from services import orders
+    detail = orders.resolve_unknown(conn, env["ws"], order["id"], "ordered", amazon_order_no=no,
+                                    actor_user_id=env["uid"])
+    assert detail["status"] == "purchased"
+
+
+def test_late_success_after_lease_expiry_before_sweep_is_accepted(conn, env):
+    """已登记提交、租约过期但还没被清扫：成功回执照常接收（不是 LEASE_LOST），任务已采购、账号不暂停。"""
+    order = fx.assigned_order(conn, env["ws"], env["acc"])
+    run_id = fx.start(conn, env["dev"])
+    a = fx.claim(conn, env["dev"], run_id)
+    fx.to_submitted(conn, env["dev"], a)
+    clock.freeze(LATER)
+    res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.success_payload(a))
+    assert res == {"attempt_status": "succeeded", "order_status": "purchased"}
+    assert fx.order_row(conn, order["id"])["purchased_attempt_id"] == a["attempt_id"]
+    out = execution.sweep(conn)
+    assert out["expired_runs"] == [run_id] and out["unknown"] == 0 and out["aborted"] == 0
+    assert fx.account_row(conn, env["acc"]["id"])["execution_paused"] is False
+
+
+def test_late_failure_after_lease_expiry_before_submit_is_lease_lost(conn, env):
+    """未登记提交的尝试：租约过期后的结果照旧拒绝（LEASE_LOST），由清扫中止、任务回已分配。"""
+    order = fx.assigned_order(conn, env["ws"], env["acc"])
+    run_id = fx.start(conn, env["dev"])
+    a = fx.claim(conn, env["dev"], run_id)
+    clock.freeze(LATER)
+    with pytest.raises(DomainError) as e:
+        execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload("OUT_OF_STOCK"))
+    assert e.value.code == "LEASE_LOST"
+    execution.sweep(conn)
+    assert fx.order_row(conn, order["id"])["status"] == "assigned"
+
+
+def test_late_result_for_aborted_attempt_is_still_conflict(conn, env):
+    fx.assigned_order(conn, env["ws"], env["acc"])
+    run_id = fx.start(conn, env["dev"])
+    a = fx.claim(conn, env["dev"], run_id)
+    clock.freeze(LATER)
+    execution.sweep(conn)
+    assert fx.attempt_row(conn, a["attempt_id"])["status"] == "aborted"
+    with pytest.raises(DomainError) as e:
+        execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload("OUT_OF_STOCK"))
+    assert e.value.code == "CONFLICT"
+    assert f.count(conn, "events", "kind = 'attempt.late_result'") == 0
 
 
 def test_heartbeat_keeps_lease_alive(conn, env):

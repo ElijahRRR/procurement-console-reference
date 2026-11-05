@@ -140,6 +140,11 @@ def test_success_without_submit_registration_is_treated_as_possibly_ordered(conn
     fx.failure_payload("PAGE_LOAD_FAILED"),
     fx.failure_payload(None, "DEMO 不明", outcome="unknown"),
     fx.failure_payload("ABORTED_BY_USER"),
+    fx.failure_payload("GUARD_BLOCKED"),
+    fx.failure_payload("SUBMIT_REJECTED"),
+    fx.failure_payload("PLUGIN_SIMULATION_ONLY"),
+    fx.failure_payload("CAPTCHA_ENCOUNTERED"),
+    fx.failure_payload("SOMETHING_NEW"),
 ])
 def test_any_non_success_after_submit_is_unknown_and_never_released(conn, env, calls, payload):
     """提交后断线 / 失败：进入结果待核实、暂停账号，不重买；额度不释放。"""
@@ -199,7 +204,7 @@ def test_page_load_failed_retried_once_then_exception(conn, env, calls):
 
 
 @pytest.mark.parametrize("code", ["LOGIN_REQUIRED", "ACCOUNT_RESTRICTED", "CARD_DECLINED", "CAPTCHA_ENCOUNTERED",
-                                  "IDENTITY_MISMATCH"])
+                                  "IDENTITY_MISMATCH", "PLUGIN_SIMULATION_ONLY"])
 def test_account_level_codes_pause_account_and_keep_task_assigned(conn, env, calls, code):
     order, a = _claimed(conn, env)
     res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload(code, "DEMO"))
@@ -216,7 +221,7 @@ def test_account_level_codes_pause_account_and_keep_task_assigned(conn, env, cal
 
 
 @pytest.mark.parametrize("code", ["OUT_OF_STOCK", "QUANTITY_UNAVAILABLE", "ADDRESS_FAILED", "CART_MISMATCH",
-                                  "PRICE_OVER_CAP", "SOMETHING_NEW"])
+                                  "PRICE_OVER_CAP", "GUARD_BLOCKED", "SUBMIT_REJECTED", "SOMETHING_NEW"])
 def test_task_level_codes_go_exception_and_run_continues(conn, env, calls, code):
     order, a = _claimed(conn, env)
     second = fx.assigned_order(conn, env["ws"], env["acc"])
@@ -242,6 +247,46 @@ def test_invalid_result_payload(conn, env, calls):
     assert _err(execution.report_result, conn, env["dev"], a["attempt_id"], {"outcome": "great"}).code == "VALIDATION"
     assert _err(execution.report_result, conn, env["dev"], a["attempt_id"], "ok").code == "VALIDATION"
     assert fx.attempt_row(conn, a["attempt_id"])["status"] == "claimed"
+
+
+def test_absurd_result_amounts_are_unreadable_not_errors(conn, env, calls):
+    """位数大到放不进金额列的金额：按读不出（None）处理，不报 500，也不当 0。"""
+    order, a = _claimed(conn, env)
+    fx.to_submitted(conn, env["dev"], a)
+    body = fx.success_payload(a, amounts={"subtotal": "9" * 30, "shipping": 1e300, "tax": "99999999999.00",
+                                          "total_before_tax": "25.00", "total": "26.50"})
+    assert execution.report_result(conn, env["dev"], a["attempt_id"], body)["attempt_status"] == "succeeded"
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["subtotal"] is None and att["shipping"] is None and att["tax"] is None
+    assert att["total"] == Decimal("26.50")
+
+
+def test_unrecognised_failure_code_without_detail_is_task_level(conn, env, calls):
+    order, a = _claimed(conn, env)
+    res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload("brand_new_code"))
+    assert res == {"attempt_status": "failed", "order_status": "exception"}
+    o = fx.order_row(conn, order["id"])
+    assert o["status_reason"] == "插件上报失败（BRAND_NEW_CODE）"
+    assert fx.attempt_row(conn, a["attempt_id"])["error_code"] == "BRAND_NEW_CODE"
+    assert not _paused(conn, env)
+
+
+@pytest.mark.parametrize("code,zh", [("GUARD_BLOCKED", "护栏拦截"), ("SUBMIT_REJECTED", "服务端拒绝了提交登记")])
+def test_plugin_side_guard_and_submit_codes_go_exception_with_label(conn, env, calls, code, zh):
+    order, a = _claimed(conn, env)
+    execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload(code))
+    o = fx.order_row(conn, order["id"])
+    assert o["status"] == "exception" and o["status_reason"] == zh
+    assert fx.attempt_row(conn, a["attempt_id"])["status"] == "failed" and not _paused(conn, env)
+
+
+def test_plugin_simulation_only_pauses_account_and_keeps_task(conn, env, calls):
+    order, a = _claimed(conn, env)
+    res = execution.report_result(conn, env["dev"], a["attempt_id"],
+                                  fx.failure_payload("PLUGIN_SIMULATION_ONLY", "插件当前只做模拟执行"))
+    assert res == {"attempt_status": "failed", "order_status": "assigned"}
+    acc = fx.account_row(conn, env["acc"]["id"])
+    assert acc["execution_paused"] is True and acc["pause_reason"] == "插件只执行模拟任务，却领到了真实任务"
 
 
 # ── 幂等 ──────────────────────────────────────────────────────────────────────

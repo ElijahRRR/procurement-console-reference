@@ -63,7 +63,9 @@ function fieldsText(f: Record<string, unknown>): string {
 <template>
   <div>
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-      <el-segmented v-model="status" :options="options" />
+      <div class="pc-segmented-scroll">
+        <el-segmented v-model="status" :options="options" />
+      </div>
       <el-button @click="load"><AppIcon name="refresh" size="sm" class="mr-1.5" />刷新</el-button>
     </div>
     <el-card class="eq-table-card" shadow="always">

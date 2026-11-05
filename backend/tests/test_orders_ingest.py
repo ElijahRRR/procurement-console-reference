@@ -71,14 +71,21 @@ def test_file_only_workspace_works_without_feishu(conn, workspace):
     assert listed["total"] == 1 and listed["rows"][0]["source_kinds"] == ["file"]
 
 
-def test_first_feishu_source_becomes_writeback_target(conn, workspace):
+def test_first_feishu_source_becomes_writeback_target_only_for_feishu_primary_tasks(conn, workspace):
+    """v1 §6.2：文件为主的任务不自动写回飞书——后来出现的同键飞书记录只追加关联；飞书为主的任务第一个飞书来源是目标。"""
     ws = workspace["id"]
     rec = f.make_record(upstream_order_no="PO-DEMO-WB-1")
     out = orders.ingest(conn, ws, rec, f.file_source(conn, ws, 2))
     orders.ingest(conn, ws, rec, f.feishu_source(conn, ws, "recDEMOWB1"))
     srcs = conn.execute("SELECT kind, is_writeback_target FROM procure.order_sources WHERE purchase_order_id = %s "
                         "ORDER BY id", (out.order_id,)).fetchall()
-    assert [(s["kind"], s["is_writeback_target"]) for s in srcs] == [("file", False), ("feishu", True)]
+    assert [(s["kind"], s["is_writeback_target"]) for s in srcs] == [("file", False), ("feishu", False)]
+    rec2 = f.make_record(upstream_order_no="PO-DEMO-WB-2")
+    out2 = orders.ingest(conn, ws, rec2, f.feishu_source(conn, ws, "recDEMOWB2"))
+    orders.ingest(conn, ws, rec2, f.file_source(conn, ws, 3))
+    srcs2 = conn.execute("SELECT kind, is_writeback_target FROM procure.order_sources WHERE purchase_order_id = %s "
+                         "ORDER BY id", (out2.order_id,)).fetchall()
+    assert [(s["kind"], s["is_writeback_target"]) for s in srcs2] == [("feishu", True), ("file", False)]
 
 
 def test_feishu_then_file_same_key_is_one_task(conn, workspace):
@@ -162,7 +169,7 @@ def test_missing_fields_go_to_needs_info_and_null_is_not_zero(conn, workspace):
                         f.file_source(conn, ws, 2))
     row = orders.get_row(conn, ws, out.order_id)
     assert row["status"] == "needs_info"
-    assert row["missing_fields"] == ["采购单价", "限价", "收货人电话"]
+    assert row["missing_fields"] == ["unit_price", "price_cap", "phone"]   # 字段键，不是中文名
     assert row["price_cap"] is None and row["unit_price"] is None
 
 
@@ -258,7 +265,7 @@ def test_missing_order_time_or_ship_days_means_needs_info(conn, workspace):
     ws = workspace["id"]
     rec = f.make_record(order_time=None, ship_days=4, suggested_purchase_date=None)
     row = orders.get_row(conn, ws, orders.ingest(conn, ws, rec, f.file_source(conn, ws, 2)).order_id)
-    assert row["status"] == "needs_info" and "建议采购日期" in row["missing_fields"]
+    assert row["status"] == "needs_info" and "suggested_purchase_date" in row["missing_fields"]
 
 
 def test_ship_days_change_recomputes_suggested_date(conn, workspace):

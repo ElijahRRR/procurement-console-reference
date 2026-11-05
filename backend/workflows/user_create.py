@@ -1,4 +1,7 @@
-"""建控制台用户：python cli.py user_create -p username=demo -p password=*** [-p workspace="工作区名" | -p workspace_id=1]。"""
+"""建控制台用户：python cli.py user_create -p username=demo [-p workspace="工作区名" | -p workspace_id=1]。
+
+密码不要写在命令行里（会留在 shell 历史与进程列表）：cli.py 在没给 password 时交互输入两次（标准输入不是终端时读第一行）。新建的工作区要用飞书表格时，由部署所有者用 python cli.py feishu_grant 授权。
+"""
 
 from __future__ import annotations
 

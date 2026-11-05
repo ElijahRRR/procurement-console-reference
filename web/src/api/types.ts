@@ -130,6 +130,8 @@ export const ORDER_ACTIONS = [
   'mark_amazon_cancelled',
   'repurchase',
   'resolve_conflict',
+  'clear_attention',
+  'set_writeback_target',
 ] as const
 export type OrderAction = (typeof ORDER_ACTIONS)[number]
 
@@ -142,6 +144,7 @@ export const GUARD_CODES = [
   'DELIVERY_TOO_LONG',
   'DATA_UNRELIABLE',
   'CARD_MISMATCH',
+  'GUARD_BLOCKED',
 ] as const
 export type GuardCode = (typeof GUARD_CODES)[number]
 
@@ -160,6 +163,8 @@ export const PLUGIN_ERROR_CODES = [
   'IDENTITY_MISMATCH',
   'ABORTED_UPSTREAM_CANCELLED',
   'ABORTED_BY_USER',
+  'SUBMIT_REJECTED',
+  'PLUGIN_SIMULATION_ONLY',
 ] as const
 export type PluginErrorCode = (typeof PLUGIN_ERROR_CODES)[number]
 
@@ -329,27 +334,29 @@ export interface OrderSource {
   snapshot: Record<string, unknown>
 }
 
-/** 护栏单项结果：后端可能用数组或对象表示，前端经 utils/guard.normalizeGuardChecks 统一 */
+/** 护栏检查项（services/guard.CHECK_ORDER 的顺序） */
+export const GUARD_CHECK_KEYS = ['item', 'zip', 'subtotal', 'price_cap', 'delivery', 'data', 'card'] as const
+export type GuardCheckKey = (typeof GUARD_CHECK_KEYS)[number]
+
+/** 护栏单项结果（services/guard.evaluate）：ok 为 true 通过 / false 不通过 / null 缺数据无法判定 */
 export interface GuardCheck {
-  name?: string
-  key?: string
-  check?: string
-  code?: string | null
-  ok?: boolean
-  passed?: boolean
-  pass?: boolean
-  detail?: string | null
-  reason?: string | null
-  message?: string | null
-  expected?: unknown
-  actual?: unknown
+  ok: boolean | null
+  expected: unknown
+  actual: unknown
 }
 
+/** 尝试的 guard_verdict（services/guard.evaluate 的完整输出） */
 export interface GuardVerdict {
   verdict: 'pass' | 'block'
   code: string | null
   reasons: string[]
-  checks?: GuardCheck[] | Record<string, GuardCheck | boolean>
+  checks?: Partial<Record<GuardCheckKey, GuardCheck>> & Record<string, GuardCheck>
+  /** 判定用的配送天数（无法得出为 null） */
+  delivery_days?: number | null
+  /** 与限价比较的金额（结算总额 + 礼品卡抵扣） */
+  total_for_cap?: Money
+  /** 配送方式（只记录，不拦截） */
+  fulfillment?: string | null
 }
 
 export interface Attempt {
@@ -411,17 +418,34 @@ export interface OrderDetail extends OrderRow {
   override: OrderOverride | null
   address: Address
   conflict: OrderConflict | null
+  upstream_cancelled?: boolean
+  upstream_cancel_note?: string | null
+  review_source?: ReviewSource | null
+  order_date_bj?: DateStr | null
+  result_version?: number
   sources: OrderSource[]
   attempts: Attempt[]
+  /** 最近的事件（新的在前，最多 ORDER_DETAIL_EVENT_LIMIT 条；更早的用 GET /events?order_id= 分页读） */
   events: EventRecord[]
   allowed_actions: OrderAction[]
 }
+
+/** 任务详情里随附的事件条数上限（services/orders.get_detail） */
+export const ORDER_DETAIL_EVENT_LIMIT = 200
 
 export interface OrderQuery extends PageQuery {
   view?: OrderView
   q?: string
   account_id?: number
   source?: SourceKind
+  /** true 只看需要留意的任务，false 只看不需要的；不给 = 不限 */
+  needs_attention?: boolean
+}
+
+/** POST /orders/bulk-review 的结果：已处理的任务 id 与跳过的任务（含原因） */
+export interface BulkReviewResult {
+  updated: number[]
+  skipped: { id: number; reason: string }[]
 }
 
 export interface ResolveUnknownAmounts {
@@ -563,13 +587,29 @@ export interface Settings {
   simulation_only: boolean
   logistics_sync_time: string
   real_purchase_available: boolean
+  /** 文件导入用的完整准入规则（缺省值 + 工作区改过的项；文件预览不另传规则时就用它） */
+  file_admission?: FeishuAdmission
 }
 
+/** PATCH /settings 的请求体（file_admission 给出的项覆盖缺省，null = 全部恢复缺省） */
+export interface SettingsPatch {
+  default_max_delivery_days?: number
+  logistics_sync_time?: string
+  file_admission?: Partial<FeishuAdmission> | null
+}
+
+/** POST /simulation/reset 的结果（services/simulation.reset） */
 export interface SimulationResetResult {
-  attempts?: number
-  orders?: number
-  accounts?: number
-  [k: string]: unknown
+  /** 结束的模拟执行批次 id */
+  runs_ended: number[]
+  /** 标为已中止的模拟尝试条数 */
+  attempts_reset: number
+  /** 回到采购开始前状态的任务 id */
+  orders_restored: number[]
+  /** 没能还原的任务与原因 */
+  orders_skipped: { order_id: number; reason: string }[]
+  /** 恢复执行的账号 id */
+  accounts_resumed: number[]
 }
 
 // ── 飞书 ──────────────────────────────────────────────────────────────────────
@@ -595,7 +635,7 @@ export interface FeishuConnection {
   source_table_id: string
   source_view_id: string | null
   result_table_id: string
-  field_map: Record<string, string>
+  field_map: FeishuFieldMap
   admission: Partial<FeishuAdmission>
   writeback_map: Record<string, string>
   writeback_enabled: boolean
@@ -612,6 +652,12 @@ export interface FeishuConnection {
   updated_at: Timestamp
 }
 
+/**
+ * 飞书字段对应 {系统字段: 列名 | [候选列名]}：给列表时按顺序回退（前一列为空才读下一列），
+ * 如 asin: ['ASIN', '来源码']（services/feishu_fields.DEFAULT_FIELD_MAP）。
+ */
+export type FeishuFieldMap = Record<string, string | string[]>
+
 export interface FeishuConnectionInput {
   name?: string
   link?: string
@@ -619,7 +665,7 @@ export interface FeishuConnectionInput {
   source_table_id?: string
   source_view_id?: string | null
   result_table_id?: string
-  field_map?: Record<string, string>
+  field_map?: FeishuFieldMap
   admission?: Partial<FeishuAdmission>
   writeback_map?: Record<string, string>
   writeback_enabled?: boolean
@@ -650,7 +696,7 @@ export interface FeishuField {
 
 export interface FeishuFieldsResult {
   fields: FeishuField[]
-  suggested_field_map: Record<string, string>
+  suggested_field_map: FeishuFieldMap
   suggested_writeback_map: Record<string, string>
 }
 
@@ -682,7 +728,7 @@ export interface FeishuPreviewInput {
   app_token: string
   table_id: string
   view_id: string | null
-  field_map: Record<string, string>
+  field_map: FeishuFieldMap
   admission: Partial<FeishuAdmission>
   limit: number
 }
@@ -696,6 +742,54 @@ export interface SyncRun {
   ok: boolean | null
   stats: Record<string, number> | null
   error: string | null
+}
+
+/** 读取中有问题的记录样本（跳过、无效、待核实） */
+export interface SyncProblem {
+  record_id: string
+  upstream_order_no: string | null
+  verdict: FeishuVerdict
+  reason: string | null
+}
+
+/** POST /feishu/connections/{id}/sync 的结果（services/feishu_intake.run_connection） */
+export interface FeishuSyncResult {
+  read: number
+  new: number
+  update: number
+  unchanged: number
+  conflict: number
+  historical: number
+  skipped: number
+  invalid: number
+  run_id: number
+  problems: SyncProblem[]
+  /** 有新单、更新、待核实或历史时随后分配一次的摘要；没有分配为 null */
+  allocation: AllocationSummary | null
+}
+
+/** 写回验收中读回值与写入值不一致的列 */
+export interface WritebackMismatch {
+  result_field: string | null
+  column: string
+  expected: unknown
+  actual: unknown
+}
+
+/** POST /feishu/connections/{id}/verify-writeback 的结果（services/feishu_connections.verify_writeback） */
+export interface VerifyWritebackResult {
+  /** 全部一致才为 true（此时记下 writeback_verified_at） */
+  ok: boolean
+  mismatches: WritebackMismatch[]
+  /** 写入的测试值 {列名: 值} */
+  written: Record<string, unknown>
+  /** 测试记录的原值是否已写回 */
+  restored: boolean
+  /** 恢复原值时飞书的报错 */
+  restore_error: string | null
+  /** 写入 / 读回时飞书的报错 */
+  error: string | null
+  connection: FeishuConnection
 }
 
 // ── 写回 ──────────────────────────────────────────────────────────────────────
@@ -721,7 +815,8 @@ export interface Writeback {
 
 export interface ImportSheet {
   name: string
-  row_count: number
+  /** 数据行数（从批次列表继续导入时可能不知道，为 null） */
+  row_count: number | null
   headers: string[]
 }
 
@@ -735,6 +830,13 @@ export interface ImportTemplate extends ImportTemplateRef {
   created_at?: Timestamp
 }
 
+/** 同一工作区里内容完全相同的最近一次上传（未放弃的） */
+export interface PreviousUpload {
+  id: number
+  status: BatchStatus
+  created_at: Timestamp
+}
+
 export interface UploadResult {
   batch_id: number
   filename: string
@@ -744,6 +846,10 @@ export interface UploadResult {
   suggested_mapping: Record<string, string | null>
   system_fields: SystemField[]
   templates: ImportTemplateRef[]
+  /** 表头覆盖了模板全部对应列的个人模板（对应列最多的那个），没有为 null */
+  matched_template_id?: number | null
+  /** 这个文件已经上传过时的那次批次，没有为 null */
+  previous_upload?: PreviousUpload | null
 }
 
 export interface BatchStats {
@@ -764,6 +870,10 @@ export interface ImportBatch {
   sheet_name: string | null
   status: BatchStatus
   stats: Partial<BatchStats> | null
+  /** 最近一次（建议或预览时）用的字段对应 {表头: 系统字段 | null}，键为该工作表的全部表头 */
+  mapping?: Record<string, string | null> | null
+  /** 原文件字节数（已放弃的批次为 0） */
+  size?: number | null
   created_at: Timestamp
   committed_at: Timestamp | null
   uploaded_by_name: string | null
@@ -772,14 +882,31 @@ export interface ImportBatch {
 export interface ImportRow {
   row_no: number
   verdict: ImportVerdict
+  verdict_zh?: string | null
   issues: string[]
+  /** 结论原因（如「与第 3 行的平台订单号重复」） */
+  reason?: string | null
+  /** 预计（提交后为实际）任务状态 */
+  status?: OrderStatus | null
+  suggested_purchase_date?: DateStr | null
+  suggested_date_basis?: SuggestedDateBasis | null
   upstream_order_no: string | null
   normalized: Record<string, unknown> | null
   raw: Record<string, unknown>
+  purchase_order_id?: number | null
 }
 
 export interface ImportPreview {
   batch: ImportBatch
   stats: Partial<BatchStats>
   rows: Page<ImportRow>
+}
+
+/** POST /imports/{id}/commit 的结果（services/imports.commit） */
+export interface ImportCommitResult {
+  batch: ImportBatch
+  /** 提交后的实际统计 */
+  stats: Partial<BatchStats>
+  /** 提交后随即分配一次的摘要 */
+  allocation: AllocationSummary | null
 }

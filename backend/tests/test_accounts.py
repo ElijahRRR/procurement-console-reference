@@ -231,3 +231,83 @@ def test_cross_workspace_account_access_is_404(conn, workspace):
         assert e.value.code == "NOT_FOUND" and e.value.http_status == 404
     assert [a["id"] for a in accounts.list_accounts(conn, ws)] == [mine["id"]]
     assert Decimal(accounts.get(conn, ws, mine["id"])["min_amount"]) == Decimal("0")
+
+
+# ── 账号卡片与执行判定一致、买家号 ID 唯一、开关与额度连续（D7-02 / D2-11 / D1-09）──────────────
+
+
+def test_account_card_identity_status_follows_current_customer_id(conn, workspace):
+    """改了账号的买家号 ID：账号卡片上的设备身份与设备列表、开始批次的判定一致（不再显示过时的「一致」）。"""
+    from services import devices, execution
+    from tests import factories_exec as fx
+
+    ws = {"id": workspace["id"], "user_id": workspace["user_id"]}
+    acc = fx.exec_account(conn, ws["id"])
+    dev = fx.paired_device(conn, ws, account=acc)
+    assert accounts.get(conn, ws["id"], acc["id"])["devices"][0]["identity_status"] == "match"
+    accounts.update(conn, ws["id"], acc["id"], {"amazon_customer_id": "A1DEMO000099"}, ws["user_id"])
+    card = accounts.get(conn, ws["id"], acc["id"])["devices"][0]["identity_status"]
+    listed = next(d for d in devices.list_devices(conn, ws["id"]) if d["id"] == dev["id"])["identity_status"]
+    assert card == listed == "mismatch"
+    with pytest.raises(DomainError) as e:
+        execution.start_run(conn, devices.authenticate(conn, dev["token"]), trigger="manual", simulated=True)
+    assert e.value.code == "IDENTITY_MISMATCH"
+
+
+def test_customer_id_unique_index_backs_the_app_check(conn, workspace):
+    ws, uid = workspace["id"], workspace["user_id"]
+    accounts.create(conn, ws, {"name": "环境-DEMO-C1", "amazon_customer_id": "A1DEMO777777"}, uid)
+    # 绕过应用层检查（模拟两个并发请求都通过了 SELECT 检查）：唯一索引兜底并转成 VALIDATION
+    monkey = accounts._check_customer_id_unique
+    accounts._check_customer_id_unique = lambda *a, **k: None
+    try:
+        with pytest.raises(DomainError) as e:
+            accounts.create(conn, ws, {"name": "环境-DEMO-C2", "amazon_customer_id": "A1DEMO777777"}, uid)
+        assert e.value.code == "VALIDATION" and e.value.detail["field"] == "amazon_customer_id"
+        other = accounts.create(conn, ws, {"name": "环境-DEMO-C3"}, uid)
+        with pytest.raises(DomainError) as e:
+            accounts.update(conn, ws, other["id"], {"amazon_customer_id": "A1DEMO777777"}, uid)
+        assert e.value.code == "VALIDATION"
+    finally:
+        accounts._check_customer_id_unique = monkey
+    assert accounts.get(conn, ws, other["id"])["amazon_customer_id"] is None      # 失败的修改没写进去
+
+
+def test_purchase_disabled_task_is_still_claimed_and_sync_flag_unchanged(conn, workspace):
+    """v1 §10：关闭采购开关 → 已有任务按既定规则继续（仍可领取执行）；同步开关不受影响。"""
+    from services import execution
+    from tests import factories_exec as fx
+
+    ws = {"id": workspace["id"], "user_id": workspace["user_id"]}
+    acc = fx.exec_account(conn, ws["id"])
+    dev = fx.paired_device(conn, ws, account=acc)
+    o = f.ingest_ready_order(conn, ws["id"])
+    allocation.allocate(conn, ws["id"], trigger="import")
+    out = accounts.update(conn, ws["id"], acc["id"], {"purchase_enabled": False}, ws["user_id"])
+    assert out["purchase_enabled"] is False and out["sync_enabled"] is True
+    run_id = fx.start(conn, dev)
+    got = fx.claim(conn, dev, run_id)
+    assert got["order_id"] == o["id"]
+    execution.finish_run(conn, dev, run_id)
+
+
+def test_quota_is_shared_across_devices_of_one_account(conn, workspace):
+    """v1 §10：同账号换电脑后继续采购 → 已用与预占额度一致：第二台电脑看到第一台用掉的额度，满额时领不到。"""
+    from services import execution
+    from tests import factories_exec as fx
+
+    ws = {"id": workspace["id"], "user_id": workspace["user_id"]}
+    acc = fx.exec_account(conn, ws["id"], daily_limit=1)
+    mac = fx.paired_device(conn, ws, account=acc, name="Mac-DEMO-Q")
+    pc = fx.paired_device(conn, ws, account=acc, name="PC-DEMO-Q")
+    first = fx.assigned_order(conn, ws["id"], acc)
+    fx.assigned_order(conn, ws["id"], acc)
+    run1 = fx.start(conn, mac)
+    att = fx.claim(conn, mac, run1)
+    assert att["order_id"] == first["id"]
+    fx.complete_success(conn, mac, att)
+    execution.finish_run(conn, mac, run1)
+    assert accounts.get(conn, ws["id"], acc["id"])["quota_today"]["used"] == 1
+    run2 = fx.start(conn, pc)
+    out = execution.next_attempt(conn, pc, run2)
+    assert out["attempt"] is None and "额度已用完" in out["reason"]

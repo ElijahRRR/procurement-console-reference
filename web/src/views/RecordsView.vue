@@ -8,6 +8,8 @@ import AppIcon from '@/components/AppIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import OrderListCard, { type OrderTab } from '@/components/orders/OrderListCard.vue'
 import { formatNumber } from '@/utils/format'
+import { ORDER_VIEW_LABEL, labelOf } from '@/utils/labels'
+import { runDownload } from '@/utils/feedback'
 
 const overview = ref<Overview | null>(null)
 async function loadCounts() {
@@ -30,16 +32,25 @@ const tabs = computed<OrderTab[]>(() => {
   ]
 })
 const purchased = computed(() => overview.value?.counts?.purchased)
+const list = ref<InstanceType<typeof OrderListCard>>()
+/** 导出当前打开的标签页（与列表同一视图） */
+const exportView = computed(() => list.value?.currentView ?? 'executing')
+function exportCurrent() {
+  const view = exportView.value
+  void runDownload('导出', () => downloadOrdersExport({ view }))
+}
 </script>
 
 <template>
   <div>
-    <PageHeader title="采购记录">
-      <template #description>已采购 {{ formatNumber(purchased) }} 笔 · 每次采购尝试与亚马逊订单关联见任务详情</template>
+    <PageHeader :title="overview ? `已采购 ${formatNumber(purchased)} 笔` : '已采购'">
+      <template #description>每次采购尝试与亚马逊订单的关联见任务详情；模拟结果带「模拟」标记，不写回飞书</template>
       <template #actions>
-        <el-button @click="downloadOrdersExport({ view: 'purchased' })"><AppIcon name="download" size="sm" class="mr-1.5" />导出已采购</el-button>
+        <el-tooltip :content="`导出「${labelOf(ORDER_VIEW_LABEL, exportView)}」的全部任务`" placement="bottom">
+          <el-button @click="exportCurrent"><AppIcon name="download" size="sm" class="mr-1.5" />导出当前列表</el-button>
+        </el-tooltip>
       </template>
     </PageHeader>
-    <OrderListCard :tabs="tabs" mode="records" @changed="loadCounts" />
+    <OrderListCard ref="list" :tabs="tabs" mode="records" @changed="loadCounts" />
   </div>
 </template>

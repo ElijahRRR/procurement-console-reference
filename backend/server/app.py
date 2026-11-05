@@ -5,8 +5,12 @@
   DomainError → 它自己的 http_status；请求参数校验失败 → 422 VALIDATION「请求参数不正确」；
   框架层 404 / 405 → NOT_FOUND / METHOD_NOT_ALLOWED；其他异常 → 500 INTERNAL「服务器内部错误」（记日志，不把堆栈给客户端）。
 - 防跨站：/api/ 下的写请求必须带 `X-Requested-With: pc-console`，否则 403 FORBIDDEN（/plugin 用设备令牌，不检查）。
+- 防 DNS 重绑定（server/limits.HostOriginMiddleware）：Host 只接受本机地址、settings.host 与 PC_ALLOWED_HOSTS；
+  /api 写请求带 Origin 时也要在名单里，否则 403 FORBIDDEN。
+- 请求体大小（server/limits.BodyLimitMiddleware，在认证之前）：POST /api/v1/imports 不超过 10 MB 加 multipart 余量，
+  其他请求不超过 1 MB；不论有没有 Content-Length（分块上传也算），超过即 413。
+- 限速（server/ratelimit）：登录（IP + 用户名）与插件配对（IP）在窗口内失败过多 → 429 RATE_LIMITED（带 Retry-After）。
 - OPTIONS 一律 204（不做 CORS：插件从扩展 service worker 调用，凭 host 权限不需要预检）。
-- 上传：Content-Length 超过 10 MB（加 multipart 开销余量）的请求在读请求体之前就以 413 拒绝。
 - 前端：settings.web_dist（缺省 web/dist）存在时托管在 / 下，非 /api、/plugin 的 GET 找不到文件就回 index.html
   （单页应用回退）；不存在时 / 返回一段 JSON 提示。
 """
@@ -23,7 +27,7 @@ from fastapi.responses import FileResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from registry import settings
-from server import deps
+from server import deps, limits, ratelimit
 from server.routes import (accounts, allocation, auth, devices, events, exports, feishu, imports, orders, overview,
                            plugin)
 from server.routes import settings as settings_routes
@@ -42,6 +46,8 @@ _HTTP_CODES = {400: "VALIDATION", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "N
                405: "METHOD_NOT_ALLOWED", 409: "CONFLICT", 413: "VALIDATION", 422: "VALIDATION"}
 _HTTP_MESSAGES = {400: "请求格式不正确", 401: "请先登录", 403: "没有权限执行此操作", 404: "接口不存在",
                   405: "接口不支持这个请求方法", 413: "请求内容过大", 422: "请求参数不正确"}
+#: 测试客户端（fastapi TestClient）的默认主机名；只由测试通过 create_app(allowed_hosts=…) 显式加入
+TEST_CLIENT_HOST = "testserver"
 
 CONSOLE_ROUTERS = (auth, overview, orders, allocation, accounts, devices, settings_routes, simulation, feishu,
                    writebacks, imports, exports, events)
@@ -96,27 +102,22 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> Response:
 # ── 中间件：OPTIONS、防跨站、上传大小、兜底 500 ───────────────────────────────
 
 
-def _content_length(request: Request) -> int | None:
-    raw = request.headers.get("content-length")
-    try:
-        return int(raw) if raw is not None else None
-    except ValueError:
-        return None
+def _too_large(limit: int) -> tuple[str, str, dict[str, Any]]:
+    """输入：触发的字节上限 → 输出：413 的 (code, message, detail)；上传沿用 imports.too_large 的文案。"""
+    if limit >= imports.MAX_UPLOAD_BYTES:
+        exc = imports.too_large()
+        return exc.code, exc.message, exc.detail
+    return "VALIDATION", "请求内容过大", {"max_bytes": limit}
 
 
 async def guard_middleware(request: Request, call_next):
-    """输入：请求、下一层 → 输出：响应。OPTIONS → 204；/api 写请求缺防跨站头 → 403；上传过大 → 413；未处理异常 → 500。"""
+    """输入：请求、下一层 → 输出：响应。OPTIONS → 204；/api 写请求缺防跨站头 → 403；未处理异常 → 500。"""
     method = request.method.upper()
     path = request.url.path
     if method == "OPTIONS":
         return Response(status_code=204, headers={"Allow": "GET, HEAD, POST, PATCH, DELETE, OPTIONS"})
     if path.startswith("/api/") and not deps.csrf_ok(request):
         return error_response("FORBIDDEN", "缺少防跨站请求头 X-Requested-With: pc-console", 403)
-    if method == "POST" and path.rstrip("/") == f"{API_PREFIX}/imports":
-        size = _content_length(request)
-        if size is not None and size > imports.MAX_UPLOAD_BYTES + UPLOAD_OVERHEAD_BYTES:
-            exc = imports.too_large()
-            return error_response(exc.code, exc.message, exc.http_status, exc.detail)
     try:
         return await call_next(request)
     except Exception:  # noqa: BLE001 - 兜底：任何漏网的异常都变成 500 JSON，不把堆栈给客户端
@@ -162,8 +163,12 @@ def _mount_frontend(app: FastAPI, dist: Path | None) -> None:
 # ── 应用 ──────────────────────────────────────────────────────────────────────
 
 
-def create_app(web_dist: Path | str | None = None) -> FastAPI:
-    """输入：可选的前端构建目录（缺省 settings.web_dist）→ 输出：配置好路由、错误处理、中间件与前端托管的 FastAPI 应用。"""
+def create_app(web_dist: Path | str | None = None, *, allowed_hosts: tuple[str, ...] = ()) -> FastAPI:
+    """输入：可选的前端构建目录（缺省 settings.web_dist）、额外接受的主机名（测试传 TEST_CLIENT_HOST）→
+    输出：配置好路由、错误处理、中间件与前端托管的 FastAPI 应用。
+
+    中间件由外到内：Host / Origin 检查 → 请求体大小 → 失败限速 → OPTIONS / 防跨站 / 兜底 500 → 路由。
+    """
     app = FastAPI(title="采购控制台", version="0.1.0", docs_url=None, redoc_url=None,
                   openapi_url=f"{API_PREFIX}/openapi.json")
     app.add_exception_handler(DomainError, domain_error_handler)
@@ -171,6 +176,14 @@ def create_app(web_dist: Path | str | None = None) -> FastAPI:
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
     app.middleware("http")(guard_middleware)
+    app.add_middleware(ratelimit.RateLimitMiddleware,
+                       rules=ratelimit.default_rules(f"{API_PREFIX}/auth/login", f"{PLUGIN_PREFIX}/pair"))
+    app.add_middleware(limits.BodyLimitMiddleware,
+                       limits={("POST", f"{API_PREFIX}/imports"): imports.MAX_UPLOAD_BYTES + UPLOAD_OVERHEAD_BYTES},
+                       too_large=_too_large)
+    s = settings.get()
+    hosts = (s.host, *s.allowed_hosts, *allowed_hosts)
+    app.add_middleware(limits.HostOriginMiddleware, allowed_hosts=[h for h in hosts if h not in ("0.0.0.0", "::")])
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():

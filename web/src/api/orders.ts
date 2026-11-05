@@ -1,8 +1,8 @@
 /** 采购任务：列表、详情与全部人工动作（契约 §8）。 */
 import { asPage, get, post } from './client'
-import type { OrderDetail, OrderQuery, OrderRow, Page, ResolveUnknownAmounts } from './types'
+import type { BulkReviewResult, OrderDetail, OrderQuery, OrderRow, Page, ResolveUnknownAmounts } from './types'
 
-/** 输入：视图、搜索词、账号、来源、分页 → 输出：{total, rows} */
+/** 输入：视图、搜索词、账号、来源、是否需要留意、分页 → 输出：{total, rows}（total 按全部条件计数） */
 export const listOrders = async (query: OrderQuery = {}): Promise<Page<OrderRow>> =>
   asPage(await get<Page<OrderRow>>('/orders', { ...query }))
 
@@ -13,9 +13,11 @@ export const getOrder = (id: number) => get<OrderDetail>(`/orders/${id}`)
 export const reviewOrder = (id: number, decision: 'approve' | 'reject', note?: string) =>
   post<OrderDetail>(`/orders/${id}/review`, { decision, note: note ?? null })
 
-/** 输入：任务 id 列表、通过 / 拒绝 → 输出：后端摘要（如 {updated}） */
-export const bulkReview = (ids: number[], decision: 'approve' | 'reject') =>
-  post<Record<string, unknown>>('/orders/bulk-review', { ids, decision })
+/** 输入：任务 id 列表、通过 / 拒绝 → 输出：{updated: [id], skipped: [{id, reason}]}（已不在开始前状态的任务会被跳过） */
+export const bulkReview = async (ids: number[], decision: 'approve' | 'reject'): Promise<BulkReviewResult> => {
+  const res = await post<Partial<BulkReviewResult> | null>('/orders/bulk-review', { ids, decision })
+  return { updated: res?.updated ?? [], skipped: res?.skipped ?? [] }
+}
 
 /** 输入：任务 id、目标账号 id → 输出：更新后的详情（人工改派） */
 export const assignOrder = (id: number, accountId: number) =>
@@ -56,3 +58,11 @@ export const decideRepurchase = (id: number, decision: 'approve' | 'decline', no
 /** 输入：任务 id、保留当前 / 接受来源新值、备注 → 输出：更新后的详情 */
 export const resolveConflict = (id: number, choice: 'keep' | 'accept', note?: string) =>
   post<OrderDetail>(`/orders/${id}/resolve-conflict`, { choice, note: note ?? null })
+
+/** 输入：任务 id、处理说明 → 输出：更新后的详情（清除「需要留意」提醒，原提醒记进事件） */
+export const clearAttention = (id: number, note?: string) =>
+  post<OrderDetail>(`/orders/${id}/clear-attention`, { note: note ?? null })
+
+/** 输入：任务 id、该任务的一条飞书来源 id → 输出：更新后的详情（设为唯一写回目标；已采购的真实结果随即入队） */
+export const setWritebackTarget = (id: number, sourceId: number) =>
+  post<OrderDetail>(`/orders/${id}/writeback-target`, { source_id: sourceId })

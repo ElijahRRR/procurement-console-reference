@@ -67,6 +67,10 @@ class ResolveConflictBody(_Body):
     note: str | None = None
 
 
+class WritebackTargetBody(_Body):
+    source_id: int
+
+
 def _note(body: NoteBody | None) -> str | None:
     return body.note if body is not None else None
 
@@ -74,10 +78,13 @@ def _note(body: NoteBody | None) -> str | None:
 @router.get("")
 def list_orders(view: str = "all", q: str | None = Query(None, max_length=200),
                 account_id: int | None = Query(None, ge=1), source: str | None = None,
+                needs_attention: bool | None = None,
                 pg: deps.Paging = Depends(deps.paging), ctx: deps.Console = Depends(deps.console)):
-    """输入：视图（today / future / unassigned / 各状态 / all）、搜索词、账号、来源种类、分页 → 输出：{total, rows: [任务列表行]}。"""
+    """输入：视图（today / future / unassigned / 各状态 / all）、搜索词、账号、来源种类、needs_attention（true / false，
+    可选）、分页 → 输出：{total, rows: [任务列表行]}（各条件可组合，total 按全部条件计数）。"""
     return respond(orders.list_orders(ctx.conn, ctx.workspace_id, view=view or "all", q=q, account_id=account_id,
-                                      source=source or None, page=pg.page, page_size=pg.page_size))
+                                      source=source or None, needs_attention=needs_attention, page=pg.page,
+                                      page_size=pg.page_size))
 
 
 @router.post("/bulk-review")
@@ -171,6 +178,13 @@ def resolve_conflict(order_id: int, body: ResolveConflictBody, ctx: deps.Console
 
 @router.post("/{order_id}/clear-attention")
 def clear_attention(order_id: int, body: NoteBody | None = None, ctx: deps.Console = Depends(deps.console)):
-    """输入：任务 id、{note} → 输出：任务详情（清除「需要关注」提醒；契约 §8 之外的补充接口）。"""
+    """输入：任务 id、{note} → 输出：任务详情（清除「需要留意」提醒，原提醒写进事件）。"""
     return respond(orders.clear_attention(ctx.conn, ctx.workspace_id, order_id, _note(body),
                                           actor_user_id=ctx.user_id))
+
+
+@router.post("/{order_id}/writeback-target")
+def set_writeback_target(order_id: int, body: WritebackTargetBody, ctx: deps.Console = Depends(deps.console)):
+    """输入：任务 id、{source_id}（该任务的一条飞书来源）→ 输出：任务详情（指定为唯一写回目标；已采购的真实结果随即入队）。"""
+    return respond(orders.set_writeback_target(ctx.conn, ctx.workspace_id, order_id, body.source_id,
+                                               actor_user_id=ctx.user_id))

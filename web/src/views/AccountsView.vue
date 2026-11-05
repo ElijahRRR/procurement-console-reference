@@ -16,8 +16,8 @@ const accountsPanel = ref<InstanceType<typeof AccountsPanel>>()
 <template>
   <div>
     <PageHeader
-      title="账号与设备"
-      description="「采购开关」只管是否接收新分配；「暂停执行」才会让插件停止为该账号领取任务。"
+      :title="tab === 'devices' ? '插件设备' : '买家账号'"
+      :description="tab === 'devices' ? '一个浏览器环境装一份插件，对应一台设备；绑定账号并显示「身份一致」后才能领取任务。' : '「采购开关」只管是否接收新分配；「暂停执行」才会让插件停止为该账号领取任务。'"
     />
     <el-tabs v-model="tab">
       <el-tab-pane label="账号" name="accounts"><AccountsPanel ref="accountsPanel" /></el-tab-pane>

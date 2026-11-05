@@ -1,5 +1,6 @@
 """清除模拟结果（契约 §5「模拟」）：模拟尝试 → aborted（simulation_reset），任务回到开始前的状态（分配仍有效
-就保留），只因模拟「结果待核实」暂停的账号恢复执行，未结束的模拟批次结束；其他暂停不动。"""
+就保留），只因模拟结果（待核实、模拟出来的账号级错误）暂停的账号恢复执行，未结束的模拟批次结束；人工暂停与
+真实尝试造成的暂停不动。"""
 
 from __future__ import annotations
 
@@ -96,26 +97,36 @@ def test_reset_with_inflight_submitted_attempt_does_not_pause_account(conn, work
     assert fx.account_row(conn, acc["id"])["execution_paused"] is False
 
 
-def test_reset_keeps_manual_pause_and_account_level_pause(conn, workspace):
+def test_reset_resumes_simulated_account_level_pause_but_keeps_manual_and_real_ones(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     manual, dev_m = _env(conn, workspace)
     captcha, dev_c = _env(conn, workspace)
     mixed, dev_x = _env(conn, workspace)
+    real, dev_r = _env(conn, workspace)
     # 人工暂停
     accounts.pause(conn, ws, manual["id"], "DEMO 人工暂停", actor_kind="user", actor_id=uid)
-    # 模拟中遇到验证码（账号级错误）
+    # 模拟中遇到验证码（模拟出来的账号级错误）→ 清除模拟结果后恢复
     fx.assigned_order(conn, ws, captcha)
     a = fx.claim(conn, dev_c, fx.start(conn, dev_c))
     execution.report_result(conn, dev_c, a["attempt_id"], fx.failure_payload("CAPTCHA_ENCOUNTERED"))
+    assert fx.account_row(conn, captcha["id"])["execution_paused"] is True
+    assert simulation.paused_only_by_simulation(conn, ws, captcha["id"]) is True
     # 模拟待核实 + 之后又人工暂停
     fx.assigned_order(conn, ws, mixed)
     b = fx.claim(conn, dev_x, fx.start(conn, dev_x))
     execution.report_result(conn, dev_x, b["attempt_id"], fx.failure_payload(None, outcome="unknown"))
     accounts.pause(conn, ws, mixed["id"], "DEMO 再暂停", actor_kind="user", actor_id=uid)
+    # 真实批次（服务端本阶段不开放，这里直接造）里的账号级错误：不是模拟结果，不恢复
+    fx.assigned_order(conn, ws, real)
+    real_run = f.make_run(conn, ws, real["id"], dev_r["id"], simulated=False)
+    c = fx.claim(conn, dev_r, real_run["id"])
+    assert c["simulated"] is False
+    execution.report_result(conn, dev_r, c["attempt_id"], fx.failure_payload("CAPTCHA_ENCOUNTERED"))
 
     out = simulation.reset(conn, ws, uid)
-    assert out["accounts_resumed"] == []
-    for acc in (manual, captcha, mixed):
+    assert out["accounts_resumed"] == [captcha["id"]]
+    assert fx.account_row(conn, captcha["id"])["execution_paused"] is False
+    for acc in (manual, mixed, real):
         assert fx.account_row(conn, acc["id"])["execution_paused"] is True
 
 
@@ -178,3 +189,17 @@ def test_reset_restored_order_details_show_history(conn, workspace):
     detail = orders.get_detail(conn, ws, order["id"])
     assert detail["status"] == "assigned"
     assert detail["attempts"][0]["status"] == "aborted" and detail["attempts"][0]["resolution"] == "simulation_reset"
+
+
+def test_reset_rewrites_stale_reason_of_restored_orders(conn, workspace):
+    """模拟遇到验证码后任务保留在已分配、原因写着「账号已暂停执行，任务保留」；清除后原因按派生规则重写。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    acc, dev = _env(conn, workspace)
+    order = fx.assigned_order(conn, ws, acc)
+    a = fx.claim(conn, dev, fx.start(conn, dev))
+    execution.report_result(conn, dev, a["attempt_id"], fx.failure_payload("CAPTCHA_ENCOUNTERED", "模拟"))
+    assert "任务保留" in fx.order_row(conn, order["id"])["status_reason"]
+    out = simulation.reset(conn, ws, uid)
+    assert out["orders_restored"] == [order["id"]] and out["accounts_resumed"] == [acc["id"]]
+    row = fx.order_row(conn, order["id"])
+    assert row["status"] == "assigned" and row["status_reason"] is None

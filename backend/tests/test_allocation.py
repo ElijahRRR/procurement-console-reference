@@ -316,3 +316,25 @@ def test_unlimited_max_amount(conn, workspace):
     o = _order(conn, ws, "999.00")
     allocation.allocate(conn, ws, trigger="manual")
     assert _assigned(conn, ws, o["id"])[0] == acc["id"]
+
+
+def test_failed_attempt_today_counts_as_coverage_but_simulation_reset_does_not(conn, workspace):
+    """D1-06 / 契约 §3.2：当天已有采购尝试（即使失败）= 已覆盖，保底名额给真正没覆盖的账号；
+    「清除模拟结果」中止的尝试不算（清除后分配恢复原样）。"""
+    ws = workspace["id"]
+    a = f.make_account(conn, ws, name="A-DEMO", priority=1)
+    b = f.make_account(conn, ws, name="B-DEMO", priority=9)
+    old = _order(conn, ws, "25.00")
+    f.make_attempt(conn, ws, old["id"], b["id"], status="failed")
+    f.set_status(conn, old["id"], "exception")            # 失败后转异常，不在分配池里
+    new = _order(conn, ws, "25.00")
+    s = allocation.allocate(conn, ws, trigger="manual")
+    assert _assigned(conn, ws, new["id"]) == (a["id"], allocation.NOTE_COVERAGE)
+    assert s["uncovered"] == []                             # B 当天已有尝试 → 已覆盖，不算「订单数量不足」
+    conn.execute("UPDATE procure.purchase_attempts SET status = 'aborted', resolution = 'simulation_reset' "
+                 "WHERE account_id = %s", (b["id"],))
+    orders.unassign(conn, ws, new["id"])
+    s2 = allocation.allocate(conn, ws, trigger="manual")
+    # 清除模拟结果后 B 又是「未覆盖」：两个都未覆盖、只有一单 → 按优先级给 B，A 记为订单数量不足
+    assert _assigned(conn, ws, new["id"]) == (b["id"], allocation.NOTE_COVERAGE)
+    assert [u["account_id"] for u in s2["uncovered"]] == [a["id"]]

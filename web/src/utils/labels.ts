@@ -12,6 +12,7 @@ import type {
   BatchStatus,
   EventEntity,
   FeishuVerdict,
+  GuardCheckKey,
   GuardCode,
   IdentityStatus,
   ImportVerdict,
@@ -133,27 +134,19 @@ export const GUARD_CODE_LABEL: Record<GuardCode, string> = {
   DELIVERY_TOO_LONG: '预计送达超过配送上限',
   DATA_UNRELIABLE: '结算页金额或配送日期读取不可靠',
   CARD_MISMATCH: '支付卡尾号与账号设置不符',
+  GUARD_BLOCKED: '护栏拦截',
 }
 
-/** 护栏检查项（guard_verdict.checks 的键或 name）→ 中文名 */
-export const GUARD_CHECK_LABEL: Record<string, string> = {
+/** 护栏检查项（guard_verdict.checks 的键，services/guard.CHECK_ORDER）与只记录的配送方式 → 中文名 */
+export const GUARD_CHECK_LABEL: Record<GuardCheckKey | 'fulfillment', string> = {
   item: '商品',
-  items: '商品',
   zip: '邮编',
-  postal_code: '邮编',
-  subtotal_range: '金额区间',
   subtotal: '金额区间',
-  amount_range: '金额区间',
   price_cap: '限价',
-  cap: '限价',
   delivery: '配送时长',
-  delivery_days: '配送时长',
   data: '数据可靠',
-  data_reliable: '数据可靠',
   card: '卡尾号',
-  card_last4: '卡尾号',
   fulfillment: '配送方式',
-  ...GUARD_CODE_LABEL,
 }
 
 /** 插件执行错误码（services/models.py ERROR_CODES） */
@@ -171,6 +164,8 @@ export const PLUGIN_ERROR_LABEL: Record<PluginErrorCode, string> = {
   IDENTITY_MISMATCH: '浏览器登录的买家账号与绑定不符',
   ABORTED_UPSTREAM_CANCELLED: '上游已取消，已中止',
   ABORTED_BY_USER: '插件端人工中止',
+  SUBMIT_REJECTED: '服务端拒绝了提交登记',
+  PLUGIN_SIMULATION_ONLY: '插件只执行模拟任务，却领到了真实任务',
 }
 
 /** 输入：尝试的 error_code（插件码或护栏码）→ 输出：中文说明，未知码原样返回 */
@@ -291,12 +286,13 @@ export const MEMBER_ROLE_LABEL: Record<MemberRole, string> = {
 
 // ── 来源导入与飞书 ────────────────────────────────────────────────────────────
 
+/** 预览结论（与 services/imports.VERDICT_ZH 一致） */
 export const IMPORT_VERDICT_LABEL: Record<ImportVerdict, string> = {
   new: '新单',
   update: '更新',
   unchanged: '无变化',
-  conflict: '冲突',
-  historical: '历史',
+  conflict: '待核实',
+  historical: '历史采购',
   invalid: '无效',
 }
 
@@ -367,8 +363,8 @@ export const SYNC_STAT_LABEL: Record<string, string> = {
   new: '新单',
   update: '更新',
   unchanged: '无变化',
-  conflict: '冲突',
-  historical: '历史',
+  conflict: '待核实',
+  historical: '历史采购',
   skipped: '跳过',
   invalid: '无效',
   pending_review: '待确认',
@@ -396,55 +392,93 @@ export const ACTOR_KIND_LABEL: Record<ActorKind, string> = {
 }
 
 /**
- * 事件 kind 的中文名。契约没有列出 kind 的取值，这里收常见的写法，未知的原样显示（见 eventKindLabel）。
+ * 事件 kind（services 里 events.record 的全部取值，tests/unit/labels.test.ts 会与后端核对）→ 中文名。
+ * 后端新增的 kind 在这里补上之前按原样显示（见 eventKindLabel）。
  */
 export const EVENT_KIND_LABEL: Record<string, string> = {
-  created: '创建任务',
-  ingested: '来源导入',
-  source_added: '追加来源',
-  source_updated: '来源更新',
-  source_changed: '来源内容变化',
-  status_changed: '状态变化',
-  transition: '状态变化',
-  reviewed: '人审',
-  review: '人审',
-  assigned: '分配账号',
-  auto_assigned: '自动分配',
-  manual_assigned: '人工改派',
-  unassigned: '解除分配',
-  override: '修改执行参数',
-  override_set: '修改执行参数',
-  override_cleared: '清除覆盖值',
-  resumed: '异常恢复',
-  cancelled: '取消',
-  upstream_cancelled: '上游取消',
-  uncancelled: '撤销取消',
-  conflict: '来源冲突',
-  conflict_resolved: '冲突已处理',
-  attempt_claimed: '插件领取',
-  attempt_started: '开始采购',
-  guard: '护栏裁决',
-  guard_passed: '护栏通过',
-  guard_blocked: '护栏拦截',
-  submitting: '登记提交',
-  verifying: '等待银行验证',
-  attempt_result: '采购结果',
-  succeeded: '采购成功',
-  failed: '采购失败',
-  result_unknown: '结果待核实',
-  resolved_unknown: '人工核实结果',
-  amazon_cancelled: '亚马逊取消',
-  repurchase_approved: '同意重采',
-  repurchase_declined: '不重采',
-  attention: '需要人工留意',
-  upstream_changed_after_start: '上游在采购开始后修改',
-  simulation_reset: '清除模拟结果',
-  writeback_queued: '写回入队',
-  writeback_done: '写回完成',
-  writeback_failed: '写回失败',
-  paused: '暂停执行',
-  account_paused: '暂停执行',
-  account_resumed: '恢复执行',
+  // 任务
+  'order.created': '创建任务',
+  'order.status_changed': '状态变化',
+  'order.source_updated': '来源更新',
+  'order.source_conflict': '来源内容冲突',
+  'order.source_review_conflict': '来源人审结论冲突',
+  'order.source_key_changed': '来源记录的平台订单号变了',
+  'order.source_changed_during_attempt': '采购过程中来源有变化',
+  'order.upstream_changed_after_start': '上游在采购开始后修改',
+  'order.upstream_cancelled': '上游取消',
+  'order.upstream_uncancelled': '上游撤销取消',
+  'order.admission_hold': '来源准入变化，暂停采购',
+  'order.attention': '需要人工留意',
+  'order.attention_cleared': '标记已处理',
+  'order.external_purchase_recorded': '登记来源已有的亚马逊订单',
+  'order.external_order_no_mismatch': '外部单号与本系统记录不一致',
+  'order.reviewed': '人审',
+  'order.assigned': '分配账号',
+  'order.reassigned': '重新分配账号',
+  'order.unassigned': '解除分配',
+  'order.override_set': '修改执行参数',
+  'order.resumed': '异常恢复',
+  'order.cancelled_manually': '人工取消',
+  'order.uncancelled': '撤销取消',
+  'order.conflict_resolved': '冲突已处理',
+  'order.unknown_resolved': '人工核实结果',
+  'order.attempt_unknown_unexpected_status': '结果不明（任务状态已变化）',
+  'order.amazon_cancelled': '登记亚马逊取消',
+  'order.repurchase_decided': '决定是否重采',
+  'order.writeback_target_set': '设为回填目标',
+  'order.writeback_enqueued': '写回入队',
+  'order.writeback_done': '写回完成',
+  'order.writeback_failed': '写回失败',
+  'order.writeback_retry': '写回重试',
+  'order.writeback_superseded': '写回被新结果取代',
+  // 采购尝试
+  'attempt.claimed': '插件领取',
+  'attempt.progress': '执行进度',
+  'attempt.guard_passed': '护栏通过',
+  'attempt.guard_blocked': '护栏拦截',
+  'attempt.submitting': '登记提交',
+  'attempt.verifying': '等待银行验证',
+  'attempt.succeeded': '采购成功',
+  'attempt.failed': '采购失败',
+  'attempt.unknown': '结果待核实',
+  'attempt.aborted': '已中止',
+  'attempt.late_result': '迟到的结果回执',
+  // 账号
+  'account.created': '新建账号',
+  'account.updated': '修改账号',
+  'account.archived': '归档账号',
+  'account.paused': '暂停执行',
+  'account.paused_by_execution': '执行结果触发暂停',
+  'account.resumed': '恢复执行',
+  'account.customer_id_adopted': '采用插件识别的买家号 ID',
+  // 设备
+  'device.pairing_code_created': '生成配对码',
+  'device.paired': '设备配对',
+  'device.updated': '修改设备',
+  'device.revoked': '撤销设备',
+  'device.identity_changed': '身份状态变化',
+  'device.ext_version_changed': '插件版本变化',
+  // 执行批次
+  'run.started': '开始执行批次',
+  'run.ended': '结束执行批次',
+  // 飞书连接
+  'connection.created': '新建飞书连接',
+  'connection.updated': '修改飞书连接',
+  'connection.disabled': '停用飞书连接',
+  'connection.writeback_verified': '写回验收通过',
+  'connection.writeback_verify_failed': '写回验收未通过',
+  // 文件导入
+  'batch.uploaded': '上传文件',
+  'batch.previewed': '生成预览',
+  'batch.committed': '提交导入',
+  'batch.discarded': '放弃导入',
+  'import_template.saved': '保存导入模板',
+  'import_template.deleted': '删除导入模板',
+  // 设置与授权
+  'settings.updated': '修改设置',
+  'simulation.reset': '清除模拟结果',
+  'feishu.base_granted': '授权多维表格',
+  'feishu.base_revoked': '收回多维表格授权',
 }
 
 /** 输入：事件 kind → 输出：中文名，未知的原样返回 */
@@ -466,6 +500,8 @@ export const ORDER_ACTION_LABEL: Record<OrderAction, string> = {
   mark_amazon_cancelled: '登记亚马逊取消',
   repurchase: '决定是否重采',
   resolve_conflict: '处理冲突',
+  clear_attention: '标记已处理',
+  set_writeback_target: '设为回填目标',
 }
 
 // ── 字段名 ────────────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict
 
 from server import deps
-from server.serialize import respond
+from server.serialize import error_response, respond
 from services import devices, execution
 
 router = APIRouter(tags=["plugin"])
@@ -59,7 +59,8 @@ class ProgressBody(_Body):
 
 
 class GuardFacts(BaseModel):
-    """结算页事实（契约 §4）：原样交给服务端护栏判定；缺项、类型不对由护栏判为数据不可靠。"""
+    """结算页事实（契约 §4）：交给服务端护栏；服务层先规范化（只留契约的键、卡号只留后 4 位）再判定与入库，
+    缺项、类型不对由护栏判为数据不可靠。"""
 
     model_config = ConfigDict(extra="allow")
 
@@ -160,6 +161,12 @@ def result(attempt_id: int, body: ResultBody, ctx: deps.Plugin = Depends(deps.pl
     """输入：尝试 id、结果 {outcome, amazon_order_no, amounts, …} → 输出：{attempt_status, order_status}。
 
     结果体字段：outcome、amazon_order_no、amounts、card_last4、delivery、error_code、error_detail（契约 §5 第 11 步）；
-    重复上报相同结果时另有 duplicate: true。
+    重复上报相同结果时另有 duplicate: true。尝试已是「结果待核实」时收到的不同结果（迟到的回执）：回执照样保存
+    （事务提交），响应为 409 CONFLICT，detail = {attempt_status, order_status, late_receipt_recorded: true}。
     """
-    return respond(execution.report_result(ctx.conn, ctx.device, attempt_id, body.model_dump()))
+    out = execution.report_result(ctx.conn, ctx.device, attempt_id, body.model_dump())
+    if out.get("late_receipt"):
+        return error_response("CONFLICT", out["message"], 409,
+                              {"attempt_status": out["attempt_status"], "order_status": out["order_status"],
+                               "late_receipt_recorded": True})
+    return respond(out)

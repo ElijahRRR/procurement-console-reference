@@ -120,11 +120,38 @@ def test_never_enqueue_simulated_external_or_file_only_results(conn, workspace, 
     file_only = f.ingest_ready_order(conn, ws, upstream_order_no="PO-DEMO-S04")
     fo = _purchase(conn, ws, "PO-DEMO-S04", acc)
     assert file_only["primary_source_kind"] == "file" and writeback.enqueue_for_order(conn, ws, fo) is None
-    # 连接关闭写回
-    fc.update(conn, ws, c["id"], {"writeback_enabled": False}, None)
-    real = _purchase(conn, ws, "PO-DEMO-S02", acc)
-    assert writeback.enqueue_for_order(conn, ws, real) is None
     assert f.count(conn, "writebacks") == 0
+
+
+def test_disabled_connection_or_writeback_off_accumulates_and_sends_after_reenable(conn, workspace, fake):
+    """停用连接 / 关写回期间登记的真实结果照常入队（只积压不发送）；重新启用后发出（D4-08）。"""
+    ws = workspace["id"]
+    acc, c = _setup(conn, ws, fake, ("PO-DEMO-S11", "PO-DEMO-S12"))
+    conn.execute("UPDATE procure.feishu_connections SET writeback_verified_at = %s WHERE id = %s", (NOW, c["id"]))
+    fc.disable(conn, ws, c["id"], None)
+    a = _purchase(conn, ws, "PO-DEMO-S11", acc)
+    assert writeback.enqueue_for_order(conn, ws, a) is not None
+    fc.update(conn, ws, c["id"], {"enabled": True, "writeback_enabled": False}, None, client=fake)
+    b = _purchase(conn, ws, "PO-DEMO-S12", acc)
+    assert writeback.enqueue_for_order(conn, ws, b) is not None
+    assert writeback.flush(conn, now=NOW, client_factory=lambda: fake)["sent"] == 0      # 关写回：只积压
+    fc.update(conn, ws, c["id"], {"writeback_enabled": True}, None, client=fake)
+    out = writeback.flush(conn, now=NOW, client_factory=lambda: fake)
+    assert out["sent"] == 2 and out["done"] == 2
+
+
+def test_results_recorded_before_writeback_columns_exist_are_backfilled(conn, workspace, fake):
+    ws = workspace["id"]
+    acc, c = _setup(conn, ws, fake, ("PO-DEMO-S21",))
+    fc.update(conn, ws, c["id"], {"writeback_map": {}}, None, client=fake)
+    oid = _purchase(conn, ws, "PO-DEMO-S21", acc)
+    assert writeback.enqueue_for_order(conn, ws, oid) is None and f.count(conn, "writebacks") == 0
+    fc.update(conn, ws, c["id"], {"writeback_map": {"amazon_order_no": "AMZ订单号"}}, None, client=fake)
+    rows = conn.execute("SELECT * FROM procure.writebacks WHERE purchase_order_id = %s", (oid,)).fetchall()
+    assert len(rows) == 1 and rows[0]["status"] == "pending" and "AMZ订单号" in rows[0]["fields"]
+    ev = conn.execute("SELECT detail FROM procure.events WHERE kind = 'connection.updated' ORDER BY id DESC "
+                      "LIMIT 1").fetchone()
+    assert ev["detail"]["backfilled_writebacks"] == 1
 
 
 def test_enqueue_with_broken_column_config_records_failed_row(conn, workspace, fake):

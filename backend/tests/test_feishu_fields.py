@@ -293,3 +293,12 @@ def test_build_writeback_rejects_bad_targets():
     assert ei.value.code == "VALIDATION" and "公式" in ei.value.message
     with pytest.raises(errors.DomainError):
         ff.build_writeback_fields({"tax": "abc"}, {"tax": "税费USD"}, {"税费USD": ff.NUMBER})
+
+
+def test_lookup_of_several_records_gives_several_values_not_a_glued_string():
+    """D4-07：查找引用列引用了多条记录 → 多个值（平台订单号因此不可用、ASIN 判缺），不拼成 B0DEMO0001B0DEMO0002。"""
+    v = {"type": 1, "value": [{"type": "text", "text": "B0DEMO0001"}, {"type": "text", "text": "B0DEMO0002"}]}
+    assert ff.cell_to_python(v, ff.LOOKUP) == ["B0DEMO0001", "B0DEMO0002"]
+    assert ff.cell_to_python({"type": 1, "value": [{"type": "text", "text": "PO-DEMO-1"}]}, ff.LOOKUP) == "PO-DEMO-1"
+    rec = ff.normalize_record({"单号": v}, {"upstream_order_no": "单号"}, {"单号": ff.LOOKUP}, None)
+    assert rec.upstream_order_no == "" and "多个值" in rec.issues[0]

@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { PluginClient, RETRY_POLICY, httpError, parseBusyHolder } from "../build/core/client.js";
+import { FINISH_REASON, PluginClient, RETRY_ON_5XX, RETRY_POLICY, httpError, parseBusyHolder } from "../build/core/client.js";
 
 const BASE = "http://127.0.0.1:8790/";
 
@@ -202,9 +202,79 @@ test("开始批次的返回形状 {id} / {run_id} / {run: {id}} 都认", async (
 
 test("领取：attempt 为 null 是「没有任务」；尝试缺 ID 不认；simulated 只认 true", async () => {
   const none = await client(scripted(json(200, { attempt: null, reason: "今天没有可执行的任务" })).fetch).next(9);
-  assert.deepEqual(none.data, { attempt: null, reason: "今天没有可执行的任务" });
+  assert.deepEqual(none.data, { attempt: null, reason: "今天没有可执行的任务", retry_after_s: null });
   assert.equal((await client(scripted(json(200, { attempt: { asin: "B0DEMO0001" } })).fetch).next(9)).ok, false);
   const a = await client(scripted(json(200, { attempt: { attempt_id: 7, unit_price: 41.97, simulated: "true" } })).fetch).next(9);
   assert.equal(a.data.attempt.simulated, false);
   assert.equal(a.data.attempt.unit_price, "41.97");
+});
+
+test("5xx（服务端事务已回滚）：结果、进度、批次心跳、结束批次、等待验证原样再发；心跳、身份不再发", async () => {
+  const body = { outcome: "succeeded", amazon_order_no: "SIM-20261105-7", amounts: null, card_last4: null, delivery: null, error_code: null, error_detail: null };
+  for (const [name, call] of [
+    ["result", (c) => c.result(7, body)],
+    ["progress", (c) => c.progress(7, "started", {})],
+    ["runHeartbeat", (c) => c.runHeartbeat(9)],
+    ["finishRun", (c) => c.finishRun(9, "completed")],
+    ["verifying", (c) => c.verifying(7, "银行验证")],
+  ]) {
+    const ok = name === "progress" ? { continue: true, cancel_reason: null } : name === "runHeartbeat" ? { stop: false, lease_expires_at: null, stop_reason: null } : { ok: true };
+    const s = scripted(json(503, { code: "INTERNAL", message: "boom" }), json(200, ok));
+    const r = await call(client(s.fetch));
+    assert.equal(r.ok, true, name);
+    assert.equal(s.calls.length, 2, `${name} 再发了一次`);
+    assert.deepEqual(s.calls[1].body, s.calls[0].body, `${name} 再发的是同一份请求体`);
+    assert.ok(RETRY_ON_5XX.has(name));
+  }
+  for (const [name, call] of [["heartbeat", (c) => c.heartbeat(null)], ["identity", (c) => c.identity({ signed_in: false, customer_id: null, site: "US", page_url: null })]]) {
+    const s = scripted(json(500, { code: "INTERNAL", message: "boom" }), json(200, HB));
+    await call(client(s.fetch));
+    assert.equal(s.calls.length, 1, `${name} 不因 5xx 再发`);
+  }
+});
+
+test("5xx 也绝不让提交登记、开始批次、领取、护栏再发", async () => {
+  for (const [name, call] of [
+    ["submitting", (c) => c.submitting(7)],
+    ["startRun", (c) => c.startRun("manual")],
+    ["next", (c) => c.next(9)],
+    ["guard", (c) => c.guard(7, {})],
+  ]) {
+    const s = scripted(json(500, { code: "INTERNAL", message: "boom" }), json(200, { ok: true }));
+    const r = await call(client(s.fetch));
+    assert.equal(r.ok, false, name);
+    assert.equal(r.error.status, 500);
+    assert.equal(s.calls.length, 1, `${name} 只发了一次`);
+    assert.equal(RETRY_ON_5XX.has(name), false);
+  }
+});
+
+test("4xx 是明确的答复：结果上报也不再发", async () => {
+  const s = scripted(json(409, { code: "CONFLICT", message: "已登记为成功", detail: { attempt_status: "succeeded" } }), json(200, { ok: true }));
+  const r = await client(s.fetch).result(7, { outcome: "failed" });
+  assert.equal(r.error.code, "CONFLICT");
+  assert.deepEqual(r.error.detail, { attempt_status: "succeeded" });
+  assert.equal(s.calls.length, 1);
+});
+
+test("开始批次：读出 lease_ttl_s（正整数才认）；结束批次上报 reason=finished、细分原因放 detail", async () => {
+  const r = await client(scripted(json(200, { run_id: 9, lease_ttl_s: 60, lease_expires_at: "2026-11-05T06:01:00Z" })).fetch).startRun("manual");
+  assert.deepEqual(r.data, { run_id: 9, lease_ttl_s: 60, lease_expires_at: "2026-11-05T06:01:00Z" });
+  for (const bad of [0, -5, "x", null]) {
+    const b = await client(scripted(json(200, { run_id: 9, lease_ttl_s: bad })).fetch).startRun("manual");
+    assert.equal(b.data.lease_ttl_s, null, `lease_ttl_s=${bad} 读不出就是 null`);
+  }
+  const s = scripted(json(200, { run_id: 9, end_reason: "finished" }));
+  await client(s.fetch).finishRun(9, "attempt_cap");
+  assert.equal(FINISH_REASON, "finished");
+  assert.deepEqual(s.calls[0].body, { reason: "finished", detail: "attempt_cap" });
+});
+
+test("进度：cancel_code 读出（没给为 null）；领取：retry_after_s 读出（只对 attempt 为 null）", async () => {
+  const p1 = await client(scripted(json(200, { continue: false, cancel_reason: "账号已暂停执行：人工", cancel_code: "ACCOUNT_PAUSED" })).fetch).progress(7, "started", {});
+  assert.deepEqual(p1.data, { continue: false, cancel_reason: "账号已暂停执行：人工", cancel_code: "ACCOUNT_PAUSED" });
+  const p2 = await client(scripted(json(200, { continue: false, cancel_reason: "上游已取消" })).fetch).progress(7, "started", {});
+  assert.equal(p2.data.cancel_code, null);
+  const n = await client(scripted(json(200, { attempt: null, retry_after_s: 5, reason: "被占用" })).fetch).next(9);
+  assert.deepEqual(n.data, { attempt: null, reason: "被占用", retry_after_s: 5 });
 });

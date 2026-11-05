@@ -62,7 +62,7 @@ function onRowClick(row: OrderRow, _col: unknown, event: Event) {
     <el-table-column v-if="selectable" type="selection" width="48" :reserve-selection="false" />
     <el-table-column label="平台订单号" min-width="220">
       <template #default="{ row }">
-        <span class="code">{{ row.upstream_order_no }}</span>
+        <span class="code pc-code-wrap" :title="row.upstream_order_no">{{ row.upstream_order_no }}</span>
         <div class="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-gray-500 dark:text-dark-400">
           <span>
             {{ row.source_kinds.map((k: 'feishu' | 'file') => labelOf(SOURCE_KIND_LABEL, k)).join(' + ') }}<template v-if="row.store_name"> · {{ row.store_name }}</template>
@@ -105,10 +105,10 @@ function onRowClick(row: OrderRow, _col: unknown, event: Event) {
       </template>
     </el-table-column>
     <template v-if="showAttempt">
-      <el-table-column label="亚马逊订单号" min-width="180">
+      <el-table-column label="亚马逊订单号" min-width="220">
         <template #default="{ row }">
           <template v-if="row.latest_attempt?.amazon_order_no">
-            <span class="code">{{ row.latest_attempt.amazon_order_no }}</span>
+            <span class="code pc-code-wrap" :title="row.latest_attempt.amazon_order_no">{{ row.latest_attempt.amazon_order_no }}</span>
             <el-tag v-if="row.latest_attempt.simulated" size="small" type="warning" class="ml-1.5" disable-transitions>模拟</el-tag>
           </template>
           <span v-else class="text-gray-400 dark:text-dark-500">—</span>

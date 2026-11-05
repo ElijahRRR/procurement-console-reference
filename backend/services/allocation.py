@@ -8,7 +8,8 @@
 计划日期 plan(t) = max(建议采购日期, 今天)，按日期从早到晚逐日处理。日期 D 内：
 
 - cap(A, D) = daily_limit − used(A, D) − fixed(A, D)；used 按工作区的模拟模式统计（services/quota）。
-- covered(A, D)：D 日 A 已有占用额度的尝试（used > 0），或已有人工固定分配（fixed > 0）。
+- covered(A, D)：D 日 A 已有采购尝试（不论结局，失败、中止也算；外部单号与「清除模拟结果」的不算，见
+  quota.attempted_map），或已有人工固定分配（fixed > 0）。契约 §3.2、方案 v2 §1 默认值 1。
 - eligible(t, A)：min_amount ≤ subtotal_eff(t) ≤ max_amount（端点含，max 为空 = 不限）且 cap(A, D) > 0。
 
 1. 保底：未覆盖且有额度的账号与当天任务做最大二分匹配（增广路）。账号按（可选任务数升序、优先级降序、
@@ -113,6 +114,7 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
         by_date.setdefault(plan_date(t, today), []).append(t)
     dates = sorted(set(by_date) | {today})
     used = quota.used_map(conn, workspace_id, dates, simulated)
+    attempted = quota.attempted_map(conn, workspace_id, dates, simulated)
 
     result: dict[int, tuple[int | None, str]] = {}      # 任务 id → (账号 id 或 None, 分配说明或未分配原因)
     uncovered: list[dict[str, Any]] = []
@@ -122,7 +124,7 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
         tasks = sorted(by_date.get(d, []), key=_task_key)
         sub = {t["id"]: orders.subtotal_eff(t) for t in tasks}
         cap = {a["id"]: a["daily_limit"] - used.get((a["id"], d), 0) - fixed.get((a["id"], d), 0) for a in accounts}
-        covered = {a["id"]: used.get((a["id"], d), 0) > 0 or fixed.get((a["id"], d), 0) > 0 for a in accounts}
+        covered = {a["id"]: attempted.get((a["id"], d), 0) > 0 or fixed.get((a["id"], d), 0) > 0 for a in accounts}
 
         def in_range(t: dict[str, Any], a: dict[str, Any]) -> bool:
             return _site_ok(t, a) and orders.amount_in_range(sub[t["id"]], a)
@@ -226,6 +228,27 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
         (workspace_id, trigger, today, now, Jsonb(stats), Jsonb(uncovered), Jsonb(unassigned)),
     ).fetchone()
     return _run_out(run)
+
+
+def daily_done(conn, workspace_id: int, bj_date: date) -> bool:
+    """输入：工作区、北京日期 → 输出：这一天的每日分配（trigger='daily'）是否已经跑过（看 allocation_runs，进程重启也认）。"""
+    return conn.execute(
+        "SELECT 1 FROM procure.allocation_runs WHERE workspace_id = %s AND trigger = 'daily' AND bj_date = %s LIMIT 1",
+        (workspace_id, bj_date),
+    ).fetchone() is not None
+
+
+def allocate_daily(conn, workspace_id: int, *, today: date | None = None) -> dict[str, Any] | None:
+    """输入：工作区、今天（缺省北京今天）→ 输出：分配摘要；这一天已做过每日分配 → None（不重复做）。
+
+    先取与 allocate 相同的工作区咨询锁再检查，两个调度同时到点也只跑一次。错过的日子（服务没开）在下次启动时
+    补跑当天的一次；不会补跑更早的日子（计划日期本来就按 max(建议日期, 今天) 算）。
+    """
+    today = today or clock.bj_today()
+    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
+    if daily_done(conn, workspace_id, today):
+        return None
+    return allocate(conn, workspace_id, today=today, trigger="daily")
 
 
 def _run_out(run: dict[str, Any]) -> dict[str, Any]:

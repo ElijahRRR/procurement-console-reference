@@ -3,14 +3,17 @@
 - **上传**：只读取字节（sheet_io.read_workbook 校验格式与大小），原件存进 import_batches.file_bytes（只读副本，
   用于重新预览）；不改用户的原文件。给出第一个有表头的工作表的自动对应（file_mapping.suggest_mapping）。
 - **预览**：重新读原件，逐行规范化；结论（每行一个）new / update / unchanged / conflict / historical / invalid：
-  缺平台订单号 → invalid；同批次同键重复 → 第一行有效，其余 invalid；库里还没有的单命中准入规则
-  （采购状态「已拍单」却没有 AMZ 订单号等，见 normalize.admission_skip_reason）→ invalid 并写明原因；
-  其余经 orders.ingest(dry_run=True) 得出结论。问题（issues）里写明「停在待确认」「停在资料待补齐」等。
-  文件的准入规则缺省「导入历史采购」= 是（带 AMZ 订单号的行按历史采购登记，不重新下单）。
+  缺平台订单号（或平台订单号是表格错误值、多个值、科学计数法）→ invalid；同批次同键重复 → 第一行有效，其余 invalid；
+  库里还没有的单命中准入规则（采购状态「已拍单」却没有 AMZ 订单号等，见 normalize.admission_skip_reason）→ invalid
+  并写明原因；其余经 orders.ingest(dry_run=True, admission=…) 得出结论（已有任务也做准入检查：采购方移走、
+  采购状态变为已拍单 / 拿回 → 待核实）。问题（issues）里写明「停在待确认」「停在资料待补齐」等。一行出错只让该行 invalid。
+  文件的准入规则：normalize.FILE_ADMISSION_DEFAULTS（导入历史采购 = 是、售后状态「已取消」= 上游取消）之上叠加
+  工作区设置（settings_svc.file_admission），预览接口再传的 admission 优先。实际用的规则存在批次上，提交时沿用。
   每次预览整体替换该批次的 import_rows；结论原因与预计状态存在 normalized._preview 里（不改表结构）。
 - **提交**：只能从 previewed 提交一次（再次提交 → CONFLICT）；逐行（invalid 除外）经 orders.ingest 写入，
   记下 purchase_order_id 与实际结论；完成后触发一次分配（trigger='import'）。
 - **问题行**：invalid / conflict / historical 或有问题的行，原列 + 结论 + 原因（+ 原行号）导出为 xlsx。
+- **导入模板**：工作区共用（同名覆盖其对应关系）；保存、删除都写 batch 事件（entity_id 为空，detail 带模板 id 与名称）。
 
 每个查询都带工作区条件；别的工作区的批次 / 模板一律 NOT_FOUND。本模块不 commit。
 """
@@ -23,16 +26,15 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from services import allocation, clock, events, feishu_connections, file_mapping, normalize, orders, sheet_io
+from services import allocation, clock, events, feishu_connections, file_mapping, normalize, orders, settings_svc, sheet_io
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import SourceRef, UpstreamRecord
 
 VERDICTS = ("new", "update", "unchanged", "conflict", "historical", "invalid")
 VERDICT_ZH = {"new": "新单", "update": "更新", "unchanged": "无变化", "conflict": "待核实", "historical": "历史采购",
               "invalid": "无效"}
-BATCH_STATUSES = ("uploaded", "previewed", "committed", "discarded")
-#: 文件来源的准入缺省：带 AMZ 订单号的行按历史采购登记（v1 §6.2）
-FILE_ADMISSION_DEFAULTS: dict[str, Any] = {"import_historical": True}
+#: 文件来源的准入缺省（见 normalize.FILE_ADMISSION_DEFAULTS；工作区可在设置里改）
+FILE_ADMISSION_DEFAULTS: dict[str, Any] = normalize.FILE_ADMISSION_DEFAULTS
 PROBLEM_VERDICTS = ("invalid", "conflict", "historical")
 _PREVIEW_KEY = "_preview"
 
@@ -108,8 +110,10 @@ def get_batch(conn, workspace_id: int, batch_id: int) -> dict[str, Any]:
     return batch_out(_batch(conn, workspace_id, batch_id))
 
 
-def _file_admission(admission: dict[str, Any] | None) -> dict[str, Any]:
-    return feishu_connections.clean_admission({**FILE_ADMISSION_DEFAULTS, **(admission or {})})
+def _file_admission(conn, ws: int, admission: dict[str, Any] | None) -> dict[str, Any]:
+    """工作区的文件准入规则（缺省 + 设置）之上叠加本次预览传入的规则 → 完整规则。"""
+    base = settings_svc.file_admission(conn, ws)
+    return feishu_connections.clean_admission({**base, **normalize.check_admission(admission)})
 
 
 # ── 上传 ─────────────────────────────────────────────────────────────────────
@@ -225,7 +229,7 @@ def _evaluate(conn, ws: int, batch_id: int, sheet: sheet_io.Sheet, mapping: dict
         item = {"row_no": row_no, "raw": raw_j, "record": rec, "issues": list(rec.issues), "reason": None,
                 "status": None, "order_id": None, "date": _expected_date(rec)}
         if not key:
-            out.append({**item, "verdict": "invalid", "reason": "缺少平台订单号"})
+            out.append({**item, "verdict": "invalid", "reason": rec.issues[0] if rec.issues else "缺少平台订单号"})
             continue
         if key in seen:
             out.append({**item, "verdict": "invalid",
@@ -238,7 +242,12 @@ def _evaluate(conn, ws: int, batch_id: int, sheet: sheet_io.Sheet, mapping: dict
                 out.append({**item, "verdict": "invalid", "reason": skip})
                 continue
         src = SourceRef(kind="file", snapshot=raw_j, batch_id=batch_id, row_no=row_no)
-        oc = orders.ingest(conn, ws, rec, src, dry_run=True)
+        try:
+            oc = orders.ingest(conn, ws, rec, src, dry_run=True, admission=admission)
+        except (DomainError, ArithmeticError, ValueError, TypeError) as exc:   # 一行数据离谱只让这一行无效
+            msg = exc.message if isinstance(exc, DomainError) else type(exc).__name__
+            out.append({**item, "verdict": "invalid", "reason": f"无法预演：{msg}"})
+            continue
         out.append({**item, "verdict": oc.verdict, "reason": oc.reason, "issues": list(oc.issues),
                     "status": oc.status, "order_id": oc.order_id})
     return out
@@ -285,22 +294,22 @@ def preview(conn, workspace_id: int, batch_id: int, *, sheet: str | None = None,
     if mapping is None:
         mapping = b["mapping"] if (b["mapping"] and s.name == b["sheet_name"]) else file_mapping.suggest_mapping(s.headers)
     mp = _clean_mapping(mapping, s.headers)
-    adm = _file_admission(admission)
+    adm = _file_admission(conn, workspace_id, admission)
     items = _evaluate(conn, workspace_id, b["id"], s, mp, adm)
-    conn.execute("DELETE FROM procure.import_rows WHERE batch_id = %s", (b["id"],))
+    conn.execute("DELETE FROM procure.import_rows WHERE batch_id = %s AND workspace_id = %s", (b["id"], workspace_id))
     if items:
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO procure.import_rows (batch_id, row_no, raw, normalized, verdict, issues, purchase_order_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, NULL)",
-                [(b["id"], it["row_no"], Jsonb(it["raw"]),
+                "INSERT INTO procure.import_rows (workspace_id, batch_id, row_no, raw, normalized, verdict, issues, "
+                "purchase_order_id) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)",
+                [(workspace_id, b["id"], it["row_no"], Jsonb(it["raw"]),
                   Jsonb(_normalized_json(it["record"], it["reason"], it["status"], it["date"])),
                   it["verdict"], it["issues"]) for it in items],
             )
     stats = _stats_of(items)
-    conn.execute("UPDATE procure.import_batches SET sheet_name = %s, mapping = %s, status = 'previewed', stats = %s "
-                 "WHERE id = %s AND workspace_id = %s",
-                 (s.name, Jsonb(mp), Jsonb(stats), b["id"], workspace_id))
+    conn.execute("UPDATE procure.import_batches SET sheet_name = %s, mapping = %s, status = 'previewed', stats = %s, "
+                 "admission = %s WHERE id = %s AND workspace_id = %s",
+                 (s.name, Jsonb(mp), Jsonb(stats), Jsonb(adm), b["id"], workspace_id))
     events.record(conn, workspace_id, "batch", b["id"], "batch.previewed",
                   detail={"sheet": s.name, "stats": stats, "admission": adm})
     return {"batch": get_batch(conn, workspace_id, b["id"]), "stats": stats,
@@ -330,7 +339,7 @@ def rows(conn, workspace_id: int, batch_id: int, *, verdict: str | None = None, 
     """
     b = _batch(conn, workspace_id, batch_id)
     page, page_size = _page(page, page_size)
-    where, params = ["batch_id = %s"], [b["id"]]
+    where, params = ["batch_id = %s", "workspace_id = %s"], [b["id"], workspace_id]
     if verdict:
         if verdict == "problems":
             where.append("(verdict = ANY(%s) OR cardinality(issues) > 0)")
@@ -365,7 +374,11 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
     if b["status"] != "previewed":
         raise validation("请先预览再提交")
     ak, aid = _actor(actor_user_id)
-    found = conn.execute("SELECT * FROM procure.import_rows WHERE batch_id = %s ORDER BY row_no", (b["id"],)).fetchall()
+    adm_row = conn.execute("SELECT admission FROM procure.import_batches WHERE id = %s AND workspace_id = %s",
+                           (b["id"], workspace_id)).fetchone()
+    adm = adm_row["admission"] if adm_row and adm_row["admission"] else _file_admission(conn, workspace_id, None)
+    found = conn.execute("SELECT * FROM procure.import_rows WHERE batch_id = %s AND workspace_id = %s ORDER BY row_no",
+                         (b["id"], workspace_id)).fetchall()
     items: list[dict[str, Any]] = []
     for r in found:
         norm = dict(r["normalized"] or {})
@@ -377,20 +390,20 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
         src = SourceRef(kind="file", snapshot=r["raw"] or {}, batch_id=b["id"], row_no=r["row_no"])
         try:
             with conn.transaction():
-                oc = orders.ingest(conn, workspace_id, rec, src, actor_kind=ak, actor_id=aid)
+                oc = orders.ingest(conn, workspace_id, rec, src, actor_kind=ak, actor_id=aid, admission=adm)
         except DomainError as exc:
             issues = list(r["issues"] or []) + [f"提交失败：{exc.message}"]
             conn.execute("UPDATE procure.import_rows SET verdict = 'invalid', issues = %s, normalized = %s "
-                         "WHERE batch_id = %s AND row_no = %s",
+                         "WHERE batch_id = %s AND row_no = %s AND workspace_id = %s",
                          (issues, Jsonb({**norm, _PREVIEW_KEY: {**meta, "reason": f"提交失败：{exc.message}"}}),
-                          b["id"], r["row_no"]))
+                          b["id"], r["row_no"], workspace_id))
             items.append({"verdict": "invalid", "status": None})
             continue
         conn.execute("UPDATE procure.import_rows SET verdict = %s, issues = %s, purchase_order_id = %s, normalized = %s "
-                     "WHERE batch_id = %s AND row_no = %s",
+                     "WHERE batch_id = %s AND row_no = %s AND workspace_id = %s",
                      (oc.verdict, list(oc.issues), oc.order_id,
                       Jsonb({**norm, _PREVIEW_KEY: {**meta, "reason": oc.reason, "status": oc.status}}), b["id"],
-                      r["row_no"]))
+                      r["row_no"], workspace_id))
         items.append({"verdict": oc.verdict, "status": oc.status})
     stats = _stats_of(items)
     now = clock.now()
@@ -410,7 +423,7 @@ def discard(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) -
         raise validation("已提交的批次不能放弃")
     if b["status"] == "discarded":
         return batch_out(b)
-    conn.execute("DELETE FROM procure.import_rows WHERE batch_id = %s", (b["id"],))
+    conn.execute("DELETE FROM procure.import_rows WHERE batch_id = %s AND workspace_id = %s", (b["id"], workspace_id))
     conn.execute("UPDATE procure.import_batches SET status = 'discarded', file_bytes = ''::bytea WHERE id = %s "
                  "AND workspace_id = %s", (b["id"], workspace_id))
     ak, aid = _actor(actor_user_id)
@@ -434,7 +447,7 @@ def list_batches(conn, workspace_id: int, page: int = 1, page_size: int = 20) ->
 def _unique_header(name: str, used: set[str]) -> str:
     cand, n = name, 2
     while cand in used:
-        cand = f"{name}（导入{'' if n == 2 else n - 1}）"
+        cand = f"{name}（导入{'' if n == 2 else f' {n - 1}'}）"
         n += 1
     used.add(cand)
     return cand
@@ -447,9 +460,9 @@ def problems_xlsx(conn, workspace_id: int, batch_id: int) -> bytes:
     if b["status"] == "discarded":
         raise validation("已放弃的批次没有问题行可下载")
     found = conn.execute(
-        "SELECT * FROM procure.import_rows WHERE batch_id = %s AND (verdict = ANY(%s) OR cardinality(issues) > 0) "
-        "ORDER BY row_no",
-        (b["id"], list(PROBLEM_VERDICTS)),
+        "SELECT * FROM procure.import_rows WHERE batch_id = %s AND workspace_id = %s "
+        "AND (verdict = ANY(%s) OR cardinality(issues) > 0) ORDER BY row_no",
+        (b["id"], workspace_id, list(PROBLEM_VERDICTS)),
     ).fetchall()
     headers: list[str] = []
     try:
@@ -471,7 +484,7 @@ def problems_xlsx(conn, workspace_id: int, batch_id: int) -> bytes:
     return sheet_io.write_xlsx([("问题行", [*headers, h_verdict, h_reason, h_row], out_rows)])
 
 
-# ── 个人模板 ──────────────────────────────────────────────────────────────────
+# ── 导入模板（工作区共用）────────────────────────────────────────────────────────
 
 
 def template_xlsx() -> bytes:
@@ -519,6 +532,9 @@ def save_template(conn, workspace_id: int, name: str, mapping: dict[str, str | N
         """,
         (workspace_id, name, Jsonb(clean), actor_user_id, now),
     ).fetchone()
+    ak, aid = _actor(actor_user_id)
+    events.record(conn, workspace_id, "batch", None, "import_template.saved", actor_kind=ak, actor_id=aid,
+                  detail={"template_id": row["id"], "name": name, "mapping": clean})
     return next(t for t in list_templates(conn, workspace_id) if t["id"] == row["id"])
 
 
@@ -528,8 +544,11 @@ def delete_template(conn, workspace_id: int, template_id: int, actor_user_id: in
         tid = int(template_id)
     except (TypeError, ValueError):
         raise not_found("导入模板") from None
-    row = conn.execute("DELETE FROM procure.import_templates WHERE id = %s AND workspace_id = %s RETURNING id",
+    row = conn.execute("DELETE FROM procure.import_templates WHERE id = %s AND workspace_id = %s RETURNING id, name",
                        (tid, workspace_id)).fetchone()
     if row is None:
         raise not_found("导入模板")
+    ak, aid = _actor(actor_user_id)
+    events.record(conn, workspace_id, "batch", None, "import_template.deleted", actor_kind=ak, actor_id=aid,
+                  detail={"template_id": row["id"], "name": row["name"]})
     return {"id": row["id"]}

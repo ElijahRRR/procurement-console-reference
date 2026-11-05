@@ -13,12 +13,14 @@
 
 重试：HTTP 429 / 5xx、网络错误、飞书限流与暂时性错误码按指数退避重试（最多 max_retries 次）；
 令牌失效错误码先强制刷新令牌再重发一次（不占重试次数）。其余错误抛 FeishuError。
-密钥只在内存里，不写日志、不进错误信息。
+密钥只在内存里，不写日志、不进错误信息；重试日志里的路径经 redact_path 去掉多维表格 / 数据表 / 记录标识与查询串
+（httpx 自己的请求日志由 cli.py 调到 WARNING）。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -29,6 +31,13 @@ import httpx
 from registry import settings
 
 log = logging.getLogger(__name__)
+
+_TOKEN_IN_PATH = re.compile(r"/(apps|tables)/[^/?]+|/(records)/rec[^/?]*")
+
+
+def redact_path(path: str) -> str:
+    """输入：请求路径 → 输出：日志里用的路径（多维表格、数据表、记录、知识库的标识换成 ***，去掉查询串）。"""
+    return _TOKEN_IN_PATH.sub(lambda m: f"/{m.group(1) or m.group(2)}/***", path.split("?", 1)[0])
 
 TOKEN_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
 
@@ -242,7 +251,8 @@ class FeishuClient:
                 resp = self._http.request(method, path, params=params, json=json_body, headers=headers)
             except httpx.TransportError as exc:
                 if attempt < self.max_retries:
-                    log.warning("飞书请求网络错误，%s 后重试：%s %s（%s）", attempt + 1, method, path, type(exc).__name__)
+                    log.warning("飞书请求网络错误，%s 后重试：%s %s（%s）", attempt + 1, method, redact_path(path),
+                                type(exc).__name__)
                     self._backoff(attempt, None)
                     attempt += 1
                     continue
@@ -262,7 +272,7 @@ class FeishuClient:
             if status == 429 or status >= 500 or code in TRANSIENT_CODES:
                 if attempt < self.max_retries:
                     log.warning("飞书请求暂时失败（HTTP %s，code %s），第 %s 次重试：%s %s",
-                                status, code, attempt + 1, method, path)
+                                status, code, attempt + 1, method, redact_path(path))
                     self._backoff(attempt, _retry_after(resp))
                     attempt += 1
                     continue

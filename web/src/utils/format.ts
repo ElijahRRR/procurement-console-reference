@@ -131,6 +131,15 @@ export function formatRelative(v: unknown, now: Date = new Date()): string {
   return formatDate(d.toISOString())
 }
 
+/** 输入：当前时刻 → 输出：按北京时间的问候语（早上好 5–11 点、中午好 11–13 点、下午好 13–18 点，其余晚上好） */
+export function greeting(now: Date = new Date()): string {
+  const h = Number(partsInTz(now, BJ_TZ).hour)
+  if (h >= 5 && h < 11) return '早上好'
+  if (h >= 11 && h < 13) return '中午好'
+  if (h >= 13 && h < 18) return '下午好'
+  return '晚上好'
+}
+
 /** 输入：两个 YYYY-MM-DD → 输出：相差天数（b − a），任一为空则 null */
 export function daysBetween(a: string | null | undefined, b: string | null | undefined): number | null {
   if (!a || !b) return null
@@ -173,6 +182,17 @@ export function blankToNull(v: string | null | undefined): string | null {
   if (v === null || v === undefined) return null
   const s = v.trim()
   return s === '' ? null : s
+}
+
+/**
+ * 输入：金额输入 → 输出：是否最多两位小数（"40.99"、"$1,234.5" 可以；"40.999"、"40.006" 不行；空值算可以）。
+ * 限价、金额区间等上下限不能在前端被四舍五入（40.999 → 41.00 会多放行），超过两位小数要让用户改。
+ */
+export function hasAtMostTwoDecimals(v: string | number | null | undefined): boolean {
+  if (isBlank(v)) return true
+  if (typeof v === 'number') return Number.isFinite(v) && Math.abs(v * 100 - Math.round(v * 100)) < 1e-6
+  const s = String(v).replace(/[$,\s]/g, '').replace(/^US/i, '')
+  return /^-?\d+(\.\d{0,2})?$/.test(s)
 }
 
 /** 输入：金额输入 → 输出：规范的两位小数字符串或 null（"12.5" → "12.50"；解析不了为 null） */

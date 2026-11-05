@@ -67,10 +67,12 @@ export interface HeartbeatOut {
   active_run: ActiveRunInfo | null;
 }
 
-/** `POST /plugin/v1/runs` 的返回（契约未规定形状，见 client.parseRunStart）。 */
+/** `POST /plugin/v1/runs` 的返回 `{run_id, lease_ttl_s, lease_expires_at}`（形状见 client.parseRunStart）。 */
 export interface RunStartOut {
   run_id: number;
   lease_expires_at: string | null;
+  /** 租约有效期（秒，服务端 registry 的 lease_ttl_s）；没给时为 null，插件按契约默认 180 秒。 */
+  lease_ttl_s: number | null;
 }
 
 /** `POST /plugin/v1/runs/{id}/heartbeat` 的返回。 */
@@ -101,12 +103,17 @@ export interface Attempt {
 export interface NextOut {
   attempt: Attempt | null;
   reason: string | null;
+  /** 候选任务只是暂时被别的操作锁着：这么多秒后再领，不要结束批次。没给时为 null。 */
+  retry_after_s: number | null;
 }
 
 /** `POST /plugin/v1/attempts/{id}/progress` 的返回。 */
 export interface ProgressOut {
   continue: boolean;
   cancel_reason: string | null;
+  /** continue=false 的机读原因（UPSTREAM_CANCELLED、ACCOUNT_PAUSED、IDENTITY_MISMATCH……）。
+   *  服务端没给时为 null —— 插件据此决定上报哪个中止码（见 codes.abortCodeFor）。 */
+  cancel_code: string | null;
 }
 
 /** 结算页事实（契约 §4）。模拟执行时由 simulate.buildCheckoutFacts 推出来。 */

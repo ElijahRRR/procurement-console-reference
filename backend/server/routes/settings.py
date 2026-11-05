@@ -1,7 +1,7 @@
 """全局设置（契约 §8 GET/PATCH /settings，形状见 §10「设置」）。
 
 校验在 services/settings_svc：默认配送上限 1–60 的整数、物流同步时间 HH:MM、本阶段 simulation_only 只能为 true、
-未知键 → 422 VALIDATION；只读键（real_purchase_available）忽略。
+文件导入的准入规则 file_admission（键同飞书准入规则）、未知键 → 422 VALIDATION；只读键（real_purchase_available）忽略。
 """
 
 from __future__ import annotations
@@ -26,11 +26,13 @@ class SettingsPatch(BaseModel):
     default_max_delivery_days: Any = None
     simulation_only: Any = None
     logistics_sync_time: Any = None
+    file_admission: Any = None
 
 
 @router.get("")
 def get_settings(ctx: deps.Console = Depends(deps.console)):
-    """输入：当前会话 → 输出：{default_max_delivery_days, simulation_only, logistics_sync_time, real_purchase_available}。"""
+    """输入：当前会话 → 输出：{default_max_delivery_days, simulation_only, logistics_sync_time, real_purchase_available,
+    file_admission}。"""
     return respond(settings_svc.get(ctx.conn, ctx.workspace_id))
 
 

@@ -4,7 +4,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import type { Account, AccountInput, Device, PurchaseMode } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
-import { blankToNull, normalizeMoneyInput, parseAmount } from '@/utils/format'
+import { blankToNull, hasAtMostTwoDecimals, normalizeMoneyInput, parseAmount } from '@/utils/format'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
 
 const props = defineProps<{ account: Account | null; devices: Device[]; defaultMaxDays: number | null }>()
@@ -65,6 +65,7 @@ const moneyValidator = (allowEmpty: boolean) => (_r: unknown, v: string, cb: (e?
   if (!v || !String(v).trim()) return allowEmpty ? cb() : cb(new Error('请填写金额'))
   const n = parseAmount(v)
   if (n === null || n < 0) return cb(new Error('请填写不小于 0 的金额，如 20.00'))
+  if (!hasAtMostTwoDecimals(v)) return cb(new Error('金额最多两位小数（不会替你四舍五入）'))
   cb()
 }
 

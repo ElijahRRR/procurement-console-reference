@@ -14,6 +14,8 @@ import {
   formatNumber,
   formatRelative,
   formatTime,
+  greeting,
+  hasAtMostTwoDecimals,
   normalizeMoneyInput,
   parseAmount,
 } from '@/utils/format'
@@ -122,5 +124,42 @@ describe('中文排版', () => {
     expect(displayValue(true)).toBe('是')
     expect(displayValue(['a', 'b'])).toBe('a、b')
     expect(displayValue(null)).toBe(EMPTY)
+  })
+})
+
+describe('金额输入最多两位小数（限价是上限，不替用户四舍五入）', () => {
+  it.each([
+    ['40.99', true],
+    ['40', true],
+    ['40.5', true],
+    ['$1,234.50', true],
+    [' 78.69 ', true],
+    ['', true],
+    [null, true],
+    [12.5, true],
+    ['40.999', false],
+    ['40.006', false],
+    ['78.685', false],
+    ['1.005', false],
+    [40.999, false],
+    ['abc', false],
+  ] as const)('%s → %s', (v, ok) => {
+    expect(hasAtMostTwoDecimals(v)).toBe(ok)
+  })
+  it('前端规整只补零，不再把三位小数进上去（三位小数先被校验挡住）', () => {
+    expect(normalizeMoneyInput('40.9')).toBe('40.90')
+    expect(hasAtMostTwoDecimals('40.999')).toBe(false)
+  })
+})
+
+describe('问候语按北京时间', () => {
+  it.each([
+    ['2026-11-04T23:30:00Z', '早上好'], // 北京 07:30
+    ['2026-11-05T03:30:00Z', '中午好'], // 北京 11:30
+    ['2026-11-05T07:00:00Z', '下午好'], // 北京 15:00
+    ['2026-11-05T12:00:00Z', '晚上好'], // 北京 20:00
+    ['2026-11-04T19:00:00Z', '晚上好'], // 北京 03:00
+  ])('%s → %s', (iso, want) => {
+    expect(greeting(new Date(iso))).toBe(want)
   })
 })

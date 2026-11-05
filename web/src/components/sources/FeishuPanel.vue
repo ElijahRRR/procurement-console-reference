@@ -11,15 +11,9 @@ import EmptyState from '@/components/EmptyState.vue'
 import StatusDot from '@/components/StatusDot.vue'
 import FeishuWizard from './FeishuWizard.vue'
 import { formatDateTime, formatNumber, formatRelative } from '@/utils/format'
-import {
-  SYNC_STAT_LABEL,
-  SYNC_TRIGGER_LABEL,
-  WRITEBACK_STATE_LABEL,
-  WRITEBACK_STATE_TAG,
-  labelOf,
-  tagOf,
-} from '@/utils/labels'
-import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
+import { SYNC_TRIGGER_LABEL, WRITEBACK_STATE_LABEL, WRITEBACK_STATE_TAG, labelOf, tagOf } from '@/utils/labels'
+import { statsText, syncSummary, verifySummary } from '@/utils/results'
+import { confirmAction, notifyFailure, notifySuccess, notifySummary, promptText } from '@/utils/feedback'
 
 const emit = defineEmits<{ changed: [] }>()
 
@@ -65,20 +59,11 @@ function openEdit(c: FeishuConnection) {
   wizardOpen.value = true
 }
 
-function statsText(stats: Record<string, number> | null | undefined): string {
-  if (!stats) return ''
-  return Object.entries(stats)
-    .filter(([, v]) => typeof v === 'number')
-    .map(([k, v]) => `${SYNC_STAT_LABEL[k] ?? k} ${formatNumber(v)}`)
-    .join(' · ')
-}
-
 async function sync(c: FeishuConnection) {
   busyId.value = `sync-${c.id}`
   try {
-    const run = await feishu.syncConnection(c.id)
-    if (run && run.ok === false) notifyFailure('同步', run.error || '飞书接口返回错误')
-    else notifySuccess(`已同步「${c.name}」`, statsText(run?.stats))
+    // 读飞书失败时服务端返回错误（失败已记进读取记录），走 catch；成功返回本次的统计与问题记录样本
+    notifySummary(syncSummary(c.name, await feishu.syncConnection(c.id)))
     await load()
     emit('changed')
   } catch (e) {
@@ -121,9 +106,8 @@ async function verify(c: FeishuConnection) {
   if (recordId === null) return
   busyId.value = `verify-${c.id}`
   try {
-    const res = await feishu.verifyWriteback(c.id, recordId)
-    if (res?.writeback_verified_at) notifySuccess('写回验收通过', '之后的采购结果会写回飞书；模拟结果仍不写回。')
-    else notifyFailure('写回验收', res?.last_error || '读回的值与写入的不一致')
+    const s = verifySummary(await feishu.verifyWriteback(c.id, recordId))
+    notifySummary(s, s.ok ? undefined : 'error')
     await load()
   } catch (e) {
     notifyFailure('写回验收', e)
@@ -228,7 +212,7 @@ function onSaved() {
             <el-button v-if="c.writeback_enabled" size="small" :loading="busyId === `verify-${c.id}`" @click="verify(c)">
               <AppIcon name="shield" size="sm" class="mr-1" />写回验收
             </el-button>
-            <el-button size="small" @click="openRuns(c)"><AppIcon name="clock" size="sm" class="mr-1" />读取记录</el-button>
+            <el-button size="small" @click="openRuns(c)"><AppIcon name="clock" size="sm" class="mr-1" />查看读取记录</el-button>
             <el-button
               size="small"
               :type="c.enabled ? 'danger' : undefined"

@@ -4,15 +4,18 @@
 
 |任务|频率|线程|
 |---|---|---|
-|租约清扫 execution.sweep|settings.sweep_interval_s（默认 30 秒）|核心线程|
-|每日分配（全部工作区，trigger='daily'）|北京时间每天 00:01 起，每个北京日期一次|核心线程|
-|飞书读取：到期连接逐个 feishu_intake.run_connection|每 INTAKE_CHECK_S 秒查一次到期连接（各连接按 poll_minutes）|飞书线程|
-|飞书写回 writeback.flush|settings.writeback_interval_s（默认 60 秒）|飞书线程|
+|租约清扫 workflows.sweep.run|settings.sweep_interval_s（默认 30 秒）|核心线程|
+|每日分配 workflows.allocate.run(trigger='daily')|北京时间每天 00:01 起，每个工作区每个北京日期一次|核心线程|
+|飞书读取 workflows.feishu_intake.run（到期连接）|settings.intake_check_s（默认 30 秒）查一次到期连接（各连接按 poll_minutes）|飞书线程|
+|飞书写回 workflows.feishu_writeback.run|settings.writeback_interval_s（默认 60 秒）|飞书线程|
+
+每个任务都调用与 ``python cli.py <任务>`` 相同的 workflows.<任务>.run()（契约 §9：单独执行与后台执行是同一件事）。
 
 - 清扫单独放在核心线程：飞书接口慢或卡住时，执行权租约照样按时清扫。
 - 每个任务各自 try/except 并记日志，一次失败不会让循环退出；连续失败只在第一次打印堆栈，恢复时记一条。
-- 每个任务自己开事务（registry.db.pg_conn）；飞书读取每个连接一个事务，读飞书失败时失败记录随该事务提交。
-- 每日分配按进程内记下的北京日期去重；进程在 00:01 之后才启动时，启动后补跑一次当天的分配（等同人工「重新分配」）。
+- 每个任务自己开事务（registry.db.pg_conn，在 workflows 里）；飞书读取每个连接一个事务，读飞书失败时失败记录随该事务提交。
+- 每日分配：进程内记下已处理的北京日期（省得每拍查库）；真正的去重在库里（allocation.daily_done 查
+  allocation_runs），所以 00:01 之后重启不会重做当天的每日分配；服务停过、当天还没做的工作区启动后补做一次。
 - 停止：uvicorn 退出（Ctrl+C / SIGTERM）后置停止事件并等待线程结束；线程是守护线程，不会挂住进程退出。
 """
 
@@ -26,77 +29,42 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import Any
 
-from registry import db, settings
-from services import clock, execution, feishu_connections, feishu_intake, writeback
-from services.errors import DomainError
+from registry import settings
+from services import clock
 
 log = logging.getLogger("scheduler")
 
 #: 每日分配的北京时间
 DAILY_ALLOCATION_AT = time(0, 1)
-#: 多久查一次「到期」的飞书连接（各连接自己的 poll_minutes 决定是否到期）
-INTAKE_CHECK_S = 30
-#: 循环的节拍（秒）：每拍检查一次哪些任务到期
+#: 循环的节拍（秒）：每拍检查一次哪些任务到期（只是轮询粒度，不是业务参数）
 TICK_S = 1.0
-
-JOB_NAMES = ("sweep", "daily_allocation", "feishu_intake", "feishu_writeback")
 
 
 # ── 单个任务（每个都自己开事务）────────────────────────────────────────────────
 
 
 def run_sweep(now: datetime) -> dict[str, Any]:
-    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}（一个事务）。"""
-    with db.pg_conn() as conn:
-        summary = execution.sweep(conn, now)
-    if summary["expired_runs"] or summary["revoked_runs"] or summary["orphan_attempts"]:
-        log.info("租约清扫：%s", summary)
-    return summary
+    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}（workflows.sweep.run）。"""
+    from workflows import sweep
+
+    return sweep.run()
 
 
 def run_feishu_intake(now: datetime) -> dict[str, Any]:
     """输入：当前时刻 → 输出：{due, connections: {连接 id: 读取统计 | {error, code}}}（飞书未配置时另有 skipped）。
 
-    先查到期连接（跨工作区）；没有到期的就不建飞书客户端。每个连接一个事务：读飞书失败时服务层已把失败记录写进
-    该事务，这里捕获 DomainError 后正常提交，失败历史得以保留；一个连接出错不影响其他连接。
+    即 workflows.feishu_intake.run(now=now)：先查到期连接，没有到期的就不建飞书客户端；每个连接一个事务。
     """
-    with db.pg_conn() as conn:
-        due = feishu_intake.due_connections(conn, now)
-    out: dict[str, Any] = {"due": len(due), "connections": {}}
-    if not due:
-        return out
-    try:
-        client = feishu_connections.make_client()
-    except DomainError as exc:
-        out["skipped"] = exc.message
-        return out
-    try:
-        for ws, cid in due:
-            try:
-                with db.pg_conn() as conn:
-                    try:
-                        res = feishu_intake.run_connection(conn, ws, cid, trigger="schedule", client=client)
-                        out["connections"][str(cid)] = {k: res[k] for k in (*feishu_intake.STAT_KEYS, "run_id")}
-                    except DomainError as exc:
-                        log.warning("飞书连接 %s 读取失败：%s", cid, exc.message)
-                        out["connections"][str(cid)] = {"error": exc.message, "code": exc.code}
-            except Exception as exc:  # noqa: BLE001 - 后台任务：记录并继续下一个连接
-                log.exception("飞书连接 %s 读取异常", cid)
-                out["connections"][str(cid)] = {"error": str(exc), "code": "INTERNAL"}
-    finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            close()
-    return out
+    from workflows import feishu_intake
+
+    return feishu_intake.run(now=now)
 
 
 def run_feishu_writeback(now: datetime) -> dict[str, Any]:
-    """输入：当前时刻 → 输出：{due, sent, done, retrying, failed, superseded, waiting_verification[, error]}（一个事务）。"""
-    with db.pg_conn() as conn:
-        stats = writeback.flush(conn, now=now)
-    if stats.get("sent") or stats.get("failed"):
-        log.info("飞书写回：%s", stats)
-    return stats
+    """输入：当前时刻 → 输出：{due, sent, done, retrying, failed, superseded, waiting_verification[, error]}。"""
+    from workflows import feishu_writeback
+
+    return feishu_writeback.run(now=now)
 
 
 def daily_due(now: datetime, last_done: date | None) -> bool:
@@ -106,11 +74,14 @@ def daily_due(now: datetime, last_done: date | None) -> bool:
 
 
 def run_daily_allocation(now: datetime) -> dict[str, Any]:
-    """输入：当前时刻 → 输出：{bj_date, workspaces: {工作区 id: 分配摘要 | {error}}}（每个工作区一个事务）。"""
+    """输入：当前时刻 → 输出：{bj_date, workspaces: {工作区 id: 分配摘要 | {skipped} | {error}}}（每个工作区一个事务；
+    当天已做过每日分配的工作区跳过，见 allocation.allocate_daily）。"""
     from workflows import allocate
 
     out = allocate.run(trigger="daily")
-    log.info("每日分配（北京 %s）：%d 个工作区", clock.bj_date(now), len(out.get("workspaces", {})))
+    done = sum(1 for v in out.get("workspaces", {}).values() if "id" in v)
+    log.info("每日分配（北京 %s）：%d 个工作区分配，%d 个已做过或失败", clock.bj_date(now), done,
+             len(out.get("workspaces", {})) - done)
     return {"bj_date": clock.bj_date(now).isoformat(), **out}
 
 
@@ -181,7 +152,7 @@ class Scheduler:
     """后台调度：核心线程（清扫、每日分配）+ 飞书线程（读取、写回）。start() 启动，stop() 置停止事件并等待结束。"""
 
     def __init__(self, *, sweep_interval_s: float | None = None, writeback_interval_s: float | None = None,
-                 intake_check_s: float = INTAKE_CHECK_S, tick_s: float = TICK_S) -> None:
+                 intake_check_s: float | None = None, tick_s: float = TICK_S) -> None:
         s = settings.get()
         self.state = JobState()
         self.tick_s = tick_s
@@ -189,7 +160,7 @@ class Scheduler:
         self._threads: list[threading.Thread] = []
         self._core = [_Periodic("sweep", float(sweep_interval_s or s.sweep_interval_s), run_sweep)]
         self._feishu = [
-            _Periodic("feishu_intake", float(intake_check_s), run_feishu_intake),
+            _Periodic("feishu_intake", float(intake_check_s or s.intake_check_s), run_feishu_intake),
             _Periodic("feishu_writeback", float(writeback_interval_s or s.writeback_interval_s), run_feishu_writeback),
         ]
 
@@ -254,6 +225,8 @@ def serve(host: str | None = None, port: int | str | None = None, jobs: Any = "1
         raise SystemExit(f"serve 不认识的参数：{'、'.join(sorted(unknown))}（可用 host、port、jobs、log_level）")
     import uvicorn
 
+    for name in ("httpx", "httpcore"):          # 它们的 INFO 请求日志带多维表格 token
+        logging.getLogger(name).setLevel(logging.WARNING)
     s = settings.get()
     bind_host = host or s.host
     bind_port = int(port) if port not in (None, "") else int(s.port)

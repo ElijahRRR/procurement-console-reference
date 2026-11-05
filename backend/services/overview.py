@@ -6,10 +6,10 @@ from datetime import timedelta
 from typing import Any
 
 from registry import settings
-from services import allocation, clock, orders, settings_svc
+from services import allocation, clock, devices, orders, settings_svc
 from services.models import ORDER_STATUSES
 
-ONLINE_WINDOW = timedelta(minutes=3)
+ONLINE_WINDOW = timedelta(seconds=devices.ONLINE_WINDOW_S)
 RECENT_EXCEPTIONS = 5
 
 

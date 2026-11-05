@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from tests.api_helpers import (api, create_account, err, find_order, import_orders, import_row, ok,  # noqa: F401
-                               owner)
+                               owner, tx)
 
 
 def _detail(client, order_id):
@@ -98,3 +98,51 @@ def test_order_list_filters_and_paging(owner):
     assert ok(owner.get("/api/v1/orders", params={"source": "file"}))["total"] == 5
     err(owner.get("/api/v1/orders", params={"source": "ftp"}), 422, "VALIDATION")
     err(owner.get("/api/v1/orders/999999"), 404, "NOT_FOUND")
+
+
+def test_needs_attention_filter_events_paging_and_clear_attention_via_api(owner):
+    """K5 / K6 / D7-03：needs_attention 过滤（与视图、搜索组合，total 准确）；事件按页精确取；清除提醒。"""
+    import_orders(owner, [import_row(f"PO-DEMO-NA{i}") for i in range(3)])
+    ids = [find_order(owner, f"PO-DEMO-NA{i}")["id"] for i in range(3)]
+    with tx() as conn:
+        conn.execute("UPDATE procure.purchase_orders SET needs_attention = true, attention_note = 'DEMO 提醒' "
+                     "WHERE id = ANY(%s)", (ids[:2],))
+    body = ok(owner.get("/api/v1/orders", params={"needs_attention": "true", "page_size": 1}))
+    assert body["total"] == 2 and len(body["rows"]) == 1
+    assert ok(owner.get("/api/v1/orders", params={"needs_attention": "false"}))["total"] == 1
+    assert ok(owner.get("/api/v1/orders", params={"needs_attention": "true", "q": "PO-DEMO-NA0",
+                                                   "view": "all"}))["total"] == 1
+    err(owner.get("/api/v1/orders", params={"needs_attention": "maybe"}), 422, "VALIDATION")
+    d = ok(owner.get(f"/api/v1/orders/{ids[0]}"))
+    assert "clear_attention" in d["allowed_actions"]
+    d = ok(owner.post(f"/api/v1/orders/{ids[0]}/clear-attention", json={"note": "已核对"}))
+    assert d["needs_attention"] is False and "clear_attention" not in d["allowed_actions"]
+    assert ok(owner.get("/api/v1/orders", params={"needs_attention": "true"}))["total"] == 1
+    all_evs = ok(owner.get("/api/v1/events", params={"order_id": ids[0], "page_size": 200}))
+    p2 = ok(owner.get("/api/v1/events", params={"order_id": ids[0], "page": 2, "page_size": 1}))
+    assert p2["total"] == all_evs["total"] >= 2 and p2["rows"][0]["id"] == all_evs["rows"][1]["id"]
+    assert all_evs["rows"][0]["kind"] == "order.attention_cleared" and all_evs["rows"][0]["actor_name"]
+
+
+def test_writeback_target_endpoint_and_missing_field_keys(owner):
+    """K12：文件为主的任务，后来同键的飞书记录不自动成为写回目标；人工指定 → 唯一目标；文件来源不能指定。K8：缺字段给键。"""
+    from tests import factories as f
+    from services import orders
+
+    import_orders(owner, [import_row("PO-DEMO-WT9", ASIN=None)])
+    row = find_order(owner, "PO-DEMO-WT9")
+    assert row["missing_fields"] == ["asin"]
+    with tx() as conn:
+        ws = conn.execute("SELECT workspace_id FROM procure.purchase_orders WHERE id = %s", (row["id"],)).fetchone()
+        orders.ingest(conn, ws["workspace_id"], f.make_record(upstream_order_no="PO-DEMO-WT9", asin=None),
+                      f.feishu_source(conn, ws["workspace_id"], "recDEMOWT9"))
+    d = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    fs = next(s for s in d["sources"] if s["kind"] == "feishu")
+    file_src = next(s for s in d["sources"] if s["kind"] == "file")
+    assert fs["is_writeback_target"] is False and "set_writeback_target" in d["allowed_actions"]
+    err(owner.post(f"/api/v1/orders/{row['id']}/writeback-target", json={"source_id": file_src["id"]}), 422,
+        "VALIDATION")
+    err(owner.post(f"/api/v1/orders/{row['id']}/writeback-target", json={"source_id": 999999}), 404, "NOT_FOUND")
+    d = ok(owner.post(f"/api/v1/orders/{row['id']}/writeback-target", json={"source_id": fs["id"]}))
+    assert [s["is_writeback_target"] for s in d["sources"] if s["kind"] == "feishu"] == [True]
+    assert any(e["kind"] == "order.writeback_target_set" and e["actor_kind"] == "user" for e in d["events"])

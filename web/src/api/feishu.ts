@@ -7,11 +7,13 @@ import type {
   FeishuPreview,
   FeishuPreviewInput,
   FeishuStatus,
+  FeishuSyncResult,
   Page,
   PageQuery,
   ResolvedLink,
   SyncRun,
   SystemFields,
+  VerifyWritebackResult,
 } from './types'
 
 /** 输入：无 → 输出：{configured}（服务端是否配置了 FEISHU_APP_ID / FEISHU_APP_SECRET） */
@@ -44,12 +46,15 @@ export const createConnection = (body: FeishuConnectionInput) => post<FeishuConn
 export const updateConnection = (id: number, body: FeishuConnectionInput) =>
   patch<FeishuConnection>(`/feishu/connections/${id}`, body)
 
-/** 输入：连接 id → 输出：本次读取记录（含统计） */
-export const syncConnection = (id: number) => post<SyncRun>(`/feishu/connections/${id}/sync`, {})
+/** 输入：连接 id → 输出：本次读取的统计 {read, new, update, …, run_id, problems, allocation}；读飞书失败抛 ApiError */
+export const syncConnection = (id: number) => post<FeishuSyncResult>(`/feishu/connections/${id}/sync`, {})
 
-/** 输入：连接 id、测试记录 id → 输出：验收后的连接（一致才记 writeback_verified_at） */
+/**
+ * 输入：连接 id、测试记录 id → 输出：{ok, mismatches, written, restored, restore_error, error, connection}
+ * （ok 为 true 才算通过并记 writeback_verified_at；写入 / 读回时飞书报错不抛异常，见 error）
+ */
 export const verifyWriteback = (id: number, recordId: string) =>
-  post<FeishuConnection>(`/feishu/connections/${id}/verify-writeback`, { record_id: recordId })
+  post<VerifyWritebackResult>(`/feishu/connections/${id}/verify-writeback`, { record_id: recordId })
 
 /** 输入：连接 id、分页 → 输出：读取记录 {total, rows} */
 export const listSyncRuns = async (id: number, query: PageQuery = { page: 1, page_size: 20 }): Promise<Page<SyncRun>> =>

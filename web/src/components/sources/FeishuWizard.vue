@@ -2,6 +2,7 @@
 /**
  * 飞书连接向导：粘贴链接 → 选数据表 → 字段对应（含写回列，不可写列禁用）→ 准入规则 → 样本预览 → 保存。
  * 链接只用来定位表；应用凭证在服务端。预览只读，不修改飞书数据。
+ * 来源字段可对应多列（有序）：前一列为空时读下一列，如 ASIN 缺失时用「来源码」（utils/feishuMap）。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import type {
@@ -16,20 +17,13 @@ import * as feishu from '@/api/feishu'
 import AppIcon from '@/components/AppIcon.vue'
 import { displayValue, failureText, formatNumber } from '@/utils/format'
 import { FEISHU_VERDICT_LABEL, SYNC_STAT_LABEL, VERDICT_TAG, labelOf, tagOf } from '@/utils/labels'
+import { ADMISSION_FIELDS, FEISHU_ADMISSION_DEFAULTS, defaultsHint, fullAdmission } from '@/utils/admission'
+import { fillSuggested, missingRequired as missingRequiredOf, toEditableMap, toFieldMap } from '@/utils/feishuMap'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
 
 const props = defineProps<{ connection: FeishuConnection | null }>()
 const visible = defineModel<boolean>({ default: false })
 const emit = defineEmits<{ saved: [conn: FeishuConnection] }>()
-
-const DEFAULT_ADMISSION: FeishuAdmission = {
-  approved_values: ['通过'],
-  rejected_values: ['拒绝', '建议拒绝', '钓鱼'],
-  purchaser_values: [],
-  skip_purchase_status_values: ['已拍单', '拿回'],
-  cancel_after_sale_values: [],
-  import_historical: false,
-}
 
 const STEPS = ['粘贴链接', '选择数据表', '字段对应', '准入规则', '样本预览'] as const
 const step = ref(0)
@@ -43,11 +37,12 @@ const form = reactive({
   source_table_id: '',
   source_view_id: '' as string,
   result_table_id: '',
-  field_map: {} as Record<string, string>,
+  /** {系统字段: [列名…]}：有序，前一列为空时读下一列 */
+  field_map: {} as Record<string, string[]>,
   writeback_map: {} as Record<string, string>,
   writeback_enabled: false,
   poll_minutes: 10,
-  admission: { ...DEFAULT_ADMISSION } as FeishuAdmission,
+  admission: fullAdmission(null, FEISHU_ADMISSION_DEFAULTS) as FeishuAdmission,
 })
 
 const tables = ref<FeishuTable[]>([])
@@ -73,11 +68,11 @@ function reset() {
     source_table_id: c?.source_table_id ?? '',
     source_view_id: c?.source_view_id ?? '',
     result_table_id: c?.result_table_id ?? '',
-    field_map: { ...(c?.field_map ?? {}) },
+    field_map: toEditableMap(c?.field_map),
     writeback_map: { ...(c?.writeback_map ?? {}) },
     writeback_enabled: c?.writeback_enabled ?? false,
     poll_minutes: c?.poll_minutes ?? 10,
-    admission: { ...DEFAULT_ADMISSION, ...(c?.admission ?? {}) },
+    admission: fullAdmission(c?.admission, FEISHU_ADMISSION_DEFAULTS),
   })
 }
 
@@ -132,19 +127,15 @@ async function loadFields() {
     } else {
       resultFields.value = sourceFields.value
     }
-    // 新建时用服务端建议的对应；编辑时保留已保存的对应，只补空缺
-    for (const [k, v] of Object.entries(src.suggested_field_map ?? {})) {
-      if (!form.field_map[k] && v) form.field_map[k] = v
-    }
+    // 新建时用服务端建议的对应（多个候选列保留为有序列表）；编辑时保留已保存的对应，只补空缺
+    fillSuggested(form.field_map, src.suggested_field_map)
     for (const [k, v] of Object.entries(src.suggested_writeback_map ?? {})) {
       if (!form.writeback_map[k] && v) form.writeback_map[k] = v
     }
   })
 }
 
-const missingRequired = computed(() =>
-  (systemFields.value?.source_fields ?? []).filter((f) => f.required && !form.field_map[f.key]).map((f) => f.label),
-)
+const missingRequired = computed(() => missingRequiredOf(systemFields.value?.source_fields ?? [], form.field_map))
 
 async function runPreview() {
   return guarded('样本预览', async () => {
@@ -152,7 +143,7 @@ async function runPreview() {
       app_token: form.app_token,
       table_id: form.source_table_id,
       view_id: form.source_view_id || null,
-      field_map: cleanMap(form.field_map),
+      field_map: toFieldMap(form.field_map),
       admission: form.admission,
       limit: 20,
     })
@@ -198,7 +189,7 @@ async function save() {
     source_table_id: form.source_table_id,
     source_view_id: form.source_view_id || null,
     result_table_id: form.result_table_id || form.source_table_id,
-    field_map: cleanMap(form.field_map),
+    field_map: toFieldMap(form.field_map),
     writeback_map: cleanMap(form.writeback_map),
     writeback_enabled: form.writeback_enabled,
     admission: form.admission,
@@ -229,13 +220,7 @@ const resultOptions = computed(() =>
   resultFields.value.map((f) => ({ value: f.field_name, label: f.field_name, writable: f.writable, type: f.ui_type ?? String(f.type) })),
 )
 
-const admissionFields: { key: keyof Omit<FeishuAdmission, 'import_historical'>; label: string; hint: string }[] = [
-  { key: 'approved_values', label: '人审通过的取值', hint: '「人工审核」列为这些值时准入。默认「通过」。' },
-  { key: 'rejected_values', label: '人审拒绝的取值', hint: '为这些值时不下发采购。默认「拒绝」「建议拒绝」「钓鱼」。' },
-  { key: 'purchaser_values', label: '只接这些采购方', hint: '「采购方」列为这些值的行才进入本系统；留空表示不过滤。' },
-  { key: 'skip_purchase_status_values', label: '不新建采购的采购状态', hint: '「采购状态」为这些值的行只作为历史或更新。默认「已拍单」「拿回」。' },
-  { key: 'cancel_after_sale_values', label: '视为上游取消的售后状态', hint: '「售后状态」为这些值时按上游取消处理。默认不设置。' },
-]
+const admissionFields = ADMISSION_FIELDS
 
 const previewRows = computed(() =>
   (preview.value?.records ?? []).map((r) => ({
@@ -304,7 +289,9 @@ const previewRows = computed(() =>
     <div v-else-if="step === 2" class="space-y-6">
       <div>
         <h4 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">来源字段</h4>
-        <p class="mb-3 text-xs text-gray-500 dark:text-dark-400">左侧是系统字段，右侧选择飞书表里对应的列。只读取用到的列。带 * 的必须对应。</p>
+        <p class="mb-3 text-xs text-gray-500 dark:text-dark-400">
+          左侧是系统字段，右侧选择飞书表里对应的列。只读取用到的列。带 * 的必须对应。可以按顺序选多列：前一列为空时读下一列（如 ASIN 缺失时用「来源码」）。
+        </p>
         <el-table :data="systemFields?.source_fields ?? []" size="small" max-height="300" class="eq-table-card">
           <el-table-column label="系统字段" min-width="160">
             <template #default="{ row }">
@@ -314,7 +301,17 @@ const previewRows = computed(() =>
           </el-table-column>
           <el-table-column label="飞书列" min-width="240">
             <template #default="{ row }">
-              <el-select v-model="form.field_map[row.key]" size="small" class="w-full" filterable clearable placeholder="不对应">
+              <el-select
+                :model-value="form.field_map[row.key] ?? []"
+                size="small"
+                class="w-full"
+                multiple
+                filterable
+                clearable
+                placeholder="不对应"
+                :aria-label="`${row.label} 对应的飞书列`"
+                @update:model-value="(v: string[]) => (form.field_map[row.key] = v)"
+              >
                 <el-option v-for="o in fieldOptions" :key="o.value" :value="o.value" :label="o.label">
                   <span>{{ o.label }}</span><span class="ml-2 text-xs text-gray-400 dark:text-dark-500">{{ o.type }}</span>
                 </el-option>
@@ -364,7 +361,7 @@ const previewRows = computed(() =>
               class="w-full"
               placeholder="输入后回车添加"
             />
-            <p class="mt-1.5 text-xs text-gray-500 dark:text-dark-400">{{ f.hint }}</p>
+            <p class="mt-1.5 text-xs text-gray-500 dark:text-dark-400">{{ f.hint }}{{ defaultsHint(FEISHU_ADMISSION_DEFAULTS[f.key]) }}</p>
           </el-form-item>
         </div>
         <div class="flex items-center justify-between gap-4 rounded-xl border border-gray-100 px-4 py-3 dark:border-dark-700">

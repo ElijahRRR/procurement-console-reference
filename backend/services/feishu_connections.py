@@ -11,8 +11,13 @@
 - 改结果表或写回列 → 写回验收作废（writeback_verified_at 置空）。改结果表时，旧目标上 pending 的写回标 failed，
   不改投新表（v1 §6.1）；只改写回列时，pending 行按新对应重建。
 - 写回验收：在指定的测试记录上写测试值、读回比对、再恢复原值；一致才记 writeback_verified_at。
+- **表格授权**（v1 §6.1 第 3 步、§6.3）：飞书应用凭证是全部署共用的，能读到某张表不等于这个工作区有权使用它。
+  一个多维表格（app_token）同一时刻只授权给一个工作区（procure.feishu_base_grants）。解析链接、读字段、样本预览、
+  建 / 改连接、立即读取、写回验收之前都检查授权：已授权给本工作区 → 放行；尚未授权、且本工作区是部署所有者的工作区
+  （第一个工作区）→ 放行（建连接时登记授权）；其余一律 403 FORBIDDEN（不透露表格是否已归别的工作区）。
+  其他工作区要用某个表格，由部署所有者在服务器上运行 ``python cli.py feishu_grant`` 授权（grant_base）。
 
-每个查询都带工作区条件；别的工作区的连接一律 NOT_FOUND。本模块不 commit。
+每个查询都带工作区条件；别的工作区的连接一律 NOT_FOUND（授权登记表除外，它是跨工作区的）。本模块不 commit。
 """
 
 from __future__ import annotations
@@ -31,11 +36,12 @@ from api.feishu import FeishuClient, FeishuError
 from registry import settings
 from services import clock, events, feishu_fields, normalize, writeback
 from services.errors import DomainError, conflict, not_found, validation
-from services.models import SourceRef
 
 NOT_CONFIGURED_MESSAGE = "未配置飞书应用：请在 backend/.env 设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET"
 #: 预览时（还没有连接）给 SourceRef 用的连接 id：bigserial 从 1 开始，0 永远查不到来源关联；dry_run 不写库
 PREVIEW_CONNECTION_ID = 0
+#: 飞书读取的咨询锁命名空间（feishu_intake 用 pg_try_advisory_xact_lock；写回验收用阻塞版与之互斥）
+INTAKE_LOCK_NS = 7_310_432
 PREVIEW_LIMIT_MAX = 200
 
 _FEISHU_HINTS: dict[Any, str] = {
@@ -124,13 +130,122 @@ def system_fields() -> dict[str, Any]:
     }
 
 
-def resolve_link(link: str, client: Any | None = None) -> dict[str, Any]:
-    """输入：用户粘贴的多维表格 / 知识库链接、可选客户端 → 输出：{app_token, table_id, view_id, tables: [{table_id, name}]}。
+# ── 表格授权 ──────────────────────────────────────────────────────────────────
 
-    知识库链接先换出实际多维表格的 app_token（节点不是多维表格 → VALIDATION）。链接里没有 table= 且只有一张数据表时
-    取这张表；链接里的数据表不在列表里 → VALIDATION。
+NO_ACCESS_MESSAGE = ("这个多维表格还没有授权给当前工作区使用。链接只用来定位表格，不等于授权；"
+                     "请让部署管理员在服务器上运行 python cli.py feishu_grant 授权")
+GRANT_SOURCES = ("owner_workspace", "cli", "migrated")
+
+
+def _no_access() -> DomainError:
+    return DomainError("FORBIDDEN", NO_ACCESS_MESSAGE, 403)
+
+
+def owner_workspace_id(conn) -> int | None:
+    """输入：连接 → 输出：部署所有者的工作区 id（第一个工作区，首次设置时创建）；还没有工作区 → None。"""
+    row = conn.execute("SELECT min(id) AS id FROM procure.workspaces").fetchone()
+    return row["id"] if row else None
+
+
+def require_base_access(conn, workspace_id: int, app_token: str, *, claim: bool = False) -> None:
+    """输入：工作区、多维表格 app_token、是否在放行时登记授权 → 输出：无；无权使用 → 403 FORBIDDEN。
+
+    已授权给本工作区 → 放行；已授权给别的工作区 → 拒绝；尚未授权：本工作区是部署所有者的工作区 → 放行
+    （claim=True 时登记为 owner_workspace 授权），否则拒绝。拒绝时的提示不区分「没人授权」与「归别人」。
+    """
+    if not isinstance(app_token, str) or not app_token:
+        raise _no_access()
+    g = conn.execute("SELECT workspace_id FROM procure.feishu_base_grants WHERE app_token = %s",
+                     (app_token,)).fetchone()
+    if g is not None:
+        if g["workspace_id"] != workspace_id:
+            raise _no_access()
+        return
+    if workspace_id != owner_workspace_id(conn):
+        raise _no_access()
+    if claim:
+        conn.execute("INSERT INTO procure.feishu_base_grants (app_token, workspace_id, granted_by, granted_at) "
+                     "VALUES (%s, %s, 'owner_workspace', %s) ON CONFLICT (app_token) DO NOTHING",
+                     (app_token, workspace_id, clock.now()))
+        # 并发的另一个工作区刚登记了同一个表格：以库里为准
+        require_base_access(conn, workspace_id, app_token, claim=False)
+
+
+def grant_base(conn, workspace_id: int, app_token: str, *, transfer: bool = False,
+               granted_by: str = "cli") -> dict[str, Any]:
+    """输入：工作区、多维表格 app_token、是否从别的工作区转过来 → 输出：{app_token, workspace_id, granted_by,
+    previous_workspace_id}。部署所有者在服务器上用 CLI 授权（不经控制台）。
+
+    工作区不存在 → NOT_FOUND；表格已授权给别的工作区且没有 transfer → VALIDATION（转授后原工作区在这个表格上的
+    连接被停用，读取、验收都会被拒绝）。
+    """
+    if not isinstance(app_token, str) or not _TOKEN_RE.match(app_token):
+        raise validation("多维表格标识（app_token）格式不对", field="app_token")
+    if granted_by not in GRANT_SOURCES:
+        raise validation(f"未知的授权来源：{granted_by}")
+    ws = conn.execute("SELECT id FROM procure.workspaces WHERE id = %s", (workspace_id,)).fetchone()
+    if ws is None:
+        raise not_found("工作区")
+    cur = conn.execute("SELECT workspace_id FROM procure.feishu_base_grants WHERE app_token = %s FOR UPDATE",
+                       (app_token,)).fetchone()
+    prev = cur["workspace_id"] if cur else None
+    if prev is not None and prev != workspace_id and not transfer:
+        raise validation(f"这个多维表格已授权给工作区 {prev}；确需转给工作区 {workspace_id} 请加 -p transfer=1",
+                         field="app_token")
+    conn.execute(
+        "INSERT INTO procure.feishu_base_grants (app_token, workspace_id, granted_by, granted_at) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (app_token) DO UPDATE SET workspace_id = EXCLUDED.workspace_id, granted_by = EXCLUDED.granted_by, "
+        "granted_at = EXCLUDED.granted_at",
+        (app_token, workspace_id, granted_by, clock.now()))
+    events.record(conn, workspace_id, "settings", workspace_id, "feishu.base_granted", actor_kind="system",
+                  detail={"app_token": app_token, "previous_workspace_id": prev, "granted_by": granted_by})
+    disabled: list[int] = []
+    if prev is not None and prev != workspace_id:
+        disabled = _disable_base_connections(conn, prev, app_token)
+        events.record(conn, prev, "settings", prev, "feishu.base_revoked", actor_kind="system",
+                      detail={"app_token": app_token, "reason": "转授给其他工作区", "disabled_connections": disabled})
+    return {"app_token": app_token, "workspace_id": workspace_id, "granted_by": granted_by,
+            "previous_workspace_id": prev, "disabled_connections": disabled}
+
+
+def _disable_base_connections(conn, workspace_id: int, app_token: str) -> list[int]:
+    """输入：工作区、多维表格 → 输出：被停用的连接 id（授权撤销 / 转走后，原工作区的连接不再定时读取）。"""
+    rows = conn.execute(
+        "UPDATE procure.feishu_connections SET enabled = false, updated_at = %s "
+        "WHERE workspace_id = %s AND app_token = %s AND enabled RETURNING id",
+        (clock.now(), workspace_id, app_token),
+    ).fetchall()
+    for r in rows:
+        events.record(conn, workspace_id, "connection", r["id"], "connection.disabled", actor_kind="system",
+                      detail={"reason": "多维表格的授权已撤销或转给其他工作区"})
+    return [r["id"] for r in rows]
+
+
+def revoke_base(conn, app_token: str) -> dict[str, Any]:
+    """输入：多维表格 app_token → 输出：{app_token, workspace_id | None, disabled_connections}（撤销授权；
+    该工作区在这个表格上的连接随即停用，重新授权后可再启用）。"""
+    row = conn.execute("DELETE FROM procure.feishu_base_grants WHERE app_token = %s RETURNING workspace_id",
+                       (app_token,)).fetchone()
+    disabled: list[int] = []
+    if row is not None:
+        disabled = _disable_base_connections(conn, row["workspace_id"], app_token)
+        events.record(conn, row["workspace_id"], "settings", row["workspace_id"], "feishu.base_revoked",
+                      actor_kind="system", detail={"app_token": app_token, "reason": "部署管理员撤销",
+                                                   "disabled_connections": disabled})
+    return {"app_token": app_token, "workspace_id": row["workspace_id"] if row else None,
+            "disabled_connections": disabled}
+
+
+def resolve_link(conn, workspace_id: int, link: str, client: Any | None = None) -> dict[str, Any]:
+    """输入：工作区、用户粘贴的多维表格 / 知识库链接、可选客户端 → 输出：{app_token, table_id, view_id,
+    tables: [{table_id, name}]}。
+
+    知识库链接先换出实际多维表格的 app_token（节点不是多维表格 → VALIDATION）。列出数据表之前检查表格授权
+    （见模块说明，无权 → FORBIDDEN）。链接里没有 table= 且只有一张数据表时取这张表；链接里的数据表不在列表里 → VALIDATION。
     """
     parsed = feishu_fields.parse_link(link)
+    if parsed["kind"] != "wiki":
+        require_base_access(conn, workspace_id, parsed["token"])
     with client_scope(client) as c, feishu_guard("解析飞书链接"):
         app_token = parsed["token"]
         if parsed["kind"] == "wiki":
@@ -138,6 +253,7 @@ def resolve_link(link: str, client: Any | None = None) -> dict[str, Any]:
             if node.get("obj_type") != "bitable" or not node.get("obj_token"):
                 raise validation("这个知识库页面不是多维表格")
             app_token = node["obj_token"]
+            require_base_access(conn, workspace_id, app_token)
         tables = c.list_tables(app_token)
     table_id = parsed["table_id"]
     ids = [t["table_id"] for t in tables]
@@ -164,10 +280,11 @@ def _list_fields(c: Any, app_token: str, table_id: str, action: str = "读取字
         return c.list_fields(app_token, table_id)
 
 
-def fields(app_token: str, table_id: str, client: Any | None = None) -> dict[str, Any]:
-    """输入：app_token、table_id、可选客户端 → 输出：{fields: [{field_id, field_name, type, ui_type, is_primary,
-    writable, type_zh, options?}], suggested_field_map, suggested_writeback_map}。"""
+def fields(conn, workspace_id: int, app_token: str, table_id: str, client: Any | None = None) -> dict[str, Any]:
+    """输入：工作区、app_token、table_id、可选客户端 → 输出：{fields: [{field_id, field_name, type, ui_type, is_primary,
+    writable, type_zh, options?}], suggested_field_map, suggested_writeback_map}。无权使用该表格 → FORBIDDEN。"""
     _check_ids(app_token, table_id)
+    require_base_access(conn, workspace_id, app_token)
     with client_scope(client) as c:
         raw = _list_fields(c, app_token, table_id)
     names = [f["field_name"] for f in raw if f.get("field_name")]
@@ -222,21 +339,8 @@ def clean_field_map(field_map: Any, table_columns: set[str] | None = None) -> di
 
 
 def clean_admission(admission: Any) -> dict[str, Any]:
-    """输入：准入规则（可缺键）→ 输出：与 normalize.DEFAULT_ADMISSION 合并后的完整规则；未知键 → VALIDATION。"""
-    if admission is None:
-        admission = {}
-    if not isinstance(admission, dict):
-        raise validation("准入规则格式不对", field="admission")
-    unknown = set(admission) - set(normalize.DEFAULT_ADMISSION)
-    if unknown:
-        raise validation(f"准入规则里有未知的项：{'、'.join(sorted(unknown))}", field="admission")
-    for k, v in admission.items():
-        if k == "import_historical":
-            if v is not None and not isinstance(v, bool):
-                raise validation("「导入历史采购」只能是是或否", field="admission")
-        elif v is not None and not (isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v)):
-            raise validation(f"准入规则「{k}」必须是文本列表", field="admission")
-    return normalize.effective_admission({**normalize.DEFAULT_ADMISSION, **admission})
+    """输入：准入规则（可缺键）→ 输出：与 normalize.DEFAULT_ADMISSION 合并后的完整规则；未知键、取值不合格 → VALIDATION。"""
+    return normalize.effective_admission({**normalize.DEFAULT_ADMISSION, **normalize.check_admission(admission)})
 
 
 def clean_writeback_map(writeback_map: Any, result_fields: list[dict[str, Any]] | None) -> tuple[dict[str, str],
@@ -390,7 +494,8 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
 
     app_token / source_table_id 缺省时从链接解析（知识库链接经飞书换出 app_token）。会向飞书读取来源表与结果表的字段，
     核对字段对应与写回对应（见模块说明）。准入规则与缺省值合并后保存。writeback_enabled 缺省 = 写回对应非空
-    （未验收前写回只积压不发送）。同一工作区同一张来源表只能有一个连接（含已停用的）→ CONFLICT，detail 带已有连接 id。
+    （未验收前写回只积压不发送）。表格未授权给本工作区 → FORBIDDEN（部署所有者的工作区首次绑定时登记授权）。
+    同一工作区同一张来源表只能有一个连接（含已停用的）→ CONFLICT，detail 带已有连接 id。
     """
     if not isinstance(data, dict):
         raise validation("连接参数格式不对")
@@ -412,13 +517,14 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
 
     with client_scope(client) as c:
         if app_token is None:
-            resolved = resolve_link(link, c)
+            resolved = resolve_link(conn, workspace_id, link, c)
             app_token, table_id = resolved["app_token"], table_id or resolved["table_id"]
         if table_id is None:
             raise validation("请选择订单所在的数据表", field="source_table_id")
         _check_ids(app_token, table_id)
         result_table = data.get("result_table_id") or table_id
         _check_ids(app_token, result_table)
+        require_base_access(conn, workspace_id, app_token, claim=True)
         existing = find_by_table(conn, workspace_id, app_token, table_id)
         if existing is not None:
             raise conflict("这张数据表已经连接过了" + ("" if existing["enabled"] else "（已停用，可重新启用）"),
@@ -503,6 +609,8 @@ def update(conn, workspace_id: int, connection_id: int, patch: dict[str, Any], a
     result_changed = new_result != row["result_table_id"]
     map_given = "writeback_map" in patch
     field_map_given = "field_map" in patch
+    if result_changed or map_given or field_map_given or upd.get("enabled") is True:
+        require_base_access(conn, workspace_id, row["app_token"])
     if result_changed or map_given or field_map_given:
         _check_ids(row["app_token"], new_result)
         with client_scope(client) as c:
@@ -549,6 +657,9 @@ def update(conn, workspace_id: int, connection_id: int, patch: dict[str, Any], a
         detail["old_result_table_id"] = row["result_table_id"]
     elif map_changed:
         detail["rebuilt_pending_writebacks"] = writeback.rebuild_pending(conn, workspace_id, row["id"])
+    if map_changed or upd.get("writeback_enabled") is True or upd.get("enabled") is True:
+        # 停用 / 关写回 / 没设写回列期间登记的真实采购结果：补入写回队列（已入过队的版本不重复）
+        detail["backfilled_writebacks"] = writeback.backfill_connection(conn, workspace_id, row["id"])
     ak, aid = _actor(actor_user_id)
     events.record(conn, workspace_id, "connection", row["id"], "connection.updated", actor_kind=ak, actor_id=aid,
                   detail=detail)
@@ -556,7 +667,8 @@ def update(conn, workspace_id: int, connection_id: int, patch: dict[str, Any], a
 
 
 def disable(conn, workspace_id: int, connection_id: int, actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、连接 id、操作人 → 输出：连接形状（enabled=false：不再定时读取，写回只积压；可再 PATCH 启用）。"""
+    """输入：工作区、连接 id、操作人 → 输出：连接形状（enabled=false：不再定时读取，写回只积压——停用期间登记的
+    真实采购结果照常入队，只是不发送；可再 PATCH 启用）。"""
     row = get_row(conn, workspace_id, connection_id, for_update=True)
     if row["enabled"]:
         conn.execute("UPDATE procure.feishu_connections SET enabled = false, updated_at = %s WHERE id = %s "
@@ -602,12 +714,12 @@ def new_record_skip_reason(record: Any, admission: dict[str, Any]) -> str | None
 
     在 normalize.admission_skip_reason（采购方、上游取消、历史单号、已拍单）之外，飞书来源只接收人审「通过」的行
     （准入 = 人审通过，方案 v2 §3）：未审或未通过的新行不建任务，通过后下次读取自动接收。已有任务的同键记录不受此限，
-    照常作为更新交给 orders.ingest（人审撤回、取消等都要传达）。带 AMZ 订单号的历史行不看人审。
+    照常作为更新交给 orders.ingest（人审撤回、取消等都要传达）。带可信 AMZ 订单号的历史行不看人审（格式不对的单号不算）。
     """
     reason = normalize.admission_skip_reason(record, admission)
     if reason:
         return reason
-    if record.external_amz_order_no is None and record.review != "approved":
+    if not normalize.amazon_order_no_ok(record.external_amz_order_no) and record.review != "approved":
         if record.review == "rejected":
             return f"人审结论为「{record.review_value}」，不新建采购"
         if record.review_value:
@@ -627,6 +739,7 @@ def preview(conn, workspace_id: int, *, app_token: str, table_id: str, view_id: 
     其余交给 orders.ingest(dry_run=True)。已有同表连接时用它的连接 id，因而能认出「这条记录上次读过」。
     """
     _check_ids(app_token, table_id)
+    require_base_access(conn, workspace_id, app_token)
     fm = clean_field_map(field_map)
     adm = clean_admission(admission)
     try:
@@ -646,7 +759,9 @@ def preview(conn, workspace_id: int, *, app_token: str, table_id: str, view_id: 
                     break
     from services import feishu_intake  # 延迟导入：intake 也导入本模块
 
-    results = feishu_intake.evaluate_records(conn, workspace_id, cid, records, fm, types, adm, dry_run=True)
+    skip = {existing["writeback_test_record"]} if existing is not None and existing["writeback_test_record"] else set()
+    results = feishu_intake.evaluate_records(conn, workspace_id, cid, records, fm, types, adm, dry_run=True,
+                                             skip_record_ids=skip)
     stats = feishu_intake.empty_stats()
     stats.update(pending_review=0, needs_info=0)
     out = []
@@ -718,15 +833,33 @@ def verify_writeback(conn, workspace_id: int, connection_id: int, record_id: str
     """输入：工作区、连接 id、结果表里的测试记录 id、操作人、可选客户端 →
     输出：{ok, mismatches: [{result_field, column, expected, actual}], written, restored, restore_error, error, connection}。
 
+    测试记录已关联采购任务（本工作区同一张表的任何来源记录）→ VALIDATION：验收只能在专用测试记录上做（v1 §6.1）。
+    验收期间持有该连接的读取锁，读取不会在「写入测试值 → 恢复原值」之间进行；读取也永远跳过这条测试记录。
     步骤：读结果表字段（核对每个写回列仍存在且可写，并刷新列类型）→ 读测试记录原值 → 写入测试值（文本「回填验收 <时间>」、
     数字 0、采购状态「已拍单」、卡尾号 0000）→ 读回比对 → 无论成败都把原值写回去（原来为空的列清空）。
     全部一致 → 记 writeback_verified_at 与测试记录；否则验收作废（writeback_verified_at 置空）。
     写入 / 读回时飞书报错不抛异常，结果为 ok=false 并带 error；读字段失败、写回对应为空 → 抛错。
     """
+    row = get_row(conn, workspace_id, connection_id)
+    require_base_access(conn, workspace_id, row["app_token"])
+    # 与读取互斥：验收写入测试值到恢复原值之间，不让同一连接的读取把测试值当成订单结果接收。
+    # 先取读取锁、再锁连接行（与读取的加锁顺序一致，避免死锁）。
+    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (INTAKE_LOCK_NS, row["id"] % 2_147_483_647))
     row = get_row(conn, workspace_id, connection_id, for_update=True)
     record_id = _text(record_id, "测试记录", "record_id", 64, required=True)
     if not row["writeback_map"]:
         raise validation("还没有设置写回列，请先在连接里选择要写回的列")
+    linked = conn.execute(
+        "SELECT o.upstream_order_no FROM procure.order_sources s "
+        "JOIN procure.purchase_orders o ON o.id = s.purchase_order_id AND o.workspace_id = s.workspace_id "
+        "WHERE s.workspace_id = %s AND s.kind = 'feishu' AND s.feishu_record_id = %s "
+        "AND s.feishu_connection_id IN (SELECT id FROM procure.feishu_connections WHERE workspace_id = %s "
+        "AND app_token = %s AND (source_table_id = %s OR result_table_id = %s)) LIMIT 1",
+        (workspace_id, record_id, workspace_id, row["app_token"], row["result_table_id"], row["result_table_id"]),
+    ).fetchone()
+    if linked is not None:
+        raise validation(f"这条记录已关联采购任务 {linked['upstream_order_no']}，验收会写入测试值，"
+                         "请改用一条专用测试记录", field="record_id")
     app_token, table_id = row["app_token"], row["result_table_id"]
     stamp = clock.now().astimezone(clock.BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     result: dict[str, Any] = {"ok": False, "mismatches": [], "written": {}, "restored": False, "restore_error": None,
@@ -791,11 +924,3 @@ def _jsonable(v: Any) -> Any:
     if isinstance(v, Decimal):
         return format(v, "f")
     return v
-
-
-# ── 读取任务用的来源引用 ────────────────────────────────────────────────────────
-
-
-def source_ref(connection_id: int, record_id: str, snapshot: dict[str, Any]) -> SourceRef:
-    """输入：连接 id（预览时可为 PREVIEW_CONNECTION_ID）、记录 id、快照 → 输出：SourceRef(kind='feishu')。"""
-    return SourceRef(kind="feishu", snapshot=snapshot, connection_id=connection_id, record_id=record_id)

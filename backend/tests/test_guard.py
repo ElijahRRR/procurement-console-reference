@@ -184,3 +184,71 @@ def test_non_dict_facts_block():
 def test_missing_price_cap_blocks():
     v = _eval(_facts(), price_cap=None)
     assert v["code"] == "PRICE_OVER_CAP" and "没有有效限价" in v["reasons"][0]
+
+
+def test_price_cap_reason_spacing_and_gift_card_wording():
+    v = _eval(_facts(), price_cap=Decimal("50.00"))
+    assert v["reasons"][0] == "结算总额 $52.00 超过限价 $50.00"
+    v = _eval(_facts(total="42.00", gift_card_amount="10.00"), price_cap=Decimal("50.00"))
+    assert v["reasons"][0] == "结算总额 $52.00（结算页 $42.00 + 礼品卡抵扣 $10.00）超过限价 $50.00"
+
+
+@pytest.mark.parametrize("cap,verdict", [("52.009", "pass"), ("52.005", "pass"), ("51.999", "block")])
+def test_price_cap_is_rounded_down_to_cents(cap, verdict):
+    """限价按 money_cap 向下取两位：51.999 → 51.99（52.00 超出，拦截），52.009 → 52.00（相等放行）。"""
+    v = _eval(_facts(), price_cap=Decimal(cap))
+    assert v["verdict"] == verdict
+    assert v["checks"]["price_cap"]["expected"] == f"{Decimal(cap).quantize(Decimal('0.01'), rounding='ROUND_DOWN')}"
+
+
+# ── 规范化（入库前）─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("facts", [
+    _facts(),
+    _facts(card_last4="4111 1111 1111 1111"),
+    _facts(card_last4={"pan": "4111111111111111"}),
+    _facts(card_last4=7860),
+    _facts(total=True), _facts(total=["52.00"]), _facts(total="5" * 19), _facts(total=float("nan")),
+    _facts(total=float("inf")), _facts(total="  52.00  "), _facts(total=52),
+    _facts(gift_card_amount={"x": 1}), _facts(gift_card_amount=False),
+    _facts(currency={"code": "USD"}), _facts(currency="USD" + " " * 20 + "X"), _facts(currency=" usd "),
+    _facts(items="B0DEMO0001"), _facts(items=[{"asin": "B0DEMO0001", "quantity": 1}] * 30),
+    _facts(items=[["B0DEMO0001", 1]]), _facts(items=[{"asin": 123, "quantity": 1.0}]),
+    _facts(items=[{"asin": "B0DEMO0001", "quantity": {"n": 1}}]),
+    _facts(items=[{"asin": "B0DEMO0001" + " " * 15 + "Z", "quantity": 1}]),
+    _facts(delivery="Nov 3"), _facts(delivery={"date": 20261103, "days": "4"}),
+    _facts(delivery={"date": None, "days": True}), _facts(delivery={"text": "x" * 5000, "days": 4}),
+    _facts(ship_to="32960"), _facts(ship_to={"postal_code": 32960}), _facts(ship_to={"postal_code": ["32960"]}),
+    _facts(fulfillment={"by": "amazon"}),
+    "garbage", None,
+])
+def test_sanitize_keeps_verdict(facts):
+    raw = _eval(facts)
+    clean = guard.sanitize_facts(facts)
+    assert set(clean) == set(guard.FACT_KEYS)
+    v = _eval(clean)
+    assert (v["verdict"], v["code"]) == (raw["verdict"], raw["code"])
+    assert v["checks"]["card"]["actual"] == raw["checks"]["card"]["actual"]
+
+
+def test_sanitize_drops_unknown_keys_trims_card_and_text():
+    clean = guard.sanitize_facts(_facts(card_last4="4111-1111-1111-1111", billing={"cvv": "123"},
+                                        ship_to={"postal_code": "32960", "name": "Demo Buyer"},
+                                        delivery={"text": "y" * 300, "date": "2026-11-03", "days": None, "x": 1},
+                                        items=[{"asin": "B0DEMO0001", "quantity": 1, "unit_price": "48.00",
+                                                "title": "DEMO"}]))
+    assert "billing" not in clean and clean["card_last4"] == "1111"
+    assert clean["ship_to"] == {"postal_code": "32960"}
+    assert clean["delivery"] == {"text": "y" * 200, "date": "2026-11-03", "days": None}
+    assert clean["items"] == [{"asin": "B0DEMO0001", "quantity": 1, "unit_price": "48.00"}]
+    assert guard.sanitize_facts({"total": float("inf")})["total"] == guard.INVALID
+    assert len(guard.sanitize_facts(_facts(items=[{}] * 50))["items"]) == 20
+
+
+@pytest.mark.parametrize("total", ["5" * 30, 10 ** 40, 1e300, "9" * 25 + ".99"])
+def test_absurd_amounts_never_crash_and_block_as_data_unreliable(total):
+    """位数大到无法取两位小数的金额：不报 500，按格式不对拦截（规范化前后都一样）。"""
+    for facts in (_facts(total=total), guard.sanitize_facts(_facts(total=total))):
+        v = _eval(facts)
+        assert v["verdict"] == "block" and v["code"] == "DATA_UNRELIABLE"

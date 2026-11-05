@@ -68,11 +68,11 @@ def test_allocate_workflow_runs_every_workspace_in_own_transaction(conn, workspa
     o = f.ingest_ready_order(conn, ws)
     f.ingest_ready_order(conn, other["id"])
     conn.commit()
-    out = allocate_wf.run()
+    out = allocate_wf.run(trigger="daily")
     assert set(out["workspaces"]) == {str(ws), str(other["id"])}
     assert out["workspaces"][str(ws)]["trigger"] == "daily"
     assert out["workspaces"][str(ws)]["stats"]["assigned"] == 1
     assert out["workspaces"][str(other["id"])]["stats"]["unassigned"] == 1
     assert orders.get_row(conn, ws, o["id"])["status"] == "assigned"
-    one = allocate_wf.run(workspace_id=str(ws), trigger="manual")
+    one = allocate_wf.run(workspace_id=str(ws))                      # CLI 缺省 = 人工「重新分配」
     assert list(one["workspaces"]) == [str(ws)] and one["workspaces"][str(ws)]["trigger"] == "manual"

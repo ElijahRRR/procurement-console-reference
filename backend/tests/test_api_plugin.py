@@ -209,3 +209,70 @@ def test_simulation_reset_restores_orders_and_resumes_accounts(owner, api):
     assert sorted(view_nos(owner, "today")) == ["PO-DEMO-X0001", "PO-DEMO-X0002"]
     acc_view = ok(owner.get(f"/api/v1/accounts/{acc['id']}"))
     assert acc_view["execution_paused"] is False and acc_view["quota_today"]["used"] == 0
+
+
+def test_late_success_after_sweep_is_recorded_and_answered_with_409(owner, api):
+    """清扫后才送到的成功回执：回 409 CONFLICT（detail.late_receipt_recorded），但回执已提交入库，
+    控制台核实时能看到单号；任务保持结果待核实。"""
+    from datetime import timedelta
+
+    from services import clock
+    from tests.api_helpers import NOW
+    from workflows import sweep as sweep_wf
+
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=good_facts(att), headers=h))
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h))
+    clock.freeze(NOW + timedelta(seconds=181))
+    assert sweep_wf.run()["unknown"] == 1
+    no = f"SIM-{TODAY:%Y%m%d}-{att['attempt_id']}"
+    body = err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
+                           json={"outcome": "succeeded", "amazon_order_no": no, "amounts": {"total": "25.00"}},
+                           headers=h), 409, "CONFLICT")
+    assert body["detail"] == {"attempt_status": "unknown", "order_status": "result_unknown",
+                              "late_receipt_recorded": True}
+    row = find_order(owner, "PO-DEMO-X0001")
+    assert row["status"] == "result_unknown"
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert detail["attempts"][0]["status"] == "unknown" and detail["attempts"][0]["amazon_order_no"] == no
+    assert any(e["kind"] == "attempt.late_result" and e["detail"]["amazon_order_no"] == no for e in detail["events"])
+    assert ok(owner.get(f"/api/v1/accounts/{acc['id']}"))["execution_paused"] is True
+
+
+def test_guard_facts_are_stored_sanitized(owner, api):
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
+    facts = good_facts(att, card_last4="4111 1111 1111 1111", billing={"card_number": "4111111111111111", "cvv": "123"})
+    assert ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=facts, headers=h))["verdict"] == "pass"
+    row = find_order(owner, "PO-DEMO-X0001")
+    resp = owner.get(f"/api/v1/orders/{row['id']}")
+    stored = ok(resp)["attempts"][0]["guard_input"]
+    assert stored["card_last4"] == "1111" and "billing" not in stored
+    assert "4111111111111111" not in resp.text and "cvv" not in resp.text
+
+
+def test_upstream_change_after_claim_stops_submit_over_http(owner, api):
+    """领取后重新导入：内容相同不算变化；ASIN 被改 → 进度 continue=false、提交登记 409 SOURCE_CHANGED，
+    插件中止后任务进待核实。"""
+    acc, plugin, dev = _ready(owner, api)
+    h = bearer(dev["token"])
+    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
+    ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=good_facts(att), headers=h))
+    import_orders(owner, [import_row("PO-DEMO-X0001", **{"备注": "DEMO 第二批"})])             # 内容相同：不算变化
+    pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress", json={"stage": "x"}, headers=h))
+    assert pr["continue"] is True
+    import_orders(owner, [import_row("PO-DEMO-X0001", **{"ASIN": "B0DEMO0X01"})])
+    pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress", json={"stage": "y"}, headers=h))
+    assert pr["continue"] is False and "ASIN" in pr["cancel_reason"]
+    err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/submitting", headers=h), 409, "SOURCE_CHANGED")
+    res = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
+                         json={"outcome": "failed", "error_code": "ABORTED_UPSTREAM_CANCELLED",
+                               "error_detail": pr["cancel_reason"]}, headers=h))
+    assert res == {"attempt_status": "aborted", "order_status": "conflict"}
+    assert view_nos(owner, "conflict") == ["PO-DEMO-X0001"]

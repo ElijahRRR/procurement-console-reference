@@ -2,6 +2,7 @@
 import { asPage, del, download, get, post, request } from './client'
 import type {
   ImportBatch,
+  ImportCommitResult,
   ImportPreview,
   ImportRow,
   ImportTemplate,
@@ -19,7 +20,7 @@ export function uploadImport(file: File): Promise<UploadResult> {
   return request<UploadResult>('POST', '/imports', { form })
 }
 
-/** 输入：批次 id、工作表、{表头: 系统字段} → 输出：预览统计与第一页行 */
+/** 输入：批次 id、工作表、{表头: 系统字段} → 输出：预览统计与第一页行（准入规则用工作区设置里的文件准入规则） */
 export const previewImport = (id: number, sheet: string, mapping: Record<string, string | null>) =>
   post<ImportPreview>(`/imports/${id}/preview`, { sheet, mapping })
 
@@ -29,8 +30,11 @@ export const listImportRows = async (
   query: PageQuery & { verdict?: ImportVerdict | '' } = {},
 ): Promise<Page<ImportRow>> => asPage(await get<Page<ImportRow>>(`/imports/${id}/rows`, { ...query }))
 
-/** 输入：批次 id → 输出：提交后的批次（逐行进入任务流） */
-export const commitImport = (id: number) => post<ImportBatch>(`/imports/${id}/commit`, {})
+/** 输入：批次 id → 输出：批次（含最近一次的字段对应），用于继续未完成的导入 */
+export const getImport = (id: number) => get<ImportBatch>(`/imports/${id}`)
+
+/** 输入：批次 id → 输出：{batch, stats, allocation}（逐行进入任务流，随后分配一次） */
+export const commitImport = (id: number) => post<ImportCommitResult>(`/imports/${id}/commit`, {})
 
 /** 输入：批次 id → 输出：放弃后的批次 */
 export const discardImport = (id: number) => post<ImportBatch>(`/imports/${id}/discard`, {})
@@ -39,15 +43,15 @@ export const discardImport = (id: number) => post<ImportBatch>(`/imports/${id}/d
 export const listImports = async (query: PageQuery = { page: 1, page_size: 20 }): Promise<Page<ImportBatch>> =>
   asPage(await get<Page<ImportBatch>>('/imports', { ...query }))
 
-/** 输入：无 → 输出：无（下载标准模板） */
-export const downloadTemplate = () => download('/imports/template.xlsx')
+/** 输入：无 → 输出：保存的文件名（下载标准模板）；失败抛 ApiError */
+export const downloadTemplate = () => download('/imports/template.xlsx', undefined, '采购导入模板.xlsx')
 
-/** 输入：批次 id → 输出：无（下载问题行：原列 + 结论 + 原因） */
-export const downloadProblems = (id: number) => download(`/imports/${id}/problems.xlsx`)
+/** 输入：批次 id → 输出：保存的文件名（下载问题行：原列 + 结论 + 原因）；失败抛 ApiError */
+export const downloadProblems = (id: number) => download(`/imports/${id}/problems.xlsx`, undefined, `问题行-批次${id}.xlsx`)
 
-/** 输入：批次 id 或视图 → 输出：无（下载结果 xlsx） */
+/** 输入：批次 id 或视图 → 输出：保存的文件名（下载结果 xlsx）；失败抛 ApiError */
 export const downloadOrdersExport = (query: { batch_id?: number; view?: OrderView }) =>
-  download('/exports/orders.xlsx', { ...query })
+  download('/exports/orders.xlsx', { ...query }, '采购结果.xlsx')
 
 /** 输入：无 → 输出：个人模板 {total, rows} */
 export const listTemplates = async (): Promise<Page<ImportTemplate>> =>

@@ -2,27 +2,26 @@
 /**
  * 任务列表卡片（待采购、采购记录、异常处理共用）：el-segmented 视图切换 + 搜索 + 表格 + 分页 + 详情抽屉。
  * 当前视图与搜索词同步到地址栏（?view=&q=），便于从概览跳转与刷新后保持。
+ * 筛选全部交给服务端（视图 + 附加条件如 needs_attention），total 按全部条件计数，正常分页。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { OrderRow, OrderView, Page } from '@/api/types'
-import type { Query as ClientQuery } from '@/api/client'
+import type { OrderQuery, OrderRow, OrderView } from '@/api/types'
 import * as ordersApi from '@/api/orders'
-import { get } from '@/api/client'
 import AppIcon from '@/components/AppIcon.vue'
 import OrderTable from './OrderTable.vue'
 import OrderDetailDrawer from './OrderDetailDrawer.vue'
 import { formatNumber } from '@/utils/format'
-import { confirmAction, notifyFailure, notifySuccess } from '@/utils/feedback'
+import { bulkReviewSummary } from '@/utils/results'
+import { confirmAction, notifyFailure, notifySummary } from '@/utils/feedback'
 
 export interface OrderTab {
   value: string
   label: string
   /** 后端视图；不给时等于 value */
   view?: OrderView
-  /** 附加查询参数（契约之外的筛选，后端不认时由 filter 在前端兜底） */
-  extraQuery?: ClientQuery
-  filter?: (row: OrderRow) => boolean
+  /** 与视图组合的附加筛选（服务端过滤），如需要留意 {needs_attention: true} */
+  query?: Pick<OrderQuery, 'needs_attention' | 'account_id' | 'source'>
   count?: number | null
   emptyTitle?: string
   emptyDescription?: string
@@ -61,6 +60,8 @@ const drawerOpen = ref(false)
 const drawerId = ref<number | null>(null)
 
 const current = computed(() => props.tabs.find((t) => t.value === tab.value) ?? props.tabs[0])
+/** 当前标签页对应的后端视图（导出等按它取数） */
+const currentView = computed<OrderView>(() => (current.value.view ?? current.value.value) as OrderView)
 const bulkEnabled = computed(() => props.bulkReviewTabs.includes(tab.value))
 const segmentOptions = computed(() =>
   props.tabs.map((t) => ({
@@ -75,28 +76,16 @@ async function load() {
   loading.value = true
   try {
     const t = current.value
-    let res: Page<OrderRow>
-    if (t.extraQuery) {
-      const query: ClientQuery = { view: t.view ?? 'all', q: q.value.trim(), page: page.value, page_size: pageSize.value, ...t.extraQuery }
-      const raw = await get<Page<OrderRow>>('/orders', query)
-      res = { total: raw?.total ?? 0, rows: raw?.rows ?? [] }
-    } else {
-      res = await ordersApi.listOrders({
-        view: (t.view ?? t.value) as OrderView,
-        q: q.value.trim() || undefined,
-        page: page.value,
-        page_size: pageSize.value,
-      })
-    }
+    const res = await ordersApi.listOrders({
+      ...t.query,
+      view: currentView.value,
+      q: q.value.trim() || undefined,
+      page: page.value,
+      page_size: pageSize.value,
+    })
     if (my !== seq) return
-    if (t.filter) {
-      const kept = res.rows.filter(t.filter)
-      rows.value = kept
-      total.value = kept.length === res.rows.length ? res.total : kept.length
-    } else {
-      rows.value = res.rows
-      total.value = res.total
-    }
+    rows.value = res.rows
+    total.value = res.total
   } catch (e) {
     if (my !== seq) return
     rows.value = []
@@ -153,7 +142,8 @@ function onChanged() {
 }
 
 async function bulk(decision: 'approve' | 'reject') {
-  const ids = selection.value.map((r) => r.id)
+  const picked = [...selection.value]
+  const ids = picked.map((r) => r.id)
   if (!ids.length) return
   const approve = decision === 'approve'
   const ok = await confirmAction({
@@ -166,8 +156,9 @@ async function bulk(decision: 'approve' | 'reject') {
   if (!ok) return
   bulkBusy.value = true
   try {
-    await ordersApi.bulkReview(ids, decision)
-    notifySuccess(approve ? `已通过 ${formatNumber(ids.length)} 笔任务` : `已拒绝 ${formatNumber(ids.length)} 笔任务`)
+    // 服务端只处理仍在开始前状态的任务（列表可能已过时：别的窗口或后台读取改了状态），其余列进 skipped
+    const res = await ordersApi.bulkReview(ids, decision)
+    notifySummary(bulkReviewSummary(res, decision, picked), res.updated.length ? undefined : 'error')
     selection.value = []
     onChanged()
   } catch (e) {
@@ -177,15 +168,17 @@ async function bulk(decision: 'approve' | 'reject') {
   }
 }
 
-defineExpose({ reload: load })
+defineExpose({ reload: load, currentView })
 </script>
 
 <template>
   <div>
     <div class="mb-4 flex flex-wrap items-center gap-3">
-      <el-segmented v-model="tab" :options="segmentOptions" />
-      <div class="ml-auto flex flex-wrap items-center gap-3">
-        <el-input v-model="q" style="width: 18rem" clearable placeholder="搜索平台订单号、ASIN、收件人" @input="onSearch" @clear="onSearch">
+      <div class="pc-segmented-scroll">
+        <el-segmented v-model="tab" :options="segmentOptions" />
+      </div>
+      <div class="ml-auto flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
+        <el-input v-model="q" class="w-full sm:!w-72" clearable placeholder="搜索平台订单号、ASIN、收件人" @input="onSearch" @clear="onSearch">
           <template #prefix><AppIcon name="search" size="sm" /></template>
         </el-input>
         <slot name="tools" :tab="tab" />

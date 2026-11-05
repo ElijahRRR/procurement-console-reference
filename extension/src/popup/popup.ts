@@ -1,9 +1,9 @@
 /** 工具栏弹出页：一眼看状态（服务端、设备、账号、身份、执行），按钮「打开设置」「立即同步」。 */
 
 import type { StateSnapshot } from "../core/messages.js";
-import { fetchState, onStateChange, toSw } from "../ui/bridge.js";
+import { fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
 import { LOGO_SVG, themeCss } from "../ui/theme.js";
-import { accountText, connectionText, h, identityText, quotaText, scheduleText } from "../ui/view.js";
+import { accountText, connectionText, h, identityText, quotaText, receiptLines, runActive, scheduleText } from "../ui/view.js";
 
 const POPUP_CSS = `
 body { margin: 0; width: 340px; background: var(--pc-bg-page); color: var(--pc-text-body); font: 400 14px/20px var(--pc-font-sans); -webkit-font-smoothing: antialiased; }
@@ -51,7 +51,8 @@ function render(): void {
     const conn = connectionText(s, Date.now());
     const ident = identityText(s);
     const dot = conn.tone === "success" ? "pc-dot pc-dot-green" : conn.tone === "danger" ? "pc-dot pc-dot-red" : conn.tone === "warning" ? "pc-dot pc-dot-yellow" : "pc-dot";
-    const run = s.run?.active ? s.run.view : null;
+    const run = runActive(s) ? s.run?.view ?? null : null;
+    const receipts = receiptLines(s).length;
     body.append(
       h(
         "dl",
@@ -61,6 +62,8 @@ function render(): void {
         h("dt", {}, "身份"), h("dd", {}, h("span", { class: `pc-tag pc-tag-${ident.tone}` }, ident.short)),
         h("dt", {}, "额度"), h("dd", {}, quotaText(s)),
         h("dt", {}, "执行"), h("dd", {}, run ? `执行中：批次 #${run.run_id ?? "—"} · ${run.stage_label ?? run.message ?? "—"}` : scheduleText(s)),
+        receipts ? h("dt", {}, "回执") : null,
+        receipts ? h("dd", {}, `${receipts} 条结果回执待补交（服务端恢复后自动补交）`) : null,
       ),
     );
   }
@@ -93,3 +96,4 @@ async function refresh(): Promise<void> {
 
 onStateChange(() => void refresh());
 void refresh();
+keepFresh("打开弹出页", () => state);

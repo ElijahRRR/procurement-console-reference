@@ -11,7 +11,10 @@
   不会把控制台已处理过的冲突、覆盖值、人工人审结论再改回去。第一次见到的来源记录（如新批次文件行）
   与任务现值比较，None 表示「没有或没读到」，不清空已有值；收件信息作为一组整体替换。
 - 来源更新按任务状态分别处理（开始前改原值并重新派生；异常时改原值但保持异常；开始后只记事件并置
-  needs_attention），上游取消、外部 AMZ 订单号、跨来源冲突各有专门规则，见 ingest() 说明。
+  needs_attention），上游取消、外部 AMZ 订单号、跨来源冲突、人审拒绝、准入变化（采购方 / 采购状态）、平台订单号变化
+  各有专门规则，见 ingest() 说明。「这笔任务不该再执行」的来源变化在开始前一律转「待核实」（conflict，按种类：
+  fields / review / external_order_no / admission / source_key_changed）并解除分配，由 resolve_conflict 人工处理；
+  执行中未提交的写在任务的 conflict 上（插件据此中止，见 execution）。
 - 人工动作都写带操作者的事件；本模块的动作**不自动触发重新分配**（契约 §3.2 的触发点只有来源导入/同步后、
   人工点「重新分配」、账号配置变化、每日 00:01），回到「待分配」的任务等待下一次分配。
 """
@@ -26,7 +29,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from services import clock, events, writeback
+from services import clock, events, normalize, writeback
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import (
     ATTEMPT_INFLIGHT,
@@ -38,6 +41,7 @@ from services.models import (
     SourceRef,
     UpstreamRecord,
     money,
+    money_cap,
 )
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
@@ -60,8 +64,6 @@ UNSET: Any = _Unset()
 PRE = PRE_EXECUTION_STATUSES
 #: derive_status() 可能给出的状态（开始前的状态 + 外部单号的 purchased + 上游取消的 cancelled）
 DERIVED_STATUSES = frozenset(PRE | {"purchased", "cancelled"})
-#: 采购已开始（或已结束）：来源更新不再改执行相关原值
-STARTED_STATUSES = frozenset({"executing", "result_unknown", "purchased", "repurchase_pending", "closed"})
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     **{s: frozenset((DERIVED_STATUSES - {s}) | ({"executing"} if s == "assigned" else set())) for s in PRE},
@@ -113,14 +115,28 @@ FIELD_LABELS: dict[str, str] = {
     **{k: v for k, v in REQUIRED_FOR_EXECUTION},
     "order_line_id": "订单行 ID", "store_name": "店铺", "sales_po_no": "采购订单号", "sku": "SKU",
     "sales_total": "销售总额", "order_time": "下单时间", "ship_days": "配送天数", "ship_method": "配送方式",
-    "address2": "地址2", "country": "国家", "district": "收货人区", "review_status": "人审结论",
-    "review_value": "人工审核", "external_amz_order_no": "AMZ订单号", "upstream_cancelled": "上游取消",
+    "address2": "地址 2", "country": "国家", "district": "收货人区", "review_status": "人审结论",
+    "review_value": "人工审核", "external_amz_order_no": "AMZ 订单号", "upstream_cancelled": "上游取消",
+    "upstream_order_no": "平台订单号", "purchaser": "采购方", "purchase_status_value": "采购状态",
 }
 
 _OVERRIDE_COLS = ("override_asin", "override_quantity", "override_price_cap")
 _INFLIGHT = sorted(ATTEMPT_INFLIGHT)
+#: missing_fields 历史上曾存过中文名：读出时换回字段键
+_LABEL_TO_KEY = {label: key for key, label in REQUIRED_FOR_EXECUTION}
+_CJK = "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_CJK_THEN_LATIN = re.compile(f"([{_CJK}])([A-Za-z0-9$])")
+_LATIN_THEN_CJK = re.compile(f"([A-Za-z0-9%])([{_CJK}])")
 
-INGEST_VERDICTS = ("new", "update", "unchanged", "conflict", "historical", "invalid")
+
+def cn_spacing(text: str) -> str:
+    """输入：拼好的中文文案 → 输出：中文与英文 / 数字之间补半角空格（与前端 cnSpacing 相同规则）。"""
+    return _LATIN_THEN_CJK.sub(r"\1 \2", _CJK_THEN_LATIN.sub(r"\1 \2", text))
+
+
+def field_labels(keys) -> str:
+    """输入：字段键序列 → 输出：「、」连接的中文名。"""
+    return "、".join(FIELD_LABELS.get(k, k) for k in keys)
 
 
 @dataclass
@@ -189,13 +205,26 @@ def compute_suggested_date(order_time: datetime | None, ship_days: int | None) -
         return None
     if order_time.tzinfo is None:
         order_time = order_time.replace(tzinfo=clock.BJ_TZ)
-    return clock.bj_date(order_time) + timedelta(days=6 - int(ship_days))
+    try:
+        return clock.bj_date(order_time) + timedelta(days=6 - int(ship_days))
+    except (OverflowError, ValueError):     # 配送天数或下单时间离谱（如把日期填进了天数列）：当作算不出
+        return None
+
+
+def _zip_ok(row: dict[str, Any], v: Any) -> bool:
+    if not isinstance(v, str) or not v.strip():
+        return False
+    if (row.get("country") or "US").upper() != "US":
+        return True
+    head = re.split(r"[-\s]", v.strip())[0]
+    return head.isdigit() and len(head) == 5
 
 
 def compute_missing_fields(row: dict[str, Any]) -> list[str]:
-    """输入：任务行（或同形状 dict）→ 输出：缺失的执行所需字段中文名列表（models.REQUIRED_FOR_EXECUTION 顺序）。"""
+    """输入：任务行（或同形状 dict）→ 输出：缺失或无效的执行所需字段**键**列表（models.REQUIRED_FOR_EXECUTION 顺序，
+    如 ['asin', 'postal_code']）。无效也算缺：ASIN 不是 10 位、数量不是正整数、金额 ≤ 0、美国邮编主体不是 5 位数字。"""
     missing: list[str] = []
-    for key, label in REQUIRED_FOR_EXECUTION:
+    for key, _label in REQUIRED_FOR_EXECUTION:
         if key == "asin":
             v = asin_eff(row)
             ok = isinstance(v, str) and bool(ASIN_RE.match(v))
@@ -210,11 +239,13 @@ def compute_missing_fields(row: dict[str, Any]) -> list[str]:
             ok = v is not None and Decimal(v) > 0
         elif key == "suggested_purchase_date":
             ok = row.get("suggested_purchase_date") is not None
+        elif key == "postal_code":
+            ok = _zip_ok(row, row.get(key))
         else:
             v = row.get(key)
             ok = isinstance(v, str) and bool(v.strip())
         if not ok:
-            missing.append(label)
+            missing.append(key)
     return missing
 
 
@@ -249,13 +280,13 @@ def derived_reason(row: dict[str, Any], status: str) -> str | None:
         return "缺少人审通过结论，等待人审"
     if status == "needs_info":
         missing = compute_missing_fields(row)
-        return "缺少：" + "、".join(missing) if missing else None
+        return "缺少：" + field_labels(missing) if missing else None
     if status == "conflict":
         c = row.get("conflict") or {}
         if c.get("reason"):
             return c["reason"]
         fields = list((c.get("fields") or {}).keys())
-        return "来源内容冲突：" + "、".join(FIELD_LABELS.get(f, f) for f in fields) if fields else "来源内容冲突"
+        return cn_spacing("来源内容冲突：" + field_labels(fields)) if fields else "来源内容冲突"
     if status == "cancelled":
         note = row.get("upstream_cancel_note")
         return f"上游取消（{note}）" if note else "上游取消"
@@ -411,6 +442,16 @@ def _rederive(conn, workspace_id: int, order: dict[str, Any], upd: dict[str, Any
                       updates=upd, event_detail=event_detail)
 
 
+def rederive(conn, order_row: dict[str, Any], *, actor_kind: str, actor_id: int | None = None,
+             reason_detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    """输入：开始前状态的任务行、操作者 → 输出：按派生规则重新校验后的任务行（如带着冲突回到「已分配」的任务 → 待核实）。
+    不是开始前状态 → 原样返回。"""
+    if order_row["status"] not in PRE:
+        return order_row
+    return _rederive(conn, order_row["workspace_id"], order_row, {}, actor_kind=actor_kind, actor_id=actor_id,
+                     event_detail=reason_detail)
+
+
 def next_attempt_no(conn, order_id: int, *, workspace_id: int | None = None) -> int:
     """输入：任务 id → 输出：下一次尝试的序号（从 1 开始）。"""
     sql = "SELECT COALESCE(max(attempt_no), 0) + 1 AS n FROM procure.purchase_attempts WHERE purchase_order_id = %s"
@@ -419,22 +460,6 @@ def next_attempt_no(conn, order_id: int, *, workspace_id: int | None = None) -> 
         sql += " AND workspace_id = %s"
         params.append(workspace_id)
     return int(conn.execute(sql, params).fetchone()["n"])
-
-
-def next_attempt_kind(conn, order_row: dict[str, Any]) -> str:
-    """输入：任务行 → 输出：下一次尝试的种类：曾成功过（含外部单号）→ 'repurchase'；
-    最近一次本系统尝试失败或中止 → 'retry'；否则 'auto'。"""
-    rows = conn.execute(
-        "SELECT kind, status FROM procure.purchase_attempts WHERE purchase_order_id = %s AND workspace_id = %s "
-        "ORDER BY attempt_no DESC",
-        (order_row["id"], order_row["workspace_id"]),
-    ).fetchall()
-    if any(r["status"] == "succeeded" for r in rows):
-        return "repurchase"
-    own = [r for r in rows if r["kind"] != "external"]
-    if own and own[0]["status"] in ("failed", "aborted"):
-        return "retry"
-    return "auto"
 
 
 def inflight_attempt(conn, order_row: dict[str, Any]) -> dict[str, Any] | None:
@@ -507,6 +532,18 @@ def _clean_text(v: Any) -> str | None:
     return s or None
 
 
+_MONEY_LIMIT = Decimal(10) ** 10
+
+
+def _safe_money(v: Any, *, cap: bool = False) -> Decimal | None:
+    """金额 → 两位小数（限价 cap=True 向下取整）；换算不了或超出 numeric(12,2) → None（不当 0）。"""
+    try:
+        d = (money_cap if cap else money)(v)
+    except (InvalidOperation, ValueError, ArithmeticError):
+        return None
+    return d if d is not None and abs(d) < _MONEY_LIMIT else None
+
+
 def _record_values(rec: UpstreamRecord) -> dict[str, Any]:
     """输入：上游记录 → 输出：它对应的任务原值列（含下单北京日期、建议采购日期及依据、人审、取消、外部单号）。"""
     vals: dict[str, Any] = {}
@@ -521,7 +558,7 @@ def _record_values(rec: UpstreamRecord) -> dict[str, Any]:
     q = rec.quantity
     vals["quantity"] = q if isinstance(q, int) and not isinstance(q, bool) and q > 0 else None
     for f in ("unit_price", "sales_total", "price_cap"):
-        vals[f] = money(getattr(rec, f))
+        vals[f] = _safe_money(getattr(rec, f), cap=(f == "price_cap"))
     sd = rec.ship_days
     vals["ship_days"] = sd if isinstance(sd, int) and not isinstance(sd, bool) else None
     ot = rec.order_time
@@ -582,7 +619,9 @@ def _find_link(conn, workspace_id: int, source: SourceRef) -> dict[str, Any] | N
 
 
 def _upsert_link(conn, workspace_id: int, order_id: int, link: dict[str, Any] | None,
-                 record: UpstreamRecord, source: SourceRef) -> None:
+                 record: UpstreamRecord, source: SourceRef, primary_kind: str) -> None:
+    """写 / 更新来源关联。写回目标：只有**主来源是飞书**的任务，第一个飞书来源自动成为写回目标；文件为主的任务
+    后来出现的同键飞书记录只追加关联（is_writeback_target=false），要写回须人工指定（v1 §6.2，set_writeback_target）。"""
     now = clock.now()
     snapshot = Jsonb(_j(source.snapshot or {}))
     normalized = Jsonb(record.to_json())
@@ -595,9 +634,11 @@ def _upsert_link(conn, workspace_id: int, order_id: int, link: dict[str, Any] | 
         )
         return
     has_target = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM procure.order_sources WHERE purchase_order_id = %s AND is_writeback_target) AS t",
-        (order_id,),
+        "SELECT EXISTS (SELECT 1 FROM procure.order_sources WHERE purchase_order_id = %s AND workspace_id = %s "
+        "AND is_writeback_target) AS t",
+        (order_id, workspace_id),
     ).fetchone()["t"]
+    is_target = source.kind == "feishu" and primary_kind == "feishu" and not has_target
     conn.execute(
         """
         INSERT INTO procure.order_sources
@@ -610,7 +651,7 @@ def _upsert_link(conn, workspace_id: int, order_id: int, link: dict[str, Any] | 
          source.record_id if source.kind == "feishu" else None,
          source.batch_id if source.kind == "file" else None,
          source.row_no if source.kind == "file" else None,
-         snapshot, normalized, fp, source.kind == "feishu" and not has_target, now, now),
+         snapshot, normalized, fp, is_target, now, now),
     )
 
 
@@ -618,7 +659,7 @@ def _status_issues(row: dict[str, Any], status: str) -> list[str]:
     if status == "pending_review":
         return [f"{derived_reason(row, status)}，停在待确认"]
     if status == "needs_info":
-        return [f"缺少执行所需字段：{'、'.join(compute_missing_fields(row))}，停在资料待补齐"]
+        return [cn_spacing(f"缺少执行所需字段：{field_labels(compute_missing_fields(row))}，停在资料待补齐")]
     return []
 
 
@@ -630,34 +671,62 @@ def _append_note(existing: str | None, note: str) -> str:
     return f"{existing}；{note}"[:1000]
 
 
+#: 冲突合并时以「处理方式更重」的种类为准（accept 的含义跟着它走）
+_CONFLICT_RANK = {"fields": 0, "review": 1, "external_order_no": 2, "source_key_changed": 3, "admission": 4}
+
+
+def _merge_conflict(old: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any] | None:
+    """输入：任务上已有的冲突、本次新冲突 → 输出：合并后的冲突（字段与来源新值合并，原因去重拼接）。"""
+    if not old:
+        return new
+    if not new:
+        return old
+    rank = lambda c: _CONFLICT_RANK.get(c.get("kind"), 0)  # noqa: E731
+    hi, lo = (new, old) if rank(new) >= rank(old) else (old, new)
+    reasons = list(dict.fromkeys(x for x in (old.get("reason"), new.get("reason")) if x))
+    return {**hi, "reason": "；".join(reasons)[:1000], "fields": {**(lo.get("fields") or {}), **(hi.get("fields") or {})},
+            "incoming": {**(lo.get("incoming") or {}), **(hi.get("incoming") or {})}, "at": new.get("at")}
+
+
 def ingest(conn, workspace_id: int, record: UpstreamRecord, source: SourceRef, *, actor_kind: str = "source",
-           actor_id: int | None = None, dry_run: bool = False) -> IngestOutcome:
-    """输入：工作区、规范化后的上游记录、来源引用、操作者、是否只预演 → 输出：IngestOutcome。
+           actor_id: int | None = None, dry_run: bool = False,
+           admission: dict[str, Any] | None = None) -> IngestOutcome:
+    """输入：工作区、规范化后的上游记录、来源引用、操作者、是否只预演、本来源的准入规则（None = 不对已有任务做准入检查）
+    → 输出：IngestOutcome。
 
     规则（契约 §2「来源更新」、§7 预览结论）：
 
-    - 无平台订单号 → invalid。按（工作区, 平台订单号）找任务；同一来源记录的平台订单号变了 → conflict
-      （记在原任务上并置 needs_attention，不新建）。
-    - 新任务：首次来源种类为主来源；第一个飞书来源为写回目标；建议采购日期取来源值（依据 source），否则
-      下单北京日期 + 6 − 配送天数（依据 computed）；带 AMZ 订单号 → historical，直接「已采购」并建
-      kind='external' 的成功尝试（单号已登记在别的任务 → conflict，不建尝试）。
+    - 无平台订单号 → invalid。按（工作区, 平台订单号）找任务；同一来源记录的平台订单号变了 → conflict：
+      原任务开始前 / 异常 → 转「待核实」并解除分配（冲突种类 source_key_changed，只在第一次发现时转）；
+      其他状态只置 needs_attention。不新建任务。
+    - 新任务：首次来源种类为主来源；主来源是飞书时第一个飞书来源为写回目标；建议采购日期取来源值（依据 source），否则
+      下单北京日期 + 6 − 配送天数（依据 computed）；带可信 AMZ 订单号 → historical，直接「已采购」并建
+      kind='external' 的成功尝试（单号已登记在别的任务、或格式不对 → conflict，不建尝试）。
     - 已有任务（只应用来源相对上次的变化；见模块说明）：
       * 同种来源（与主来源相同）：开始前改原值并重新派生（覆盖值不动；人审撤回 → 待确认并解除分配；
         金额已不在账号区间 → 解除分配回待分配）；异常时改原值但保持异常；采购开始后只改展示字段，
         执行相关变化记事件并置 needs_attention（结论 conflict）；已取消的只改原值。
       * 另一种来源：执行相关字段（ASIN、数量、单价、限价、收件信息、建议采购日期）不同 → 开始前转 conflict
-        （不覆盖，来源新值存进 conflict.incoming 供「接受」）；相同只追加来源关联。
+        （不覆盖，来源新值存进 conflict.incoming 供「接受」）；相同只追加来源关联；只能补上「未知」的人审结论。
+      * 人审拒绝从不悄悄丢掉：另一种来源、或控制台已人审通过后新批次文件送来「拒绝」→ 开始前转 conflict
+        （冲突种类 review）并解除分配；执行中未登记提交 → 冲突写在任务上（插件据此中止）；其余置 needs_attention。
+        控制台已确认通过、且同样的拒绝早已出现过的旧文件再次上传 → 不再转冲突，只在问题里说明。
+      * 准入（admission 不为 None 时）：采购方已不在负责范围、或采购状态变为「已拍单 / 拿回」且没有可信单号 →
+        开始前 / 异常转 conflict（种类 admission）并解除分配；执行中未提交同上写在任务上；本系统曾采购成功的任务
+        不看采购状态（那是写回写的）。同一来源反复送来同样的值只提醒一次。
       * 上游取消：开始前 / 异常 → cancelled 并解除分配；执行中未登记提交 → 置 upstream_cancelled（插件下次
         进度上报得到 continue=false）；执行中已登记提交 → result_unknown（「执行中收到取消」）；
         待核实 / 已采购 / 待决定重采 / 已关闭 → 只置 upstream_cancelled 与 needs_attention。
-      * 外部 AMZ 订单号：开始前 / 异常 → purchased（建 external 尝试）；单号已属别的任务、或任务正在执行 /
-        已有不同单号 → conflict（开始前转 conflict 状态，其余置 needs_attention）。
+        **撤销取消只认发出取消的那条来源记录**（上次说取消、这次不说，且没有别的来源仍说取消）；
+        别的来源或新批次文件说「没取消」不会撤销取消。
+      * 外部 AMZ 订单号：开始前 / 异常 → purchased（建 external 尝试）；单号格式不对、已属别的任务 → conflict；
+        任务正在执行 / 已有不同单号 → needs_attention。
     - 每次都 upsert order_sources（快照、规范化记录、指纹、last_seen_at）。dry_run=True 时给出同样的结论但不写库。
     """
     order_no = (record.upstream_order_no or "").strip()
     issues = list(record.issues or [])
     if not order_no:
-        return IngestOutcome("invalid", issues=issues, reason="缺少平台订单号")
+        return IngestOutcome("invalid", issues=issues, reason=issues[0] if issues else "缺少平台订单号")
     if order_no != record.upstream_order_no:
         record = UpstreamRecord.from_json({**record.to_json(), "upstream_order_no": order_no})
     link = _find_link(conn, workspace_id, source)
@@ -669,25 +738,48 @@ def ingest(conn, workspace_id: int, record: UpstreamRecord, source: SourceRef, *
     if link is not None and (order is None or link["purchase_order_id"] != order["id"]):
         return _ingest_key_changed(conn, workspace_id, link, order_no, source, issues, actor_kind, actor_id, dry_run)
     if order is None:
-        return _ingest_new(conn, workspace_id, record, source, issues, actor_kind, actor_id, dry_run)
-    return _ingest_existing(conn, workspace_id, order, link, record, source, issues, actor_kind, actor_id, dry_run)
+        return _ingest_new(conn, workspace_id, record, source, issues, actor_kind, actor_id, dry_run, admission)
+    return _ingest_existing(conn, workspace_id, order, link, record, source, issues, actor_kind, actor_id, dry_run,
+                            admission)
+
+
+def _holdable(status: str) -> bool:
+    return status in PRE or status == "exception"
 
 
 def _ingest_key_changed(conn, ws, link, order_no, source, issues, actor_kind, actor_id, dry_run) -> IngestOutcome:
-    old = conn.execute("SELECT * FROM procure.purchase_orders WHERE id = %s AND workspace_id = %s",
-                       (link["purchase_order_id"], ws)).fetchone()
+    old = conn.execute("SELECT * FROM procure.purchase_orders WHERE id = %s AND workspace_id = %s"
+                       + ("" if dry_run else " FOR UPDATE"), (link["purchase_order_id"], ws)).fetchone()
+    src = _source_desc(source)
     reason = f"同一来源记录的平台订单号由 {old['upstream_order_no']} 变为 {order_no}，需人工核实"
-    if not dry_run and reason not in (old["attention_note"] or ""):   # 定时同步反复送来时只提醒一次
-        note = _append_note(old["attention_note"], reason)
-        _update(conn, ws, old["id"], {"needs_attention": True, "attention_note": note})
-        events.record(conn, ws, "order", old["id"], "order.source_key_changed", actor_kind=actor_kind,
-                      actor_id=actor_id, detail={"source": _source_desc(source), "old": old["upstream_order_no"],
-                                                 "new": order_no})
-    return IngestOutcome("conflict", old["id"], {"upstream_order_no": [old["upstream_order_no"], order_no]},
-                         issues, reason, old["status"])
+    payload = {"kind": "source_key_changed", "source_kind": source.kind, "reason": reason,
+               "fields": {"upstream_order_no": [old["upstream_order_no"], order_no]},
+               "incoming": {"upstream_order_no": order_no}, "source": src, "link_id": link["id"], "at": clock.now()}
+    seen = conn.execute(
+        "SELECT 1 FROM procure.events WHERE workspace_id = %s AND order_id = %s AND kind = 'order.source_key_changed' "
+        "AND detail->>'new' = %s AND detail->'source' = %s LIMIT 1",
+        (ws, old["id"], order_no, Jsonb(_j(src))),
+    ).fetchone()
+    status = old["status"]
+    if seen is None and _holdable(status):
+        merged = {**old, "conflict": _merge_conflict(old["conflict"], payload)}
+        status = derive_status(merged) if status in PRE else status
+    changes = {"upstream_order_no": [old["upstream_order_no"], order_no]}
+    if dry_run or seen is not None:      # 定时同步反复送来时只处理一次（第一次已转待核实 / 已提醒）
+        return IngestOutcome("conflict", old["id"], changes, issues, reason, status)
+    events.record(conn, ws, "order", old["id"], "order.source_key_changed", actor_kind=actor_kind, actor_id=actor_id,
+                  detail={"source": src, "old": old["upstream_order_no"], "new": order_no})
+    upd: dict[str, Any] = {"needs_attention": True, "attention_note": _append_note(old["attention_note"], reason)}
+    if _holdable(old["status"]):
+        upd["conflict"] = _merge_conflict(old["conflict"], payload)
+    if old["status"] in PRE:
+        row = _rederive(conn, ws, old, upd, actor_kind=actor_kind, actor_id=actor_id, event_detail={"source": src})
+    else:
+        row = _update(conn, ws, old["id"], upd)
+    return IngestOutcome("conflict", old["id"], changes, issues, reason, row["status"])
 
 
-def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run) -> IngestOutcome:
+def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run, admission=None) -> IngestOutcome:
     vals = _record_values(record)
     ext_no = vals.pop("external_amz_order_no")
     now = clock.now()
@@ -704,15 +796,16 @@ def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run)
     }
     verdict, reason = "new", None
     if ext_no:
-        dup = _amazon_no_owner(conn, ws, ext_no, None)
-        if dup:
+        buyer = _clean_text(record.external_buyer_account)
+        dup = _amazon_no_owner(conn, ws, ext_no, None) if normalize.amazon_order_no_ok(ext_no) else None
+        if not normalize.amazon_order_no_ok(ext_no) or dup:
             verdict = "conflict"
-            reason = f"AMZ 订单号 {ext_no} 已登记在任务 {dup['upstream_order_no']}，需人工核实"
+            reason = (f"AMZ 订单号 {ext_no} 已登记在任务 {dup['upstream_order_no']}，需人工核实" if dup else
+                      f"来源的 AMZ 订单号「{ext_no}」格式不对，需人工核实（不当作已采购）")
             row["conflict"] = {
                 "kind": "external_order_no", "source_kind": source.kind, "reason": reason,
                 "fields": {"external_amz_order_no": [None, ext_no]},
-                "incoming": {"external_amz_order_no": ext_no,
-                             "external_buyer_account": _clean_text(record.external_buyer_account)},
+                "incoming": {"external_amz_order_no": ext_no, "external_buyer_account": buyer},
                 "source": _source_desc(source), "at": now,
             }
         else:
@@ -740,7 +833,7 @@ def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run)
         order = conn.execute("SELECT * FROM procure.purchase_orders WHERE workspace_id = %s AND upstream_order_no = %s "
                              "FOR UPDATE", (ws, record.upstream_order_no)).fetchone()
         return _ingest_existing(conn, ws, order, _find_link(conn, ws, source), record, source,
-                                list(record.issues or []), actor_kind, actor_id, False)
+                                list(record.issues or []), actor_kind, actor_id, False, admission)
     oid = inserted["id"]
     events.record(conn, ws, "order", oid, "order.created", actor_kind=actor_kind, actor_id=actor_id,
                   detail={"source": _source_desc(source), "verdict": verdict, "status": status})
@@ -752,7 +845,7 @@ def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run)
                       actor_id=actor_id, detail={"amazon_order_no": ext_no,
                                                  "buyer_account": _clean_text(record.external_buyer_account),
                                                  "attempt_id": aid})
-    _upsert_link(conn, ws, oid, None, record, source)
+    _upsert_link(conn, ws, oid, None, record, source, source.kind)
     return IngestOutcome(verdict, oid, {}, issues, reason, status)
 
 
@@ -787,32 +880,89 @@ def _suggested_after(order: dict[str, Any], merged: dict[str, Any], inc: dict[st
     return d, ("computed" if d else None)
 
 
-def _review_change(order, inc, prv, same_kind: bool, source_kind: str) -> dict[str, Any]:
+def _kind_zh(kind: str) -> str:
+    return "飞书" if kind == "feishu" else "文件"
+
+
+def _rejection_overridden(conn, order: dict[str, Any], link: dict[str, Any] | None, value: str | None) -> bool:
+    """控制台人审通过之前，同样的「拒绝」已由这笔任务的另一条来源送来过（控制台看过并改判）→ True。"""
+    if order["reviewed_at"] is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s AND id <> %s "
+        "AND normalized->>'review' = 'rejected' AND COALESCE(normalized->>'review_value', '') = %s "
+        "AND first_seen_at <= %s LIMIT 1",
+        (order["workspace_id"], order["id"], link["id"] if link else -1, value or "", order["reviewed_at"]),
+    ).fetchone() is not None
+
+
+def _review_change(conn, order, link, inc, prv, same_kind: bool,
+                   source_kind: str) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+    """输入：任务、来源关联、来源新值与上次值、是否同种来源 → 输出：(直接应用的人审列, 需人工核实的拒绝 {reason} | None,
+    未应用时给预览的说明 | None)。
+
+    - 来源相对上次没变、或首次关联却没带人审 → 什么都不做；
+    - 「拒绝」碰上已通过的任务，而来源是另一种、或任务由控制台通过且这是新关联（新批次文件）→ 需人工核实（不悄悄丢掉）；
+      控制台通过之前同样的拒绝已出现过（旧文件重传）→ 不再核实，只说明；
+    - 控制台人审结论只被同一来源记录的真实变化改写；另一种来源只能补上「未知」的人审结论（其余差异只说明）。
+    """
     new_status, new_value = inc["review_status"], inc["review_value"]
     if prv is not None:
         if new_status == prv["review_status"] and _same(new_value, prv["review_value"]):
-            return {}
+            return {}, None, None
     elif new_value is None and new_status == "unknown":
-        return {}
-    if order["review_source"] == "console" and (prv is None or new_status == "unknown"):
-        return {}   # 控制台人审结论只被来源的真实变化改写
-    if not same_kind and (order["review_status"] != "unknown" or new_status == "unknown"):
-        return {}   # 另一种来源只能补上「未知」的人审结论
+        return {}, None, None
+    cur = order["review_status"]
+    console = order["review_source"] == "console"
+    who = _kind_zh(source_kind)
+    shown = new_value or ("拒绝" if new_status == "rejected" else "未知")
+    if new_status == "rejected" and cur == "approved" and ((console and prv is None) or not same_kind):
+        if console and prv is None and _rejection_overridden(conn, order, link, new_value):
+            return {}, None, f"{who}来源的人工审核为「{shown}」，控制台已确认通过，未应用"
+        return {}, {"reason": f"{who}来源的人工审核为「{shown}」，与任务已有的通过结论不同，需人工核实"}, None
+    if console and (prv is None or new_status == "unknown"):
+        # 控制台人审结论只被来源的真实变化改写
+        note = (f"{who}来源的人工审核为「{shown}」，与控制台人审结论不同，未应用"
+                if new_status != "unknown" and new_status != cur else None)
+        return {}, None, note
+    if not same_kind and (cur != "unknown" or new_status == "unknown"):
+        # 另一种来源只能补上「未知」的人审结论
+        note = (f"{who}来源的人工审核为「{shown}」，与任务已有结论不同，未应用"
+                if new_status != "unknown" and new_status != cur else None)
+        return {}, None, note
     upd: dict[str, Any] = {}
-    if new_status != order["review_status"]:
+    if new_status != cur:
         upd.update(review_status=new_status, review_source=source_kind, reviewed_by=None, reviewed_at=clock.now())
     if same_kind and not _same(new_value, order["review_value"]):
         upd["review_value"] = new_value
-    return upd
+    return upd, None, None
 
 
-def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, actor_id, dry_run) -> IngestOutcome:
+def _other_link_cancelled(conn, order: dict[str, Any], link: dict[str, Any] | None) -> bool:
+    """这笔任务除了 link 之外，还有来源记录当前说「上游取消」→ True。"""
+    return conn.execute(
+        "SELECT 1 FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s AND id <> %s "
+        "AND normalized->>'upstream_cancelled' = 'true' LIMIT 1",
+        (order["workspace_id"], order["id"], link["id"] if link else -1),
+    ).fetchone() is not None
+
+
+def _has_success(conn, order: dict[str, Any]) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM procure.purchase_attempts WHERE purchase_order_id = %s AND workspace_id = %s "
+        "AND status = 'succeeded' LIMIT 1", (order["id"], order["workspace_id"]),
+    ).fetchone() is not None
+
+
+def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, actor_id, dry_run,
+                     admission=None) -> IngestOutcome:
     prev = UpstreamRecord.from_json(link["normalized"]) if link is not None else None
     inc = _record_values(record)
     prv = _record_values(prev) if prev is not None else None
     status = order["status"]
     same_kind = source.kind == order["primary_source_kind"]
     src = _source_desc(source)
+    who = _kind_zh(source.kind)
     now = clock.now()
 
     upd: dict[str, Any] = {}
@@ -824,10 +974,35 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
     to_status: str | None = None
     to_reason: str | None = None
     conflict_payload: dict[str, Any] | None = None
+    hold_payload: dict[str, Any] | None = None      # 执行中（未提交）收到的暂停：写在任务上，插件据此中止
     ext_apply: str | None = None
+    submitted_cache: list[bool] = []
+
+    def submitted() -> bool:
+        if not submitted_cache:
+            att = inflight_attempt(conn, order)
+            submitted_cache.append(att is not None and att["submitted_at"] is not None)
+        return submitted_cache[0]
+
+    def hold(payload: dict[str, Any], note: str) -> None:
+        """一项「这笔任务不该再执行」的来源变化：开始前 / 异常 → 冲突；执行中未提交 → 写在任务上；其余 → 提醒。"""
+        nonlocal conflict_payload, hold_payload, reason
+        if status == "cancelled":          # 已取消的任务不会再执行，不必暂停
+            return
+        verdict_flags.add("conflict")
+        reason = reason or payload["reason"]
+        if _holdable(status):
+            conflict_payload = _merge_conflict(conflict_payload, payload)
+            if status == "exception":
+                notes.append(payload["reason"])
+        elif status == "executing" and not submitted():
+            hold_payload = _merge_conflict(hold_payload, payload)
+            notes.append(f"采购进行中，{note}，插件将中止本次采购")
+        else:
+            notes.append(note)
 
     cand = _candidate_fields(order, inc, prv)
-    review_upd = _review_change(order, inc, prv, same_kind, source.kind)
+    review_upd, review_reject, review_note = _review_change(conn, order, link, inc, prv, same_kind, source.kind)
     mutable = status in PRE or status in ("exception", "cancelled")
 
     # ① 字段变化
@@ -856,8 +1031,7 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
             if display:
                 verdict_flags.add("update")
             if blocked:
-                labels = "、".join(FIELD_LABELS.get(f, f) for f in blocked)
-                note = f"上游在采购开始后修改了{labels}"
+                note = cn_spacing(f"上游在采购开始后修改了{field_labels(blocked)}")
                 notes.append(note)
                 reason = f"采购已开始，{note}，未应用"
                 evs.append(("order.upstream_changed_after_start",
@@ -875,20 +1049,20 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
                 conf[f] = [order[f], cand[f]]
         if conf:
             changes.update(conf)
-            labels = "、".join(FIELD_LABELS.get(f, f) for f in conf)
-            reason = f"{'飞书' if source.kind == 'feishu' else '文件'}来源的{labels}与任务不同，需人工核实"
+            r = cn_spacing(f"{who}来源的{field_labels(conf)}与任务不同，需人工核实")
+            reason = r
             verdict_flags.add("conflict")
             evs.append(("order.source_conflict", {"source": src, "fields": conf}))
-            if status in PRE or status == "exception":
+            if _holdable(status):
                 incoming = {f: v[1] for f, v in conf.items()}
                 if "suggested_purchase_date" in incoming:
                     incoming["suggested_date_basis"] = inc["suggested_date_basis"]
-                conflict_payload = {"kind": "fields", "source_kind": source.kind, "reason": reason,
+                conflict_payload = {"kind": "fields", "source_kind": source.kind, "reason": r,
                                     "fields": conf, "incoming": incoming, "source": src, "at": now}
                 if status == "exception":
-                    notes.append(reason)
+                    notes.append(r)
             else:
-                notes.append(reason)
+                notes.append(r)
         elif review_upd and mutable:
             upd.update(review_upd)
             changes["review_status"] = [order["review_status"], review_upd.get("review_status")]
@@ -896,25 +1070,51 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
             evs.append(("order.source_updated", {"source": src, "changes": {"review_status": changes["review_status"]},
                                                  "overrides_kept": []}))
 
-    # ② 上游取消 / 撤销取消
+    # ①b 来源的人审拒绝（不悄悄丢掉）
+    if review_reject is not None:
+        r = review_reject["reason"]
+        changes["review_status"] = [order["review_status"], "rejected"]
+        evs.append(("order.source_review_conflict", {"source": src, "review_value": inc["review_value"],
+                                                     "status": status}))
+        hold({"kind": "review", "source_kind": source.kind, "reason": r,
+              "fields": {"review_status": [order["review_status"], "rejected"]},
+              "incoming": {"review_status": "rejected", "review_value": inc["review_value"],
+                           "review_source": source.kind},
+              "source": src, "at": now}, r)
+    elif review_note:
+        issues = issues + [review_note]
+
+    # ①c 准入：采购方 / 采购状态变化
+    adm_hold = normalize.admission_hold(record, admission) if admission is not None else None
+    if adm_hold is not None:
+        prev_hold = normalize.admission_hold(prev, admission) if prev is not None else None
+        fresh = prev_hold is None or prev_hold["reason"] != adm_hold["reason"]
+        own_status = adm_hold["kind"] == "purchase_status" and (
+            status in ("purchased", "repurchase_pending", "closed") or _has_success(conn, order))
+        if fresh and not own_status:
+            r = f"{who}来源的{adm_hold['reason']}，已暂停采购，需人工核实"
+            changes[adm_hold["field"]] = [None, adm_hold["value"]]
+            evs.append(("order.admission_hold", {"source": src, "reason": adm_hold["reason"], "status": status}))
+            hold({"kind": "admission", "source_kind": source.kind, "reason": r,
+                  "fields": {adm_hold["field"]: [None, adm_hold["value"]]}, "incoming": {},
+                  "source": src, "at": now}, f"{who}来源的{adm_hold['reason']}，请核实")
+
+    # ② 上游取消 / 撤销取消（撤销只认发出取消的那条来源记录）
     rec_cancel = inc["upstream_cancelled"]
     cancel = rec_cancel and not order["upstream_cancelled"] and (prv is None or not prv["upstream_cancelled"])
-    uncancel = (order["upstream_cancelled"] and not rec_cancel
-                and ((prv is not None and prv["upstream_cancelled"])
-                     or (prv is None and _clean_text(record.after_sale_value) is not None)))
+    uncancel = (order["upstream_cancelled"] and not rec_cancel and prv is not None and prv["upstream_cancelled"]
+                and not _other_link_cancelled(conn, order, link))
     if cancel:
         cancel_note = _clean_text(record.after_sale_value) or "上游取消"
         upd.update(upstream_cancelled=True, upstream_cancel_note=cancel_note, upstream_cancelled_at=now)
         changes["upstream_cancelled"] = [False, True]
         verdict_flags.add("update")
         detail = {"source": src, "after_sale_value": record.after_sale_value, "status": status}
-        if status in PRE or status == "exception":
+        if _holdable(status):
             to_status, to_reason = "cancelled", f"上游取消（{cancel_note}）"
         elif status == "executing":
-            att = inflight_attempt(conn, order)
-            submitted = att is not None and att["submitted_at"] is not None
-            detail["submitted"] = submitted
-            if submitted:
+            detail["submitted"] = submitted()
+            if submitted():
                 to_status, to_reason = "result_unknown", "执行中收到取消（已登记提交，需人工核实是否已下单）"
                 notes.append("执行中收到上游取消，已登记提交，请核实亚马逊订单")
             else:
@@ -931,23 +1131,29 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
         if status == "cancelled":
             notes.append("上游撤销了取消，如需继续采购请人工撤销取消")
         evs.append(("order.upstream_uncancelled", {"source": src, "after_sale_value": record.after_sale_value}))
+    elif order["upstream_cancelled"] and not rec_cancel and _clean_text(record.after_sale_value) is not None:
+        issues = issues + [f"{who}来源的售后状态为「{_clean_text(record.after_sale_value)}」，"
+                           "但任务已按发出取消的来源取消，未撤销"]
 
     # ③ 外部 AMZ 订单号
     ext_in = inc["external_amz_order_no"]
     if ext_in and (prv is None or ext_in != prv["external_amz_order_no"]) and ext_in not in _known_amazon_nos(conn, order):
         changes["external_amz_order_no"] = [order["external_amz_order_no"], ext_in]
         buyer = _clean_text(record.external_buyer_account)
-        if status in PRE or status == "exception":
-            dup = _amazon_no_owner(conn, ws, ext_in, order["id"])
-            if dup:
-                r = f"AMZ 订单号 {ext_in} 已登记在任务 {dup['upstream_order_no']}，需人工核实"
+        if _holdable(status):
+            valid = normalize.amazon_order_no_ok(ext_in)
+            dup = _amazon_no_owner(conn, ws, ext_in, order["id"]) if valid else None
+            if not valid or dup:
+                r = (f"AMZ 订单号 {ext_in} 已登记在任务 {dup['upstream_order_no']}，需人工核实" if dup else
+                     f"来源的 AMZ 订单号「{ext_in}」格式不对，需人工核实（不当作已采购）")
                 reason = reason or r
                 verdict_flags.add("conflict")
-                conflict_payload = {"kind": "external_order_no", "source_kind": source.kind, "reason": r,
-                                    "fields": {"external_amz_order_no": [order["external_amz_order_no"], ext_in]},
-                                    "incoming": {"external_amz_order_no": ext_in, "external_buyer_account": buyer},
-                                    "source": src, "at": now}
-                evs.append(("order.source_conflict", {"source": src, "fields": conflict_payload["fields"]}))
+                payload = {"kind": "external_order_no", "source_kind": source.kind, "reason": r,
+                           "fields": {"external_amz_order_no": [order["external_amz_order_no"], ext_in]},
+                           "incoming": {"external_amz_order_no": ext_in, "external_buyer_account": buyer},
+                           "source": src, "at": now}
+                conflict_payload = _merge_conflict(conflict_payload, payload)
+                evs.append(("order.source_conflict", {"source": src, "fields": payload["fields"]}))
                 if status == "exception":
                     notes.append(r)
             else:
@@ -973,7 +1179,9 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
 
     # ④ 最终状态
     if conflict_payload is not None:
-        upd["conflict"] = conflict_payload
+        upd["conflict"] = _merge_conflict(order["conflict"], conflict_payload)
+    elif hold_payload is not None:
+        upd["conflict"] = _merge_conflict(order["conflict"], hold_payload)
     merged = {**order, **upd}
     if ext_apply:
         merged["assigned_account_id"] = None
@@ -1035,7 +1243,7 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
                          updates=upd, event_detail={"source": src})
     else:
         row = _update(conn, ws, order["id"], upd) if upd else order
-    _upsert_link(conn, ws, order["id"], link, record, source)
+    _upsert_link(conn, ws, order["id"], link, record, source, order["primary_source_kind"])
     return IngestOutcome(verdict, order["id"], _j(changes), issues, reason, row["status"])
 
 
@@ -1099,7 +1307,8 @@ def order_row_out(r: dict[str, Any]) -> dict[str, Any]:
         "suggested_purchase_date": _iso(r["suggested_purchase_date"]), "order_time": _iso(r["order_time"]),
         "recipient_name": r["recipient_name"], "state": r["state"], "postal_code": r["postal_code"],
         "status": r["status"], "status_zh": ORDER_STATUS_ZH.get(r["status"]), "status_reason": r["status_reason"],
-        "missing_fields": list(r["missing_fields"] or []), "review_status": r["review_status"],
+        "missing_fields": [_LABEL_TO_KEY.get(x, x) for x in (r["missing_fields"] or [])],
+        "review_status": r["review_status"],
         "needs_attention": r["needs_attention"], "attention_note": r["attention_note"],
         "assigned_account": ({"id": r["assigned_account_id"], "name": r.get("account_name")}
                              if r["assigned_account_id"] is not None else None),
@@ -1110,11 +1319,13 @@ def order_row_out(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_orders(conn, workspace_id: int, *, view: str = "all", q: str | None = None, account_id: int | None = None,
-                source: str | None = None, page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    """输入：工作区、视图、搜索词、账号、来源种类、分页 → 输出：{total, rows}（行为契约 §10 列表行）。
+                source: str | None = None, needs_attention: bool | None = None, page: int = 1,
+                page_size: int = 20) -> dict[str, Any]:
+    """输入：工作区、视图、搜索词、账号、来源种类、是否需要留意（None = 不限）、分页 → 输出：{total, rows}
+    （行为契约 §10 列表行；total 是全部过滤条件下的总数）。
 
     视图：today = 已分配且建议采购日期 ≤ 北京今天；future = 已分配且日期在今天之后；unassigned = 待分配；
-    其余为同名状态；all = 全部。q 搜平台订单号 / ASIN（含覆盖值）/ 收件人。
+    其余为同名状态；all = 全部。q 搜平台订单号 / ASIN（含覆盖值）/ 收件人。各过滤条件可任意组合。
     """
     view = view or "all"
     if view not in ORDER_VIEWS:
@@ -1154,6 +1365,11 @@ def list_orders(conn, workspace_id: int, *, view: str = "all", q: str | None = N
         where.append("EXISTS (SELECT 1 FROM procure.order_sources s WHERE s.purchase_order_id = o.id "
                      "AND s.workspace_id = o.workspace_id AND s.kind = %s)")
         params.append(source)
+    if needs_attention is not None:
+        if not isinstance(needs_attention, bool):
+            raise validation("needs_attention 只能是 true 或 false", field="needs_attention")
+        where.append("o.needs_attention = %s")
+        params.append(needs_attention)
     where_sql = " AND ".join(where)
     total = conn.execute(f"SELECT count(*) AS n FROM procure.purchase_orders o WHERE {where_sql}",
                          params).fetchone()["n"]
@@ -1166,8 +1382,9 @@ def list_orders(conn, workspace_id: int, *, view: str = "all", q: str | None = N
     return {"total": int(total), "rows": [order_row_out(r) for r in rows]}
 
 
-def allowed_actions(row: dict[str, Any]) -> list[str]:
-    """输入：任务行 → 输出：当前可做的人工动作（契约 §10 allowed_actions，前端据此显示按钮）。"""
+def allowed_actions(row: dict[str, Any], sources: list[dict[str, Any]] | None = None) -> list[str]:
+    """输入：任务行、它的来源关联（可选，kind / is_writeback_target）→ 输出：当前可做的人工动作
+    （契约 §10 allowed_actions，前端据此显示按钮）。"""
     s = row["status"]
     acts: list[str] = []
     if s == "pending_review":
@@ -1192,6 +1409,10 @@ def allowed_actions(row: dict[str, Any]) -> list[str]:
         acts.append("repurchase")
     if row.get("conflict") and (s in PRE or s == "exception"):
         acts.append("resolve_conflict")
+    if row.get("needs_attention"):
+        acts.append("clear_attention")
+    if any(x.get("kind") == "feishu" and not x.get("is_writeback_target") for x in sources or []):
+        acts.append("set_writeback_target")
     return acts
 
 
@@ -1291,7 +1512,7 @@ def get_detail(conn, workspace_id: int, order_id: int) -> dict[str, Any]:
     out["events"] = [{"id": e["id"], "entity": e["entity"], "entity_id": e["entity_id"], "order_id": e["order_id"],
                       "at": _iso(e["at"]), "actor_kind": e["actor_kind"], "actor_id": e["actor_id"],
                       "actor_name": e["actor_name"], "kind": e["kind"], "detail": e["detail"]} for e in evs]
-    out["allowed_actions"] = allowed_actions(r)
+    out["allowed_actions"] = allowed_actions(r, out["sources"])
     return out
 
 
@@ -1448,7 +1669,7 @@ def set_override(conn, workspace_id: int, order_id: int, *, asin: Any = UNSET, q
         if price_cap is None or (isinstance(price_cap, str) and not price_cap.strip()):
             upd["override_price_cap"] = None
         else:
-            pv = None if isinstance(price_cap, bool) else money(price_cap)
+            pv = None if isinstance(price_cap, bool) else _safe_money(price_cap, cap=True)
             if pv is None or pv <= 0:
                 raise validation("限价应为大于 0 的美元金额", field="price_cap")
             upd["override_price_cap"] = pv
@@ -1559,7 +1780,7 @@ def resolve_unknown(conn, workspace_id: int, order_id: int, outcome: str, *, ama
                 raise validation(f"未知金额项：{k}", field="amounts")
             if v is None or (isinstance(v, str) and not v.strip()):
                 continue
-            mv = None if isinstance(v, bool) else money(v)
+            mv = None if isinstance(v, bool) else _safe_money(v)
             if mv is None or mv < 0:
                 raise validation(f"金额格式不对：{k}", field="amounts")
             amts[k] = mv
@@ -1613,7 +1834,7 @@ def decide_repurchase(conn, workspace_id: int, order_id: int, decision: str, not
     """输入：工作区、任务、approve / decline、备注、操作人 → 输出：任务详情。
 
     approve：解除原分配、清掉外部单号标记，按派生规则回到待分配等（下一次尝试的种类为 'repurchase'，
-    见 next_attempt_kind）；decline：→ closed。
+    由 execution 领取时判定）；decline：→ closed。
     """
     if decision not in ("approve", "decline"):
         raise validation("重采决定只能是 approve 或 decline", field="decision")
@@ -1639,7 +1860,7 @@ def _from_j(f: str, v: Any) -> Any:
     if v is None:
         return None
     if f in _MONEY_COLUMNS:
-        return money(v)
+        return _safe_money(v, cap=f in ("price_cap", "override_price_cap"))
     if f in ("suggested_purchase_date", "order_date_bj"):
         return date.fromisoformat(v) if isinstance(v, str) else v
     if f == "order_time":
@@ -1653,8 +1874,10 @@ def resolve_conflict(conn, workspace_id: int, order_id: int, choice: str, note: 
                      actor_user_id: int | None = None) -> dict[str, Any]:
     """输入：工作区、任务、keep / accept、备注、操作人 → 输出：任务详情。
 
-    keep：保留任务现值，清除冲突；accept：把 conflict.incoming 里的来源新值写进原值（外部单号冲突时登记为
-    已采购，单号仍属别的任务 → VALIDATION），清除冲突。之后按派生规则重新校验。
+    keep：保留任务现值，清除冲突（人审冲突时记为控制台确认通过）；accept：按冲突种类接受来源：
+    fields / review → 把 conflict.incoming 写进原值；external_order_no → 登记为已采购（单号仍属别的任务或格式不对 →
+    VALIDATION）；admission（采购方 / 采购状态已不归本系统）→ 取消任务；source_key_changed（来源记录改成了别的
+    平台订单号）→ 取消原任务并解除那条来源关联（下次读取按新订单号接收）。之后按派生规则重新校验。
     """
     if choice not in ("keep", "accept"):
         raise validation("冲突处理只能是 keep 或 accept", field="choice")
@@ -1666,12 +1889,28 @@ def resolve_conflict(conn, workspace_id: int, order_id: int, choice: str, note: 
         raise _invalid_for(order, "处理冲突")
     note = _note(note)
     ak, aid = _actor(actor_user_id)
+    kind = c.get("kind")
     upd: dict[str, Any] = {"conflict": None}
     applied: dict[str, Any] = {}
+    detail = {"action": "resolve_conflict", "choice": choice}
+    if choice == "accept" and kind in ("admission", "source_key_changed"):
+        if kind == "source_key_changed" and c.get("link_id") is not None:
+            conn.execute("DELETE FROM procure.order_sources WHERE id = %s AND workspace_id = %s "
+                         "AND purchase_order_id = %s", (c["link_id"], workspace_id, order_id))
+            applied["unlinked_source_id"] = c["link_id"]
+        _record_action(conn, workspace_id, order_id, "order.conflict_resolved", actor_user_id,
+                       {"choice": choice, "kind": kind, "note": note, "fields": c.get("fields"), "applied": applied})
+        why = (f"来源记录已改为平台订单号 {(c.get('incoming') or {}).get('upstream_order_no')}，原任务不再采购"
+               if kind == "source_key_changed" else f"人工确认不再采购：{c.get('reason') or '来源已不归本系统采购'}")
+        transition(conn, order, "cancelled", reason=why[:1000], actor_kind=ak, actor_id=aid, updates=upd,
+                   event_detail=detail)
+        return get_detail(conn, workspace_id, order_id)
     if choice == "accept":
         incoming = c.get("incoming") or {}
-        if c.get("kind") == "external_order_no":
+        if kind == "external_order_no":
             no = incoming.get("external_amz_order_no")
+            if no and not normalize.amazon_order_no_ok(no):
+                raise validation(f"AMZ 订单号「{no}」格式不对，不能登记为已采购；请选择保留当前")
             dup = _amazon_no_owner(conn, workspace_id, no, order_id) if no else None
             if dup:
                 raise validation(f"AMZ 订单号 {no} 仍登记在任务 {dup['upstream_order_no']}，不能接受")
@@ -1687,17 +1926,21 @@ def resolve_conflict(conn, workspace_id: int, order_id: int, choice: str, note: 
                     applied[f] = v
             if "order_time" in upd:
                 upd["order_date_bj"] = clock.bj_date(upd["order_time"]) if upd["order_time"] else None
+            if "review_status" in upd:
+                upd.update(reviewed_by=None, reviewed_at=clock.now())
+    elif "review_status" in (c.get("fields") or {}) and order["review_status"] == "approved":
+        # 保留通过：记为控制台确认（之后同样的旧文件再上传不再转冲突）
+        upd.update(review_source="console", reviewed_by=actor_user_id, reviewed_at=clock.now())
     _record_action(conn, workspace_id, order_id, "order.conflict_resolved", actor_user_id,
-                   {"choice": choice, "note": note, "fields": c.get("fields"), "applied": applied})
+                   {"choice": choice, "kind": kind, "note": note, "fields": c.get("fields"), "applied": applied})
     if order["status"] in PRE:
-        _rederive(conn, workspace_id, order, upd, actor_kind=ak, actor_id=aid,
-                  event_detail={"action": "resolve_conflict", "choice": choice})
+        _rederive(conn, workspace_id, order, upd, actor_kind=ak, actor_id=aid, event_detail=detail)
     else:
         merged = {**order, **upd}
         upd["missing_fields"] = compute_missing_fields(merged)
         if merged.get("external_amz_order_no"):
             transition(conn, order, "purchased", reason=derived_reason(merged, "purchased"), actor_kind=ak,
-                       actor_id=aid, updates=upd, event_detail={"action": "resolve_conflict", "choice": choice})
+                       actor_id=aid, updates=upd, event_detail=detail)
         else:
             _update(conn, workspace_id, order_id, upd)
     return get_detail(conn, workspace_id, order_id)
@@ -1715,16 +1958,52 @@ def clear_attention(conn, workspace_id: int, order_id: int, note: str | None = N
     return get_detail(conn, workspace_id, order_id)
 
 
+def set_writeback_target(conn, workspace_id: int, order_id: int, source_id: Any,
+                         actor_user_id: int | None = None) -> dict[str, Any]:
+    """输入：工作区、任务、来源关联 id、操作人 → 输出：任务详情。
+
+    把这笔任务的一条飞书来源指定为**唯一**写回目标（文件为主的任务不会自动写回飞书，v1 §6.2）。来源不属于该任务
+    或别的工作区 → NOT_FOUND；不是飞书来源 → VALIDATION。写 'order.writeback_target_set' 事件；任务已采购且成功
+    尝试是真实结果（非模拟、非外部单号）时立即按新目标入写回队列。
+    """
+    try:
+        sid = int(source_id)
+    except (TypeError, ValueError):
+        raise validation("来源 id 格式不对", field="source_id") from None
+    order = get_row(conn, workspace_id, order_id, for_update=True)
+    src = conn.execute("SELECT * FROM procure.order_sources WHERE id = %s AND workspace_id = %s "
+                       "AND purchase_order_id = %s", (sid, workspace_id, order_id)).fetchone()
+    if src is None:
+        raise not_found("来源记录")
+    if src["kind"] != "feishu":
+        raise validation("只有飞书来源可以作为写回目标", field="source_id")
+    prev = conn.execute("SELECT id FROM procure.order_sources WHERE workspace_id = %s AND purchase_order_id = %s "
+                        "AND is_writeback_target", (workspace_id, order_id)).fetchone()
+    if prev is None or prev["id"] != sid:
+        conn.execute("UPDATE procure.order_sources SET is_writeback_target = false WHERE workspace_id = %s "
+                     "AND purchase_order_id = %s AND is_writeback_target", (workspace_id, order_id))
+        conn.execute("UPDATE procure.order_sources SET is_writeback_target = true WHERE id = %s AND workspace_id = %s",
+                     (sid, workspace_id))
+        _record_action(conn, workspace_id, order_id, "order.writeback_target_set", actor_user_id,
+                       {"source_id": sid, "previous_source_id": prev["id"] if prev else None,
+                        "connection_id": src["feishu_connection_id"], "record_id": src["feishu_record_id"]})
+        if order["status"] == "purchased":
+            writeback.enqueue_for_order(conn, workspace_id, order_id)
+    return get_detail(conn, workspace_id, order_id)
+
+
 def revert_simulation(conn, workspace_id: int, order_id: int, *, actor_kind: str = "user",
                       actor_id: int | None = None) -> dict[str, Any]:
     """输入：工作区、任务、操作者 → 输出：任务行。契约 §5「清除模拟结果」专用：把只经过模拟执行的任务直接退回
     开始前的派生状态（保留分配；绕过迁移表，这是唯一的例外）。
 
     调用前须先把该任务的模拟尝试改成 aborted；任务有真实尝试（成功 / 待核实 / 在途）→ CONFLICT。
-    开始前或已取消的任务原样返回。
+    开始前或已取消的任务只清掉模拟留下的页面错误重试计数与当前尝试指针（状态不变）。
     """
     order = get_row(conn, workspace_id, order_id, for_update=True)
     if order["status"] in PRE or order["status"] == "cancelled":
+        if order["page_load_retries"] or order["current_attempt_id"] is not None:
+            return _update(conn, workspace_id, order_id, {"page_load_retries": 0, "current_attempt_id": None})
         return order
     real = conn.execute(
         "SELECT 1 FROM procure.purchase_attempts WHERE purchase_order_id = %s AND workspace_id = %s "
@@ -1737,8 +2016,8 @@ def revert_simulation(conn, workspace_id: int, order_id: int, *, actor_kind: str
         raise conflict("任务仍有在途的采购尝试，请先中止", code="ATTEMPT_IN_FLIGHT")
     upd: dict[str, Any] = {"current_attempt_id": None, "page_load_retries": 0}
     if order["purchased_attempt_id"] is not None:
-        pa = conn.execute("SELECT simulated FROM procure.purchase_attempts WHERE id = %s",
-                          (order["purchased_attempt_id"],)).fetchone()
+        pa = conn.execute("SELECT simulated FROM procure.purchase_attempts WHERE id = %s AND workspace_id = %s",
+                          (order["purchased_attempt_id"], workspace_id)).fetchone()
         if pa is not None and pa["simulated"]:
             upd["purchased_attempt_id"] = None
     merged = {**order, **upd}

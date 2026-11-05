@@ -39,11 +39,11 @@ IMPORT_HEADERS = ["平台订单号", "店铺账号", "收货人姓名", "收货�
 @pytest.fixture()
 def api(clean_db, tmp_path) -> Iterator[Any]:
     """输入：无 → 输出：新建的 FastAPI 应用（不托管前端；时钟冻结在 NOW，测试后解冻）。"""
-    from server.app import create_app
+    from server.app import TEST_CLIENT_HOST, create_app
 
     clock.freeze(NOW)
     try:
-        yield create_app(web_dist=tmp_path / "no-dist")
+        yield create_app(web_dist=tmp_path / "no-dist", allowed_hosts=(TEST_CLIENT_HOST,))
     finally:
         clock.unfreeze()
 

@@ -86,8 +86,9 @@ def _batch_order_ids(conn, ws: int, batch_id: Any) -> list[int]:
     found = conn.execute(
         "SELECT r.purchase_order_id, min(r.row_no) AS first_row FROM procure.import_rows r "
         "JOIN procure.purchase_orders o ON o.id = r.purchase_order_id AND o.workspace_id = %s "
-        "WHERE r.batch_id = %s AND r.purchase_order_id IS NOT NULL GROUP BY r.purchase_order_id ORDER BY first_row",
-        (ws, bid),
+        "WHERE r.batch_id = %s AND r.workspace_id = %s AND r.purchase_order_id IS NOT NULL "
+        "GROUP BY r.purchase_order_id ORDER BY first_row",
+        (ws, bid, ws),
     ).fetchall()
     return [r["purchase_order_id"] for r in found]
 

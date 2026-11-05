@@ -117,6 +117,30 @@ def test_sync_failure_is_recorded_and_reported(owner, fake):
     assert ok(owner.get(f"/api/v1/feishu/connections/{cid}"))["last_error"]
 
 
+def test_sync_validation_and_internal_failures_are_committed_too(owner, fake, monkeypatch):
+    """K14：平台订单号列不见了（VALIDATION）、接收时意外出错（INTERNAL）——都先提交失败的读取记录与 last_error 再返回。"""
+    from services import feishu_intake
+
+    cid = ok(owner.post("/api/v1/feishu/connections", json=_connection_body(fake)))["id"]
+    table = fake.apps[ff.DEMO_APP][ff.DEMO_TABLE]
+    table["fields"] = [x for x in table["fields"] if x["field_name"] != "平台订单号"]
+    body = err(owner.post(f"/api/v1/feishu/connections/{cid}/sync"), 422, "VALIDATION")
+    assert body["detail"]["run_id"] and "平台订单号" in body["message"]
+    got = ok(owner.get(f"/api/v1/feishu/connections/{cid}"))
+    assert got["last_error"] == body["message"] and got["last_sync_at"]
+
+    def boom(*a, **kw):
+        raise RuntimeError("DEMO")
+
+    fake2 = ff.FakeFeishuClient.with_order_table()
+    monkeypatch.setattr(fc, "make_client", lambda: fake2)
+    monkeypatch.setattr(feishu_intake, "evaluate_records", boom)
+    body = err(owner.post(f"/api/v1/feishu/connections/{cid}/sync"), 500, "INTERNAL")
+    assert body["detail"]["run_id"]
+    runs = ok(owner.get(f"/api/v1/feishu/connections/{cid}/runs"))["rows"]
+    assert [r["ok"] for r in runs] == [False, False] and "RuntimeError" in runs[0]["error"]
+
+
 def test_feishu_routes_without_app_credentials_are_409_and_file_import_still_works(owner, not_configured):
     assert ok(owner.get("/api/v1/feishu/status")) == {"configured": False}
     assert ok(owner.get("/api/v1/feishu/system-fields"))["source_fields"]       # 不需要飞书也能取

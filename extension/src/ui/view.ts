@@ -1,9 +1,11 @@
 /** 三处界面（页面内面板、设置页、弹出页）共用的展示逻辑：状态 → 中文文案与色调，
  *  以及一个只用 textContent 的 DOM 构造器（动态内容从不拼进 innerHTML）。 */
 
-import { IDENTITY_STATUS_TEXT } from "../core/identity.js";
+import { IDENTITY_STATUS_TEXT, maskCustomerId } from "../core/identity.js";
 import type { StateSnapshot } from "../core/messages.js";
+import { receiptText } from "../core/receipts.js";
 import { normalizeSlots } from "../core/schedule.js";
+import { runViewActive, startGate } from "../core/startgate.js";
 import { bjClock, bjShort } from "../core/time.js";
 import type { LogLine } from "../core/log.js";
 
@@ -58,13 +60,23 @@ export function accountText(s: StateSnapshot): string {
   return `${hb.account.name}${paused}`;
 }
 
-/** 输入：状态快照 → 输出：「开始执行」现在能不能点，不能点时给原因。 */
-export function canStart(s: StateSnapshot): { ok: boolean; reason: string | null } {
-  if (!s.device.paired) return { ok: false, reason: "尚未配对，请先在设置页完成配对" };
-  if (s.run?.active) return { ok: false, reason: "本浏览器正在执行" };
-  const hb = s.config?.heartbeat;
-  if (hb && !hb.account) return { ok: false, reason: "本设备还没有绑定买家账号" };
-  return { ok: true, reason: null };
+/** 输入：状态快照 → 输出：「开始执行」现在能不能点，不能点时给原因（规则见 core/startgate.ts）。 */
+export const canStart = startGate;
+
+/** 输入：状态快照 → 输出：本浏览器是不是正在执行（本地记录且没被更新的服务端心跳否定）。 */
+export const runActive = runViewActive;
+
+/** 输入：状态快照 → 输出：身份对账有分歧时的提示；没有分歧为 null。 */
+export function identityConflictText(s: StateSnapshot): string | null {
+  const id = s.identity;
+  if (!id?.conflict) return null;
+  const who = id.signed_in ? `买家号 ID ${maskCustomerId(id.customer_id)}` : "未登录";
+  return `本浏览器的亚马逊标签页显示的登录状态不一致（其中一页显示：${who}），服务端不会下发任务。请刷新或关闭较早打开的亚马逊标签页，再点「刷新身份」。`;
+}
+
+/** 输入：状态快照 → 输出：待补交回执的提示行（没有为空数组）。 */
+export function receiptLines(s: StateSnapshot): string[] {
+  return (s.receipts ?? []).map(receiptText);
 }
 
 /** 输入：日志行 → 输出：`HH:MM:SS` 北京时间前缀。 */

@@ -23,15 +23,18 @@
   （按绝对值加回，插件无论报正数还是负数都不会把总额算小）。gift_card_amount 为 null 表示没有礼品卡。
 - 配送日期早于站点今天视为读取不可靠（不当作 0 天放行）。
 - fulfillment（是否亚马逊配送）只记录，不拦截。
+- 限价按 models.money_cap 取两位（向下取整，宁可少放行 1 美分）。
+- 入库前先用 sanitize_facts 规范化事实：只留契约 §4 的键，卡号只留后 4 位，文本截短，类型不对的值换成
+  INVALID 标记（判定结果与原值相同：仍按格式不对处理）。服务端只保存规范化后的事实。
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from services.models import money
+from services.models import money, money_cap
 
 #: 检查名与拦截码，顺序即契约 §4 的判定顺序
 CHECK_ORDER: tuple[tuple[str, str], ...] = (
@@ -45,6 +48,17 @@ CHECK_ORDER: tuple[tuple[str, str], ...] = (
 )
 
 _ABSENT = object()
+
+#: 结算页事实里会被保存与判定的键（契约 §4）；其余键一律丢弃
+FACT_KEYS: tuple[str, ...] = (
+    "items", "subtotal", "shipping", "tax", "total_before_tax", "total", "gift_card_amount", "currency",
+    "delivery", "ship_to", "card_last4", "fulfillment",
+)
+_AMOUNT_FACTS = ("subtotal", "shipping", "tax", "total_before_tax", "total", "gift_card_amount")
+#: 类型不对的值的替身：护栏照样判为格式不对，库里不留原值
+INVALID = "<invalid>"
+_MAX_ITEMS = 20
+_MAX_NUMBER = 10 ** 12           # 金额 / 数量的绝对值上限（库里金额是 numeric(12,2)），超出按格式不对
 
 
 def _usd(v: Decimal | None) -> str:
@@ -62,7 +76,10 @@ def _amount(v: Any, *, signed: bool = False) -> Any:
         return _ABSENT
     if isinstance(v, bool) or not isinstance(v, (str, int, float, Decimal)):
         return None
-    d = money(v)
+    try:
+        d = money(v)
+    except (InvalidOperation, ValueError, OverflowError):     # 位数大到无法取两位小数
+        d = None
     if d is None or (d < 0 and not signed):
         return None
     return d
@@ -116,6 +133,75 @@ def _card4(v: Any) -> str | None:
     return digits[-4:] if len(digits) >= 4 else (digits or None)
 
 
+def _scalar(v: Any, n: int) -> Any:
+    """输入：金额 / 数量一类的标量 → 输出：None、绝对值小于 10^12 的有限数字或不超过 n 个字符的字符串；
+    其他（布尔、对象、数组、NaN、超长、超大）→ INVALID。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return INVALID
+    if isinstance(v, (int, float, Decimal)):
+        try:
+            finite = Decimal(str(v)).is_finite()
+        except (InvalidOperation, ValueError):
+            finite = False
+        return v if finite and abs(v) < _MAX_NUMBER else INVALID
+    if isinstance(v, str):
+        s = v.strip()
+        return s if len(s) <= n else INVALID
+    return INVALID
+
+
+def _short(v: Any, n: int) -> str | None:
+    """输入：只展示或只看前几位的文本 → 输出：截到 n 个字符的字符串；字符串 / 数字以外 → INVALID；空 → None。"""
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (str, int, float, Decimal)):
+        return INVALID
+    s = str(v).strip()
+    return s[:n] or None
+
+
+def _exact(v: Any, n: int) -> str | None:
+    """输入：要整段比对的文本（ASIN、币种）→ 输出：去空白后的字符串；超过 n 个字符或类型不对 → INVALID
+    （截短可能把不相同的值变成相同）。"""
+    s = _short(v, 10 ** 6)
+    return s if s is None or len(s) <= n else INVALID
+
+
+def sanitize_facts(facts: Any) -> dict[str, Any]:
+    """输入：插件上报的结算页事实（任意 JSON）→ 输出：只含 FACT_KEYS 的规范化事实（可入库）。
+
+    卡号只留后 4 位（与 evaluate 的比对口径相同）；delivery 只留 text（≤200 字）/ date / days，ship_to 只留
+    postal_code，items 每项只留 asin / quantity / unit_price（最多 20 项）；缺的键为 None。
+    evaluate(sanitize_facts(x)) 与 evaluate(x) 的裁决相同。
+    """
+    raw = facts if isinstance(facts, dict) else {}
+    out: dict[str, Any] = {k: None for k in FACT_KEYS}
+    items = raw.get("items")
+    if isinstance(items, list):
+        out["items"] = [
+            {"asin": _exact(it.get("asin"), 20), "quantity": _scalar(it.get("quantity"), 8),
+             "unit_price": _scalar(it.get("unit_price"), 20)} if isinstance(it, dict) else {}
+            for it in items[:_MAX_ITEMS]
+        ]
+    for k in _AMOUNT_FACTS:
+        out[k] = _scalar(raw.get(k), 20)
+    out["currency"] = _exact(raw.get("currency"), 8)
+    delivery = raw.get("delivery")
+    if isinstance(delivery, dict):
+        d = delivery.get("date")
+        out["delivery"] = {"text": _short(delivery.get("text"), 200),
+                           "date": d.strip()[:32] if isinstance(d, str) else None,
+                           "days": _scalar(delivery.get("days"), 8)}
+    ship_to = raw.get("ship_to")
+    if isinstance(ship_to, dict):
+        out["ship_to"] = {"postal_code": _short(ship_to.get("postal_code"), 16)}
+    out["card_last4"] = _card4(raw.get("card_last4"))
+    out["fulfillment"] = _short(raw.get("fulfillment"), 32)
+    return out
+
+
 def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, postal_code: str | None,
              price_cap: Decimal | None, amount_min: Decimal, amount_max: Decimal | None,
              max_delivery_days: int | None, expected_card_last4: str | None, site_today: date) -> dict[str, Any]:
@@ -128,6 +214,7 @@ def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, p
     """
     if not isinstance(facts, dict):
         facts = {}
+    price_cap = money_cap(price_cap)
     checks: dict[str, dict[str, Any]] = {}
     reasons: dict[str, str] = {}
     exp_asin = asin.strip().upper() if isinstance(asin, str) and asin.strip() else None
@@ -205,7 +292,7 @@ def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, p
         checks["price_cap"] = {"ok": ok, "expected": _s(price_cap), "actual": _s(total_for_cap)}
         if not ok:
             extra = f"（结算页 {_usd(total)} + 礼品卡抵扣 {_usd(abs(gift))}）" if gift else ""
-            reasons["price_cap"] = f"结算总额 {_usd(total_for_cap)}{extra}超过限价 {_usd(price_cap)}"
+            reasons["price_cap"] = f"结算总额 {_usd(total_for_cap)}{extra or ' '}超过限价 {_usd(price_cap)}"
 
     # ── 配送时长 ──
     delivery = facts.get("delivery") if isinstance(facts.get("delivery"), dict) else {}

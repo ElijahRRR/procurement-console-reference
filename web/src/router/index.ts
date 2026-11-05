@@ -41,7 +41,7 @@ const routes: RouteRecordRaw[] = [
         path: 'exceptions',
         name: 'exceptions',
         component: () => import('@/views/ExceptionsView.vue'),
-        meta: { title: '异常处理', subtitle: '被护栏拦截或执行失败、待决定重采和需要留意的任务' },
+        meta: { title: '异常处理', subtitle: '被护栏拦截或执行失败、结果待核实、待决定重采和需要留意的任务' },
       },
       {
         path: 'sources',
@@ -59,7 +59,7 @@ const routes: RouteRecordRaw[] = [
         path: 'settings',
         name: 'settings',
         component: () => import('@/views/SettingsView.vue'),
-        meta: { title: '设置', subtitle: '全局配送上限、模拟模式与物流同步' },
+        meta: { title: '设置', subtitle: '全局配送上限、模拟模式、物流同步与文件导入的准入规则' },
       },
     ],
   },

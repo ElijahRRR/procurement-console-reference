@@ -3,7 +3,7 @@
  * Playwright 截图脚本用 page.route() 把 /api/v1/** 交给 handleApi；评审阶段也可以直接复用。
  * 写操作只改内存里的一份 fixtures，刷新页面不保留。
  */
-import type { OrderRow, OrderView } from '../../src/api/types.ts'
+import type { FeishuSyncResult, ImportCommitResult, OrderRow, OrderStatus, OrderView, SimulationResetResult, VerifyWritebackResult } from '../../src/api/types.ts'
 import { buildFixtures, type Fixtures } from './fixtures.ts'
 
 export interface MockOptions {
@@ -99,7 +99,23 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       if (acc) rows = rows.filter((o) => String(o.assigned_account?.id) === acc)
       return ok(page(rows, q))
     }
-    if (path === '/orders/bulk-review' && m === 'POST') return ok({ updated: Array.isArray(b.ids) ? b.ids.length : 0 })
+    if (path === '/orders/bulk-review' && m === 'POST') {
+      // 同服务端 orders.bulk_review：只处理仍在开始前状态的任务，其余列进 skipped
+      const pre: OrderStatus[] = ['pending_review', 'needs_info', 'conflict', 'queued', 'assigned']
+      const ids = Array.isArray(b.ids) ? (b.ids as number[]) : []
+      const updated: number[] = []
+      const skipped: { id: number; reason: string }[] = []
+      for (const id of ids) {
+        const d = fx.details[id]
+        if (!d) skipped.push({ id, reason: '任务不存在' })
+        else if (!pre.includes(d.status)) skipped.push({ id, reason: `「${d.status_zh ?? d.status}」状态的任务不能人审` })
+        else {
+          d.review_status = b.decision === 'approve' ? 'approved' : 'rejected'
+          updated.push(id)
+        }
+      }
+      return ok({ updated, skipped })
+    }
     if ((r = /^\/orders\/(\d+)$/.exec(path))) {
       const d = fx.details[Number(r[1])]
       return d ? ok(d) : err(404, 'NOT_FOUND', '任务不存在')
@@ -119,6 +135,16 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         Object.assign(d, { status: 'cancelled', status_reason: `人工取消：${String(b.note ?? '')}`, allowed_actions: ['uncancel'] })
       } else if (action === 'review') {
         Object.assign(d, { review_status: b.decision === 'approve' ? 'approved' : 'rejected' })
+      } else if (action === 'clear-attention') {
+        Object.assign(d, { needs_attention: false, attention_note: null, allowed_actions: d.allowed_actions.filter((a) => a !== 'clear_attention') })
+      } else if (action === 'writeback-target') {
+        const src = d.sources.find((x) => x.id === b.source_id)
+        if (!src) return err(404, 'NOT_FOUND', '来源记录不存在')
+        if (src.kind !== 'feishu') return err(422, 'VALIDATION', '只有飞书来源可以作为写回目标')
+        for (const x of d.sources) x.is_writeback_target = x.id === src.id
+        if (!d.sources.some((x) => x.kind === 'feishu' && !x.is_writeback_target)) {
+          d.allowed_actions = d.allowed_actions.filter((a) => a !== 'set_writeback_target')
+        }
       }
       return ok(d)
     }
@@ -157,14 +183,23 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
 
     // ── 设置与模拟 ──
     if (path === '/settings') {
-      if (m === 'PATCH') Object.assign(fx.settings, b)
+      if (m === 'PATCH') {
+        const { file_admission: adm, ...rest } = b
+        Object.assign(fx.settings, rest)
+        if (adm === null) fx.settings.file_admission = buildFixtures(now).settings.file_admission
+        else if (adm && typeof adm === 'object') fx.settings.file_admission = { ...fx.settings.file_admission!, ...(adm as object) }
+      }
       return ok(fx.settings)
     }
-    if (path === '/simulation/reset' && m === 'POST') return ok({ attempts: 9, orders: 7, accounts: 1 })
+    if (path === '/simulation/reset' && m === 'POST') {
+      const res: SimulationResetResult = { runs_ended: [9], attempts_reset: 9, orders_restored: [101, 102, 103, 104, 105, 106], orders_skipped: [{ order_id: 107, reason: '任务已被人工处理' }], accounts_resumed: [7] }
+      return ok(res)
+    }
 
     // ── 飞书 ──
     if (path === '/feishu/status') return ok({ configured: feishuConfigured })
-    if (path.startsWith('/feishu/') && !feishuConfigured && path !== '/feishu/connections') {
+    // 系统字段清单不需要飞书应用（文件导入继续批次时也用它），与服务端一致
+    if (path.startsWith('/feishu/') && !feishuConfigured && path !== '/feishu/connections' && path !== '/feishu/system-fields') {
       return err(409, 'FEISHU_NOT_CONFIGURED', '未配置飞书应用')
     }
     if (path === '/feishu/system-fields') return ok(fx.systemFields)
@@ -180,10 +215,29 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       const c = fx.connections.find((x) => x.id === Number(r![1]))
       if (!c) return err(404, 'NOT_FOUND', '连接不存在')
       if (r[2] === 'runs') return ok(page(fx.syncRuns[c.id] ?? [], q))
-      if (r[2] === 'sync') return ok(fx.syncRuns[c.id]?.[0] ?? { id: 1, connection_id: c.id, trigger: 'manual', started_at: now.toISOString(), finished_at: now.toISOString(), ok: true, stats: { read: 0 }, error: null })
+      if (r[2] === 'sync') {
+        // 同服务端 feishu_intake.run_connection：统计 + 问题记录样本 + 随后的分配摘要
+        const res: FeishuSyncResult = {
+          read: 12, new: 2, update: 1, unchanged: 8, conflict: 0, historical: 0, skipped: 1, invalid: 0,
+          run_id: 501,
+          problems: [{ record_id: 'recDEMO000777', upstream_order_no: 'PO-DEMO-20261199-SKU99', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
+          allocation: { ...fx.lastAllocation, id: fx.lastAllocation.id + 1, trigger: 'intake', at: now.toISOString() },
+        }
+        return ok(res)
+      }
       if (r[2] === 'verify-writeback') {
-        Object.assign(c, { writeback_verified_at: now.toISOString(), writeback_state: 'active', writeback_test_record: String(b.record_id ?? '') })
-        return ok(c)
+        const recordId = String(b.record_id ?? '')
+        Object.assign(c, { writeback_verified_at: now.toISOString(), writeback_state: 'active', writeback_test_record: recordId })
+        const res: VerifyWritebackResult = {
+          ok: true,
+          mismatches: [],
+          written: Object.fromEntries(Object.values(c.writeback_map).map((col) => [col, '回填验收'])),
+          restored: true,
+          restore_error: null,
+          error: null,
+          connection: c,
+        }
+        return ok(res)
       }
       if (m === 'PATCH') Object.assign(c, b)
       return ok(c)
@@ -209,8 +263,23 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       const v = q.get('verdict')
       return ok(page(v ? fx.importRows.filter((x) => x.verdict === v) : fx.importRows, q))
     }
-    if ((r = /^\/imports\/(\d+)\/(commit|discard)$/.exec(path)) && m === 'POST') {
-      return ok({ ...fx.importPreview.batch, status: r[2] === 'commit' ? 'committed' : 'discarded', committed_at: r[2] === 'commit' ? now.toISOString() : null })
+    if ((r = /^\/imports\/(\d+)$/.exec(path)) && m === 'GET') {
+      const id = Number(r[1])
+      const found = fx.batches.find((x) => x.id === id) ?? (fx.importPreview.batch.id === id ? fx.importPreview.batch : null)
+      return found ? ok(found) : err(404, 'NOT_FOUND', '导入批次不存在')
+    }
+    if ((r = /^\/imports\/(\d+)\/commit$/.exec(path)) && m === 'POST') {
+      // 同服务端 imports.commit：{batch, stats, allocation}
+      const batch = { ...fx.importPreview.batch, status: 'committed' as const, committed_at: now.toISOString() }
+      const res: ImportCommitResult = {
+        batch,
+        stats: batch.stats ?? {},
+        allocation: { ...fx.lastAllocation, id: fx.lastAllocation.id + 1, trigger: 'import', at: now.toISOString() },
+      }
+      return ok(res)
+    }
+    if ((r = /^\/imports\/(\d+)\/discard$/.exec(path)) && m === 'POST') {
+      return ok({ ...fx.importPreview.batch, status: 'discarded', committed_at: null })
     }
     if (path === '/import-templates' && m === 'GET') return ok(page(fx.templates, q))
     if (path === '/import-templates' && m === 'POST') return ok({ id: 9, name: String(b.name ?? ''), mapping: b.mapping ?? {} })
@@ -218,7 +287,7 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
 
     // ── 事件 ──
     if (path === '/events') {
-      const id = Number(q.get('entity_id'))
+      const id = Number(q.get('order_id') ?? q.get('entity_id'))
       const d = fx.details[id]
       return ok(page(d?.events ?? [], q))
     }

@@ -8,12 +8,14 @@ import type { Account, Device } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
 import * as devicesApi from '@/api/devices'
 import * as settingsApi from '@/api/settings'
+import * as ordersApi from '@/api/orders'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import StatusDot from '@/components/StatusDot.vue'
 import AccountDialog from './AccountDialog.vue'
 import { formatAmountRange, formatDateTime, formatNumber, formatRelative } from '@/utils/format'
 import { IDENTITY_STATUS_DOT, IDENTITY_STATUS_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
+import { resumeConfirmText } from '@/utils/accounts'
 import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
 
 const accounts = ref<Account[]>([])
@@ -115,10 +117,23 @@ async function pause(a: Account) {
   }
 }
 
+/** 输入：账号 → 输出：该账号仍为「结果待核实」的任务数；读不到为 null（确认框改用通用提醒） */
+async function openUnknownCount(a: Account): Promise<number | null> {
+  try {
+    return (await ordersApi.listOrders({ view: 'result_unknown', account_id: a.id, page: 1, page_size: 1 })).total
+  } catch {
+    return null
+  }
+}
+
 async function resume(a: Account) {
+  busy.value = `resume-${a.id}`
+  const open = await openUnknownCount(a)
+  busy.value = null
   const ok = await confirmAction({
-    message: `确定要恢复「${a.name}」的执行吗？${a.pause_reason === '结果待核实' ? '请先确认该账号的结果待核实任务都已核实。' : ''}`,
+    message: resumeConfirmText(a.name, a.pause_reason, open),
     confirmText: '恢复执行',
+    danger: !!open,
   })
   if (!ok) return
   busy.value = `resume-${a.id}`
@@ -148,8 +163,8 @@ function quotaStatus(a: Account): '' | 'warning' {
   <div>
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <p class="text-sm text-gray-500 dark:text-dark-400">
-        共 {{ formatNumber(summary.total) }} 个账号，{{ formatNumber(summary.enabled) }} 个开启采购<template v-if="summary.paused">，{{ formatNumber(summary.paused) }} 个暂停执行</template>。
-        账号配置以服务端为准，插件显示的是服务端已确认的有效设置。
+        共 {{ formatNumber(summary.total) }} 个账号，{{ formatNumber(summary.enabled) }} 个开启采购<template v-if="summary.paused">，{{ formatNumber(summary.paused) }} 个暂停执行</template>。<!--
+        -->账号配置以服务端为准，插件显示的是服务端已确认的有效设置。
       </p>
       <div class="flex gap-2">
         <el-button @click="load"><AppIcon name="refresh" size="sm" class="mr-1.5" />刷新</el-button>
@@ -217,7 +232,8 @@ function quotaStatus(a: Account): '' | 'warning' {
           <template #default="{ row }">
             <div class="flex flex-col items-start gap-1">
               <template v-if="row.execution_paused">
-                <StatusDot color="red" :label="`已暂停：${row.pause_reason || '未写原因'}`" />
+                <StatusDot color="red" label="已暂停" />
+                <span class="break-all text-xs text-gray-700 dark:text-gray-300">{{ row.pause_reason || '未写原因' }}</span>
                 <span class="text-xs text-gray-500 dark:text-dark-400">{{ formatDateTime(row.paused_at) }}</span>
                 <el-button size="small" :loading="busy === `resume-${row.id}`" @click="resume(row as Account)">恢复执行</el-button>
               </template>

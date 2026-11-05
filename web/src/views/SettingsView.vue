@@ -1,26 +1,41 @@
 <script setup lang="ts">
-/** 设置：全局默认配送上限、模拟模式（本阶段只读）、物流同步时间（第二个 PR 启用）、清除模拟结果。 */
-import { onMounted, ref } from 'vue'
-import type { Settings } from '@/api/types'
+/**
+ * 设置：全局默认配送上限、模拟模式（本阶段只读）、物流同步时间（第二个 PR 启用）、文件导入的准入规则、清除模拟结果。
+ */
+import { computed, onMounted, reactive, ref } from 'vue'
+import type { FeishuAdmission, Settings } from '@/api/types'
 import * as settingsApi from '@/api/settings'
 import * as simulationApi from '@/api/simulation'
 import AppIcon from '@/components/AppIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
-import { formatNumber } from '@/utils/format'
-import { confirmAction, notifyFailure, notifySuccess } from '@/utils/feedback'
+import { ADMISSION_FIELDS, FILE_ADMISSION_DEFAULTS, admissionEquals, defaultsHint, fullAdmission } from '@/utils/admission'
+import { resetSummary } from '@/utils/results'
+import { confirmAction, notifyFailure, notifySuccess, notifySummary } from '@/utils/feedback'
 import { loadAppFlags } from '@/stores/app'
 
 const settings = ref<Settings | null>(null)
 const loading = ref(false)
 const saving = ref(false)
 const resetting = ref(false)
+const savingAdmission = ref(false)
 const maxDays = ref<number | undefined>(10)
+const fileAdmission = reactive<FeishuAdmission>(fullAdmission(null, FILE_ADMISSION_DEFAULTS))
+
+/** 服务端当前生效的文件准入规则（缺省 + 工作区改过的项） */
+const savedAdmission = computed(() => fullAdmission(settings.value?.file_admission, FILE_ADMISSION_DEFAULTS))
+const admissionDirty = computed(() => !admissionEquals(fileAdmission, savedAdmission.value))
+const admissionIsDefault = computed(() => admissionEquals(savedAdmission.value, FILE_ADMISSION_DEFAULTS))
+
+function applySettings(s: Settings) {
+  settings.value = s
+  maxDays.value = s.default_max_delivery_days
+  Object.assign(fileAdmission, fullAdmission(s.file_admission, FILE_ADMISSION_DEFAULTS))
+}
 
 async function load() {
   loading.value = true
   try {
-    settings.value = await settingsApi.getSettings()
-    maxDays.value = settings.value.default_max_delivery_days
+    applySettings(await settingsApi.getSettings())
   } catch (e) {
     notifyFailure('读取设置', e)
   } finally {
@@ -37,13 +52,48 @@ async function saveDays() {
   if (!ok) return
   saving.value = true
   try {
-    settings.value = await settingsApi.updateSettings({ default_max_delivery_days: maxDays.value })
-    maxDays.value = settings.value.default_max_delivery_days
+    const next = await settingsApi.updateSettings({ default_max_delivery_days: maxDays.value })
+    settings.value = next
+    maxDays.value = next.default_max_delivery_days
     notifySuccess('默认配送上限已保存')
   } catch (e) {
     notifyFailure('保存默认配送上限', e)
   } finally {
     saving.value = false
+  }
+}
+
+async function saveAdmission() {
+  const ok = await confirmAction({
+    message: '确定要保存文件导入的准入规则吗？之后的预览与提交都按新规则判定，已提交的批次不受影响。',
+  })
+  if (!ok) return
+  savingAdmission.value = true
+  try {
+    const next = await settingsApi.updateSettings({ file_admission: { ...fileAdmission } })
+    settings.value = next
+    Object.assign(fileAdmission, fullAdmission(next.file_admission, FILE_ADMISSION_DEFAULTS))
+    notifySuccess('文件导入的准入规则已保存')
+  } catch (e) {
+    notifyFailure('保存准入规则', e)
+  } finally {
+    savingAdmission.value = false
+  }
+}
+
+async function restoreAdmission() {
+  const ok = await confirmAction({ message: '确定要把文件导入的准入规则恢复为缺省值吗？' })
+  if (!ok) return
+  savingAdmission.value = true
+  try {
+    const next = await settingsApi.updateSettings({ file_admission: null })
+    settings.value = next
+    Object.assign(fileAdmission, fullAdmission(next.file_admission, FILE_ADMISSION_DEFAULTS))
+    notifySuccess('已恢复缺省的准入规则')
+  } catch (e) {
+    notifyFailure('恢复准入规则', e)
+  } finally {
+    savingAdmission.value = false
   }
 }
 
@@ -58,11 +108,7 @@ async function resetSimulation() {
   resetting.value = true
   try {
     const res = await simulationApi.resetSimulation()
-    const parts: string[] = []
-    if (typeof res?.attempts === 'number') parts.push(`尝试 ${formatNumber(res.attempts)} 次`)
-    if (typeof res?.orders === 'number') parts.push(`任务 ${formatNumber(res.orders)} 笔`)
-    if (typeof res?.accounts === 'number') parts.push(`恢复账号 ${formatNumber(res.accounts)} 个`)
-    notifySuccess('已清除模拟结果', parts.join('，'))
+    notifySummary(resetSummary(res))
     void loadAppFlags()
   } catch (e) {
     notifyFailure('清除模拟结果', e)
@@ -74,7 +120,7 @@ async function resetSimulation() {
 
 <template>
   <div>
-    <PageHeader title="设置" description="设置项的修改以服务端为准，插件在下一次心跳拿到最新的有效配置。" />
+    <PageHeader title="全局设置" description="设置项的修改以服务端为准，插件在下一次心跳拿到最新的有效配置。" />
 
     <div v-loading="loading" class="grid max-w-4xl grid-cols-1 gap-6">
       <el-card shadow="always">
@@ -113,6 +159,47 @@ async function resetSimulation() {
             </div>
             <el-time-select :model-value="settings?.logistics_sync_time ?? '08:30'" disabled start="00:00" end="23:30" step="00:30" style="width: 9rem" />
           </div>
+        </div>
+      </el-card>
+
+      <el-card shadow="always">
+        <template #header>
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h3 class="text-base font-semibold text-gray-900 dark:text-white">文件导入的准入规则</h3>
+            <el-tag v-if="admissionIsDefault" size="small" type="info" disable-transitions>缺省值</el-tag>
+          </div>
+        </template>
+        <p class="mb-4 text-xs text-gray-500 dark:text-dark-400">
+          上传的表格按这里的规则判定准入；飞书连接各自在连接里设置。文件是快照，上游取消要靠更新后的文件里的「售后状态」表达，所以缺省把「已取消」视为上游取消。
+        </p>
+        <el-form label-position="top">
+          <div class="grid gap-x-6 md:grid-cols-2">
+            <el-form-item v-for="f in ADMISSION_FIELDS" :key="f.key" :label="f.label">
+              <el-select
+                v-model="fileAdmission[f.key]"
+                multiple
+                filterable
+                allow-create
+                default-first-option
+                :reserve-keyword="false"
+                class="w-full"
+                placeholder="输入后回车添加"
+                :aria-label="f.label"
+              />
+              <p class="mt-1.5 text-xs text-gray-500 dark:text-dark-400">{{ f.hint }}{{ defaultsHint(FILE_ADMISSION_DEFAULTS[f.key]) }}</p>
+            </el-form-item>
+          </div>
+          <div class="flex items-center justify-between gap-4 rounded-xl border border-gray-100 px-4 py-3 dark:border-dark-700">
+            <div>
+              <p class="text-sm font-medium text-gray-900 dark:text-white">导入历史已采购的行</p>
+              <p class="text-xs text-gray-500 dark:text-dark-400">已带 AMZ 订单号的行记为已采购（不重新下单），用于物流同步与对账。文件导入默认开启。</p>
+            </div>
+            <el-switch v-model="fileAdmission.import_historical" aria-label="导入历史已采购的行" />
+          </div>
+        </el-form>
+        <div class="mt-4 flex flex-wrap justify-end gap-2">
+          <el-button :disabled="admissionIsDefault && !admissionDirty" :loading="savingAdmission" @click="restoreAdmission">恢复缺省值</el-button>
+          <el-button type="primary" :disabled="!settings || !admissionDirty" :loading="savingAdmission" @click="saveAdmission">保存准入规则</el-button>
         </div>
       </el-card>
 

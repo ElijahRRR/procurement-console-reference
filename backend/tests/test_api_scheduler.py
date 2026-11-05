@@ -147,3 +147,43 @@ def test_scheduler_threads_start_and_stop(monkeypatch):
 def test_serve_rejects_unknown_params():
     with pytest.raises(SystemExit):
         scheduler.serve(nonsense="1")
+
+
+def test_daily_allocation_is_restart_proof_and_catches_up_once():
+    """K11：00:01 之后重启（进程内状态丢了）不会重做当天的每日分配；当天没做过的（服务停过）启动后补做一次。"""
+    from services import allocation
+
+    ws = _workspace()
+    with tx() as conn:
+        assert allocation.daily_done(conn, ws["id"], clock.bj_date(NOW)) is False
+    first = scheduler.run_jobs_once(NOW, scheduler.JobState())["daily_allocation"]      # 10:00 启动：补做
+    assert "id" in first["workspaces"][str(ws["id"])]
+    restarted = scheduler.JobState()                                                      # 进程重启
+    second = scheduler.run_jobs_once(NOW + timedelta(hours=1), restarted)["daily_allocation"]
+    assert second["workspaces"][str(ws["id"])] == {"skipped": "今天已做过每日分配"}
+    assert restarted.last_daily == clock.bj_date(NOW)
+    with tx() as conn:
+        assert allocation.daily_done(conn, ws["id"], clock.bj_date(NOW)) is True
+        assert f.count(conn, "allocation_runs", "trigger = 'daily'") == 1
+        allocation.allocate(conn, ws["id"], trigger="manual")                             # 人工分配不算每日分配
+        assert allocation.daily_done(conn, ws["id"], clock.bj_date(NOW) + timedelta(days=1)) is False
+
+
+def test_cli_allocate_defaults_to_manual_and_daily_skips_done_workspaces():
+    from workflows import allocate
+
+    ws = _workspace()
+    out = allocate.run()
+    assert out["workspaces"][str(ws["id"])]["trigger"] == "manual"
+    assert "id" in allocate.run(trigger="daily")["workspaces"][str(ws["id"])]
+    assert allocate.run(trigger="daily")["workspaces"][str(ws["id"])] == {"skipped": "今天已做过每日分配"}
+
+
+def test_scheduler_intake_interval_comes_from_settings(monkeypatch):
+    import dataclasses
+
+    from registry import settings
+
+    monkeypatch.setattr(settings, "_loaded", dataclasses.replace(settings.get(), intake_check_s=45))
+    s = scheduler.Scheduler()
+    assert s._feishu[0].name == "feishu_intake" and s._feishu[0].interval_s == 45

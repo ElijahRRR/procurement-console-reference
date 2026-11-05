@@ -4,7 +4,7 @@
     "noEmit": false,
     "outDir": "build",
     "rootDir": "src",
-    "types": []
+    "types": ["chrome"]
   },
-  "include": ["src/core", "src/dom"]
+  "include": ["src/core", "src/dom", "src/background"]
 }

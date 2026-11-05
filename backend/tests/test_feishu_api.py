@@ -312,3 +312,21 @@ def test_batch_update_chunks_of_500(client, fake):
     assert [r["record_id"] for r in out] == [f"rec{i}" for i in range(1201)]
     assert client.batch_update_records(APP, TABLE, []) == []
     assert len(fake.data_requests()) == 3
+
+
+def test_retry_logs_never_contain_table_tokens(client, fake, sleeps, caplog):
+    """重试日志里的路径去掉多维表格 / 数据表 / 记录标识（D3-06）；cli.py 把 httpx 的请求日志调到 WARNING。"""
+    import logging
+
+    import cli
+    from api.feishu import redact_path
+
+    fake.handlers[tables_path()] = [httpx.Response(503, text="busy"), ok({"items": [], "has_more": False})]
+    with caplog.at_level(logging.INFO):
+        client.list_tables(APP)
+    ours = [r for r in caplog.records if r.name == "api.feishu"]
+    assert ours and all(APP not in r.getMessage() for r in ours)
+    assert redact_path(f"/open-apis/bitable/v1/apps/{APP}/tables/{TABLE}/records/recDEMO1?x=1") == \
+        "/open-apis/bitable/v1/apps/***/tables/***/records/***"
+    assert redact_path(f"/open-apis/bitable/v1/apps/{APP}/tables/{TABLE}/records/search").endswith("/records/search")
+    assert "httpx" in cli.QUIET_LOGGERS

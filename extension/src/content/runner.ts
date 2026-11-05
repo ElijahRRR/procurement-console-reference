@@ -5,15 +5,18 @@
  *   · 标签页租约（本浏览器）：同一时刻只有一个亚马逊标签页去申请执行批次；
  *   · 服务端执行批次（全局权威）：同一账号跨电脑、跨浏览器只有一个批次，冲突时 409 ACCOUNT_BUSY。
  *
- * 续租（标签页租约每 60 秒、批次心跳每 35 秒）跑在定时器上、在单飞闸外面：
- * 后台标签页的定时器会被节流到约 60 秒一次，仍在两者的有效期（5 分钟、180 秒）之内；
- * 定时器再慢时，引擎在每次领取之前也会按时钟补发一次批次心跳，后台还有一路兜底心跳。
+ * 续租（标签页租约每 60 秒、批次心跳每 min(35 秒, 租约有效期 / 3)）跑在定时器上、在单飞闸外面：
+ * 后台标签页的定时器会被节流到约 60 秒一次；定时器再慢时，引擎在每一步之前也会按时钟补发一次
+ * 批次心跳，后台还有一路兜底心跳（只在本页对 pc.ping 有答复时才发）。
+ *
+ * 开始之前先请后台让**每个**亚马逊标签页重读身份、对账、上报（pc.prepareStart）：
+ * 只重读本页不够 —— 本页可能是几小时前打开的，别的标签页里已经登录了另一个买家号。
  */
 
 import { codeLabel } from "../core/codes.js";
 import { RunEngine, type EngineView, type RunSummary } from "../core/engine.js";
 import { SingleFlight } from "../core/gates.js";
-import type { LeaseReply, Msg, ScheduledReply } from "../core/messages.js";
+import type { LeaseReply, Msg, PrepareReply, ScheduledReply } from "../core/messages.js";
 import type { Trigger } from "../core/types.js";
 import { fetchState, swLog, toSw } from "../ui/bridge.js";
 import { RemoteApi } from "./remote-api.js";
@@ -25,9 +28,6 @@ export class RunHost {
   private engine: RunEngine | null = null;
   private lastSummary: RunSummary | null = null;
   private readonly listeners = new Set<() => void>();
-
-  /** readIdentity：重新读一次本页身份并强制上报（开始批次前要让服务端拿到新鲜身份）。 */
-  constructor(private readonly readIdentity: (force: boolean) => Promise<unknown>) {}
 
   get running(): boolean {
     return this.flight.busy;
@@ -124,7 +124,13 @@ export class RunHost {
     this.emit();
     try {
       // 让服务端拿到这一刻的身份（开始批次要求 10 分钟内上报过、且与绑定账号一致）。
-      await this.readIdentity(true).catch(() => undefined);
+      const prep = await toSw<PrepareReply>({ type: "pc.prepareStart" }, 45_000).catch(() => null);
+      if (prep?.conflict) {
+        const message = prep.message ?? "开始执行失败：本浏览器的亚马逊标签页显示的登录账号不一致";
+        swLog("err", message);
+        reply({ result: "rejected", message });
+        return null;
+      }
       renew = setInterval(() => {
         void this.lease(true).then((l) => {
           if (!l.granted) engine.requestStop("本页的执行租约被另一个标签页取得");
@@ -132,6 +138,7 @@ export class RunHost {
       }, LEASE_RENEW_MS);
       const summary = await engine.run(trigger, (n) => {
         if (n.started) reply({ result: "started", message: n.message });
+        else if (n.status === "busy" && n.busy_mine) reply({ result: "retry", message: n.message });
         else if (n.status === "busy") reply({ result: "busy", message: n.message });
         else if (n.error?.kind === "network") reply({ result: "network", message: n.message });
         else reply({ result: "rejected", message: n.message });

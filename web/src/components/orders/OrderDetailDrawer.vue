@@ -1,13 +1,15 @@
 <script setup lang="ts">
 /**
- * 任务详情抽屉：执行参数（有效值 vs 原值）、收件信息、分配、冲突、来源与快照、采购尝试（含护栏逐项结果）、事件。
- * 底部操作按钮只由后端给的 allowed_actions 决定，前端不自行推断哪些动作可做。
+ * 任务详情抽屉：执行参数（有效值 vs 原值）、收件信息、分配、冲突、来源与快照（含回填目标）、采购尝试（含护栏逐项结果）、
+ * 事件（更早的按页读取）。底部操作按钮只由后端给的 allowed_actions 决定，前端不自行推断哪些动作可做。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import type { Account, Attempt, EventRecord, OrderAction, OrderDetail, OrderSource } from '@/api/types'
+import { ORDER_DETAIL_EVENT_LIMIT } from '@/api/types'
 import * as ordersApi from '@/api/orders'
 import * as accountsApi from '@/api/accounts'
+import * as eventsApi from '@/api/events'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import OrderStatusTag from './OrderStatusTag.vue'
@@ -19,6 +21,7 @@ import {
   formatDays,
   formatMoney,
   formatNumber,
+  hasAtMostTwoDecimals,
   normalizeMoneyInput,
   parseAmount,
 } from '@/utils/format'
@@ -42,6 +45,7 @@ import {
   tagOf,
 } from '@/utils/labels'
 import { normalizeGuardChecks } from '@/utils/guard'
+import { missingFieldsText, showStatusReason, statusAlertType } from '@/utils/orderDetail'
 import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
 
 const props = defineProps<{ orderId: number | null }>()
@@ -52,16 +56,28 @@ const detail = ref<OrderDetail | null>(null)
 const loading = ref(false)
 const loadError = ref('')
 const busy = ref<string | null>(null)
+/** 按页读到的更早事件（详情只随附最近的一部分） */
+const olderEvents = ref<EventRecord[]>([])
+/** GET /events 返回的全部条数；还没按页读过为 null */
+const olderTotal = ref<number | null>(null)
+const olderLoading = ref(false)
 
 const drawerSize = computed(() => (typeof window !== 'undefined' && window.innerWidth < 800 ? '100%' : '760px'))
 const can = (a: OrderAction) => !!detail.value?.allowed_actions?.includes(a)
+
+/** 输入：新的任务详情 → 输出：无（替换详情，清掉按页读过的更早事件） */
+function setDetail(d: OrderDetail | null) {
+  detail.value = d
+  olderEvents.value = []
+  olderTotal.value = null
+}
 
 async function load() {
   if (!props.orderId) return
   loading.value = true
   loadError.value = ''
   try {
-    detail.value = await ordersApi.getOrder(props.orderId)
+    setDetail(await ordersApi.getOrder(props.orderId))
   } catch (e) {
     detail.value = null
     loadError.value = e instanceof Error ? e.message : String(e)
@@ -83,7 +99,7 @@ async function run(action: string, fn: () => Promise<unknown>, success: string) 
   busy.value = action
   try {
     const res = await fn()
-    if (res && typeof res === 'object' && 'allowed_actions' in res) detail.value = res as OrderDetail
+    if (res && typeof res === 'object' && 'allowed_actions' in res) setDetail(res as OrderDetail)
     else await load()
     notifySuccess(success)
     emit('changed', detail.value)
@@ -168,6 +184,21 @@ function sourceTitle(s: OrderSource): string {
   return `${s.filename || `批次 ${s.batch_id ?? '—'}`} · 第 ${s.row_no ?? '—'} 行`
 }
 
+const feishuSources = computed(() => (detail.value?.sources ?? []).filter((s) => s.kind === 'feishu'))
+const hasWritebackTarget = computed(() => feishuSources.value.some((s) => s.is_writeback_target))
+
+/** 输入：一条不是回填目标的飞书来源 → 输出：无（确认后设为这笔任务唯一的回填目标） */
+async function setWritebackTarget(s: OrderSource) {
+  if (!detail.value) return
+  const ok = await confirmAction({
+    title: '设为回填目标',
+    message: `确定要把这条飞书记录设为回填目标吗？之后这笔任务的真实采购结果只写回「${sourceTitle(s)}」${hasWritebackTarget.value ? '，原来的回填目标不再写回' : ''}；已采购的真实结果会马上排队写回，模拟结果不写回。`,
+  })
+  if (!ok) return
+  const id = detail.value.id
+  await run('设为回填目标', () => ordersApi.setWritebackTarget(id, s.id), '已设为回填目标')
+}
+
 // ── 尝试与事件 ────────────────────────────────────────────────────────────────
 
 function attemptAmounts(a: Attempt): [string, string][] {
@@ -200,6 +231,30 @@ function eventSummary(e: EventRecord): string {
 function actorText(e: EventRecord): string {
   const kind = labelOf(ACTOR_KIND_LABEL, e.actor_kind)
   return e.actor_name ? `${kind} ${e.actor_name}` : kind
+}
+
+// 详情只随附最近 ORDER_DETAIL_EVENT_LIMIT 条事件；更早的用 GET /events?order_id= 按页读（同样新的在前）
+const EVENT_PAGE = 100
+const allEvents = computed(() => [...(detail.value?.events ?? []), ...olderEvents.value])
+const hasOlderEvents = computed(() =>
+  olderTotal.value === null ? (detail.value?.events?.length ?? 0) >= ORDER_DETAIL_EVENT_LIMIT : allEvents.value.length < olderTotal.value,
+)
+
+async function loadOlderEvents() {
+  if (!detail.value) return
+  olderLoading.value = true
+  try {
+    const page = Math.floor(allEvents.value.length / EVENT_PAGE) + 1
+    const res = await eventsApi.listEvents({ order_id: detail.value.id, page, page_size: EVENT_PAGE })
+    const seen = new Set(allEvents.value.map((e) => e.id))
+    olderEvents.value = [...olderEvents.value, ...res.rows.filter((e) => !seen.has(e.id))]
+    // 读到不满一页说明到底了
+    olderTotal.value = res.rows.length < EVENT_PAGE ? allEvents.value.length : res.total
+  } catch (e) {
+    notifyFailure('读取更早的事件', e)
+  } finally {
+    olderLoading.value = false
+  }
 }
 
 const MONEY_FIELDS = new Set(['unit_price', 'price_cap', 'sales_total'])
@@ -296,8 +351,14 @@ const overrideRules: FormRules = {
   asin: [{ pattern: /^[A-Za-z0-9]{10}$/, message: 'ASIN 为 10 位字母或数字', trigger: 'blur' }],
   price_cap: [
     {
-      validator: (_r: unknown, v: string, cb: (e?: Error) => void) =>
-        !v || (normalizeMoneyInput(v) !== null && Number(normalizeMoneyInput(v)) > 0) ? cb() : cb(new Error('限价须为大于 0 的金额')),
+      validator: (_r: unknown, v: string, cb: (e?: Error) => void) => {
+        if (!v) return cb()
+        const n = parseAmount(v)
+        if (n === null || n <= 0) return cb(new Error('限价须为大于 0 的金额'))
+        // 限价是上限：不替用户四舍五入（40.999 → 41.00 会多放行），超过两位小数让用户自己改
+        if (!hasAtMostTwoDecimals(v)) return cb(new Error('限价最多两位小数，如 40.99'))
+        cb()
+      },
       trigger: 'blur',
     },
   ],
@@ -394,8 +455,12 @@ const unknownForm = reactive({
   note: '',
 })
 const moneyRule = {
-  validator: (_r: unknown, v: string, cb: (e?: Error) => void) =>
-    !v || normalizeMoneyInput(v) !== null ? cb() : cb(new Error('请填写金额，如 44.49')),
+  validator: (_r: unknown, v: string, cb: (e?: Error) => void) => {
+    if (!v) return cb()
+    if (normalizeMoneyInput(v) === null) return cb(new Error('请填写金额，如 44.49'))
+    if (!hasAtMostTwoDecimals(v)) return cb(new Error('金额最多两位小数，与亚马逊订单页一致'))
+    cb()
+  },
   trigger: 'blur',
 }
 const unknownRules = computed<FormRules>(() => ({
@@ -435,7 +500,7 @@ async function submitUnknown() {
   const ordered = unknownForm.outcome === 'ordered'
   if (!ordered) {
     const ok = await confirmAction({
-      message: '确定已在亚马逊核实这笔没有下单吗？确认后释放当天额度，任务回到待采购，可能被再次执行。',
+      message: '确定要登记为未下单吗？请先在亚马逊订单页核实这笔确实没有下单。确认后释放当天额度，任务回到待采购，可能被再次执行。',
       danger: true,
     })
     if (!ok) return
@@ -482,7 +547,7 @@ async function repurchase(decision: 'approve' | 'decline') {
     title: approve ? '同意重采' : '不重采',
     message: approve
       ? '确定要重新采购这笔任务吗？会重新校验限价、配送时长与账号额度后进入待采购，形成新的采购尝试。'
-      : '确定不再重采吗？任务会关闭，原采购与取消记录保留。',
+      : '确定要关闭这笔任务、不再重采吗？原采购与取消记录保留。',
     placeholder: '说明（可选）',
     confirmText: approve ? '同意重采' : '不重采',
     danger: !approve,
@@ -510,7 +575,28 @@ async function resolveConflict(choice: 'keep' | 'accept') {
   await run('处理冲突', () => ordersApi.resolveConflict(id, choice, note || undefined), keep ? '已保留当前值' : '已接受来源新值')
 }
 
-const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) > 0)
+// ── 需要留意 ──────────────────────────────────────────────────────────────────
+
+async function clearAttention() {
+  if (!detail.value) return
+  const note = await promptText({
+    title: '标记已处理',
+    message: '确定要把这条提醒标记为已处理吗？请写明对相关亚马逊订单做了什么，原提醒会记进事件。',
+    placeholder: '处理说明，如 已在亚马逊取消对应订单',
+    required: true,
+    confirmText: '标记已处理',
+  })
+  if (note === null) return
+  const id = detail.value.id
+  await run('标记已处理', () => ordersApi.clearAttention(id, note), '已标记为已处理')
+}
+
+/** 底部按钮栏里的动作（回填目标在来源列表里逐条操作，不算在内） */
+const FOOTER_ACTIONS: readonly OrderAction[] = [
+  'review', 'assign', 'unassign', 'override', 'resume', 'cancel', 'uncancel', 'resolve_unknown',
+  'mark_amazon_cancelled', 'repurchase', 'resolve_conflict', 'clear_attention',
+]
+const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
 </script>
 
 <template>
@@ -533,18 +619,25 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
 
       <template v-if="detail">
         <div class="mb-4 space-y-2">
-          <el-alert v-if="detail.status_reason" :title="detail.status_reason" type="warning" :closable="false" show-icon />
+          <el-alert v-if="showStatusReason(detail)" :title="detail.status_reason ?? ''" :type="statusAlertType(detail.status)" :closable="false" show-icon />
           <el-alert
             v-if="detail.needs_attention"
             :title="detail.attention_note || '这笔任务需要人工留意'"
             type="error"
             :closable="false"
             show-icon
-          />
+          >
+            <template v-if="can('clear_attention')" #default>
+              <div class="mt-1 flex flex-wrap items-center gap-2">
+                <span>处理完相关的亚马逊订单后标记已处理，任务就不再出现在「需要留意」里。</span>
+                <el-button size="small" :loading="busy === '标记已处理'" @click="clearAttention">标记已处理</el-button>
+              </div>
+            </template>
+          </el-alert>
           <el-alert
             v-if="detail.missing_fields?.length"
-            :title="`缺少执行所需字段：${detail.missing_fields.map(fieldLabel).join('、')}`"
-            type="info"
+            :title="missingFieldsText(detail)"
+            type="warning"
             :closable="false"
             show-icon
           />
@@ -639,16 +732,34 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
               <div class="min-w-0">
                 <div class="flex flex-wrap items-center gap-2 text-sm text-gray-900 dark:text-gray-100">
                   <el-tag size="small" :type="s.kind === 'feishu' ? 'primary' : 'info'" disable-transitions>{{ labelOf(SOURCE_KIND_LABEL, s.kind) }}</el-tag>
-                  <span class="truncate">{{ sourceTitle(s) }}</span>
-                  <el-tag v-if="s.is_writeback_target" size="small" type="success" disable-transitions>写回目标</el-tag>
+                  <span class="min-w-0 break-all">{{ sourceTitle(s) }}</span>
+                  <el-tag v-if="s.is_writeback_target" size="small" type="success" disable-transitions>回填目标</el-tag>
                 </div>
                 <div class="mt-1 text-xs text-gray-500 dark:text-dark-400">
                   首次 {{ formatDateTime(s.first_seen_at) }} · 最近 {{ formatDateTime(s.last_seen_at) }}
                 </div>
               </div>
-              <el-button text size="small" @click="snapshotSource = s"><AppIcon name="eye" size="sm" class="mr-1" />查看快照</el-button>
+              <div class="flex flex-wrap items-center gap-1">
+                <el-button
+                  v-if="s.kind === 'feishu' && !s.is_writeback_target && can('set_writeback_target')"
+                  text
+                  size="small"
+                  type="primary"
+                  :loading="busy === '设为回填目标'"
+                  @click="setWritebackTarget(s)"
+                >
+                  设为回填目标
+                </el-button>
+                <el-button text size="small" @click="snapshotSource = s"><AppIcon name="eye" size="sm" class="mr-1" />查看快照</el-button>
+              </div>
             </div>
           </div>
+          <p v-if="feishuSources.length && !hasWritebackTarget" class="mt-2 text-xs text-gray-500 dark:text-dark-400">
+            这笔任务还没有回填目标：采购结果不会写回飞书。需要写回时，在上面选一条飞书记录设为回填目标。
+          </p>
+          <p v-else-if="feishuSources.length > 1" class="mt-2 text-xs text-gray-500 dark:text-dark-400">
+            同一平台订单号有多条飞书记录时，只有回填目标会收到采购结果。
+          </p>
         </section>
 
         <section class="pc-section">
@@ -702,7 +813,10 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
                   </template>
                   <template v-if="a.resolution">
                     <dt>人工核实</dt>
-                    <dd>{{ labelOf(RESOLUTION_LABEL, a.resolution) }}<template v-if="a.resolution_note"> · {{ a.resolution_note }}</template></dd>
+                    <dd>
+                      {{ labelOf(RESOLUTION_LABEL, a.resolution) }}<template v-if="a.resolution_note"> · {{ a.resolution_note }}</template>
+                      <div class="text-xs text-gray-500 dark:text-dark-400">{{ a.resolved_by_name || '—' }} · {{ formatDateTime(a.resolved_at) }}</div>
+                    </dd>
                   </template>
                 </dl>
                 <div v-if="a.total || a.subtotal" class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
@@ -727,11 +841,12 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
                   <table v-if="normalizeGuardChecks(a.guard_verdict).length" class="pc-checks">
                     <tbody>
                       <tr v-for="c in normalizeGuardChecks(a.guard_verdict)" :key="c.key">
-                        <td class="w-28 text-gray-500 dark:text-dark-400">{{ c.label }}</td>
-                        <td class="w-16">
-                          <span v-if="c.ok === true" class="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400"><AppIcon name="check" size="xs" />通过</span>
-                          <span v-else-if="c.ok === false" class="inline-flex items-center gap-1 text-red-600 dark:text-red-400"><AppIcon name="x" size="xs" />拦截</span>
-                          <span v-else class="text-gray-500 dark:text-dark-400">记录</span>
+                        <td class="w-24 text-gray-500 dark:text-dark-400">{{ c.label }}</td>
+                        <td class="w-20 whitespace-nowrap">
+                          <span v-if="c.state === 'pass'" class="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400"><AppIcon name="check" size="xs" />{{ c.stateText }}</span>
+                          <span v-else-if="c.state === 'fail'" class="inline-flex items-center gap-1 text-red-600 dark:text-red-400"><AppIcon name="x" size="xs" />{{ c.stateText }}</span>
+                          <span v-else-if="c.state === 'unknown'" class="text-amber-700 dark:text-amber-400">{{ c.stateText }}</span>
+                          <span v-else class="text-gray-500 dark:text-dark-400">{{ c.stateText }}</span>
                         </td>
                         <td class="text-gray-700 dark:text-gray-300">{{ c.detail || '—' }}</td>
                       </tr>
@@ -745,9 +860,9 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
 
         <section class="pc-section">
           <h3 class="pc-section-title">事件</h3>
-          <div v-if="!detail.events?.length" class="text-sm text-gray-500 dark:text-dark-400">没有事件</div>
+          <div v-if="!allEvents.length" class="text-sm text-gray-500 dark:text-dark-400">没有事件</div>
           <el-timeline v-else>
-            <el-timeline-item v-for="e in detail.events" :key="e.id" :timestamp="formatDateTime(e.at)" size="normal">
+            <el-timeline-item v-for="e in allEvents" :key="e.id" :timestamp="formatDateTime(e.at)" size="normal">
               <div class="text-sm">
                 <span class="font-medium text-gray-900 dark:text-white">{{ eventKindLabel(e.kind) }}</span>
                 <span class="ml-2 text-xs text-gray-500 dark:text-dark-400">{{ actorText(e) }}</span>
@@ -755,6 +870,10 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
               <div v-if="eventSummary(e)" class="mt-0.5 text-sm text-gray-600 dark:text-gray-300">{{ eventSummary(e) }}</div>
             </el-timeline-item>
           </el-timeline>
+          <div v-if="hasOlderEvents" class="mt-2">
+            <el-button size="small" :loading="olderLoading" @click="loadOlderEvents">显示更早的事件</el-button>
+          </div>
+          <p v-else-if="olderTotal !== null" class="mt-2 text-xs text-gray-500 dark:text-dark-400">共 {{ formatNumber(allEvents.length) }} 条事件，已全部显示</p>
         </section>
       </template>
     </div>
@@ -775,6 +894,7 @@ const hasActions = computed(() => (detail.value?.allowed_actions?.length ?? 0) >
         </template>
         <el-button v-if="can('resume')" type="primary" :loading="busy === '恢复任务'" @click="resume">恢复</el-button>
         <el-button v-if="can('resolve_unknown')" type="primary" @click="openUnknown">核实结果</el-button>
+        <el-button v-if="can('clear_attention')" :loading="busy === '标记已处理'" @click="clearAttention">标记已处理</el-button>
         <template v-if="can('repurchase')">
           <el-button :loading="busy === '关闭任务'" @click="repurchase('decline')">不重采</el-button>
           <el-button type="primary" :loading="busy === '同意重采'" @click="repurchase('approve')">同意重采</el-button>

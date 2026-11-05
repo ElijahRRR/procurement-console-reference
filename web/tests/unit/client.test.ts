@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, asPage, buildUrl, get, post, request, setAuthHandlers, toApiError, isNeedsSetup } from '@/api/client'
+import { ApiError, asPage, buildUrl, download, filenameFromDisposition, get, post, request, setAuthHandlers, toApiError, isNeedsSetup } from '@/api/client'
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(body === undefined ? '' : JSON.stringify(body), {
@@ -147,5 +147,82 @@ describe('asPage', () => {
     expect(asPage([1, 2])).toEqual({ total: 2, rows: [1, 2] })
     expect(asPage(null)).toEqual({ total: 0, rows: [] })
     expect(asPage({ total: 9, rows: [1] })).toEqual({ total: 9, rows: [1] })
+  })
+})
+
+describe('下载文件名（Content-Disposition）', () => {
+  it('优先取 RFC 5987 的 UTF-8 原名，其次取 filename=', () => {
+    expect(filenameFromDisposition(`attachment; filename="download.xlsx"; filename*=UTF-8''%E9%87%87%E8%B4%AD%E7%BB%93%E6%9E%9C-all-20261105.xlsx`)).toBe('采购结果-all-20261105.xlsx')
+    expect(filenameFromDisposition('attachment; filename="orders.xlsx"')).toBe('orders.xlsx')
+    expect(filenameFromDisposition('attachment; filename=plain.xlsx')).toBe('plain.xlsx')
+    expect(filenameFromDisposition(`attachment; filename="fallback.xlsx"; filename*=UTF-8''%E0%A4%A`)).toBe('fallback.xlsx')
+    expect(filenameFromDisposition(null)).toBeNull()
+    expect(filenameFromDisposition('attachment')).toBeNull()
+  })
+})
+
+describe('download：先看 HTTP 状态再存文件', () => {
+  const fetchMock = vi.fn()
+  const onUnauthorized = vi.fn()
+  const onNeedsSetup = vi.fn()
+  const createObjectURL = vi.fn(() => 'blob:demo')
+  const revokeObjectURL = vi.fn()
+  let clicked: { href: string; download: string }[] = []
+
+  beforeEach(() => {
+    fetchMock.mockReset()
+    onUnauthorized.mockReset()
+    onNeedsSetup.mockReset()
+    clicked = []
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('URL', Object.assign(URL, { createObjectURL, revokeObjectURL }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push({ href: this.href, download: this.download })
+    })
+    setAuthHandlers({ onUnauthorized, onNeedsSetup })
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('成功时用响应里的文件名保存，Cookie 同源随带', async () => {
+    fetchMock.mockResolvedValue(
+      new Response('xlsx', {
+        status: 200,
+        headers: { 'Content-Disposition': `attachment; filename="download.xlsx"; filename*=UTF-8''%E9%97%AE%E9%A2%98%E8%A1%8C-%E6%89%B9%E6%AC%A142.xlsx` },
+      }),
+    )
+    const name = await download('/imports/42/problems.xlsx', undefined, 'x.xlsx')
+    expect(name).toBe('问题行-批次42.xlsx')
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v1/imports/42/problems.xlsx')
+    expect(init.credentials).toBe('same-origin')
+    expect(clicked).toEqual([{ href: 'blob:demo', download: '问题行-批次42.xlsx' }])
+  })
+
+  it('没有文件名时用兜底名', async () => {
+    fetchMock.mockResolvedValue(new Response('x', { status: 200 }))
+    expect(await download('/exports/orders.xlsx', { view: 'today' }, '采购结果.xlsx')).toBe('采购结果.xlsx')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/exports/orders.xlsx?view=today')
+  })
+
+  it('422 / 404 抛出后端的 {code, message}，不存文件', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(422, { code: 'VALIDATION', message: '批次还没有提交，不能导出结果' }))
+    await expect(download('/exports/orders.xlsx', { batch_id: 3 })).rejects.toMatchObject({ code: 'VALIDATION', status: 422, message: '批次还没有提交，不能导出结果' })
+    expect(clicked).toEqual([])
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
+  it('401（会话过期）与普通请求一样触发跳转登录', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(401, { code: 'UNAUTHORIZED', message: '请先登录' }))
+    await expect(download('/imports/template.xlsx')).rejects.toMatchObject({ code: 'UNAUTHORIZED' })
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+    expect(clicked).toEqual([])
+  })
+
+  it('网络错误映射成 NETWORK', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await expect(download('/imports/template.xlsx')).rejects.toMatchObject({ code: 'NETWORK' })
   })
 })

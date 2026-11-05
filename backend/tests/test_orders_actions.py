@@ -181,7 +181,7 @@ def test_reassign_between_accounts_and_unassign(conn, workspace):
 def test_set_override_unset_vs_none_and_rederive(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     o = f.ingest_ready_order(conn, ws, asin="bad")
-    assert o["status"] == "needs_info" and o["missing_fields"] == ["ASIN"]
+    assert o["status"] == "needs_info" and o["missing_fields"] == ["asin"]
     d = orders.set_override(conn, ws, o["id"], asin="b0demo0007", note="换同款", actor_user_id=uid)
     assert d["status"] == "queued" and d["asin_eff"] == "B0DEMO0007" and d["has_override"]
     assert d["override"]["by_name"] == "测试所有者" and d["override"]["note"] == "换同款"
@@ -350,7 +350,6 @@ def test_amazon_cancel_then_repurchase_approve_and_decline(conn, workspace):
     assert d["status"] == "repurchase_pending" and d["allowed_actions"] == ["repurchase"]
     d = orders.decide_repurchase(conn, ws, o["id"], "approve", "同意重采", uid)
     assert d["status"] == "queued" and d["assigned_account"] is None
-    assert orders.next_attempt_kind(conn, orders.get_row(conn, ws, o["id"])) == "repurchase"
     o2 = f.ingest_ready_order(conn, ws)
     f.set_status(conn, o2["id"], "repurchase_pending")
     assert orders.decide_repurchase(conn, ws, o2["id"], "decline", None, uid)["status"] == "closed"
@@ -366,14 +365,15 @@ def test_repurchase_of_external_purchase_is_not_reverted_by_reimport(conn, works
     assert again.verdict == "unchanged" and orders.get_row(conn, ws, o.order_id)["status"] == "queued"
 
 
-def test_next_attempt_no_and_kind(conn, workspace):
+def test_next_attempt_no(conn, workspace):
+    """尝试种类（auto / retry / repurchase）由 execution 领取时判定；这里只负责序号。"""
     ws = workspace["id"]
     acc = f.make_account(conn, ws)
     o = f.ingest_ready_order(conn, ws)
-    assert orders.next_attempt_no(conn, o["id"]) == 1 and orders.next_attempt_kind(conn, o) == "auto"
+    assert orders.next_attempt_no(conn, o["id"]) == 1
     f.make_attempt(conn, ws, o["id"], acc["id"], status="failed")
     assert orders.next_attempt_no(conn, o["id"], workspace_id=ws) == 2
-    assert orders.next_attempt_kind(conn, o) == "retry"
+    assert not hasattr(orders, "next_attempt_kind")
 
 
 # ── 冲突处理 ──────────────────────────────────────────────────────────────────

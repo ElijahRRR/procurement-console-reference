@@ -41,6 +41,7 @@ export const ATTEMPT_CODE_LABEL: Record<string, string> = {
   PAGE_LOAD_FAILED: "页面加载失败",
   CAPTCHA_ENCOUNTERED: "遇到验证码或风控，转人工处理",
   ABORTED_UPSTREAM_CANCELLED: "上游已取消，未提交前中止",
+  ABORTED_BY_SERVER: "服务端要求中止（账号暂停、身份不符或来源有变化），未提交前中止",
   GUARD_BLOCKED: "护栏拦截（服务端未给出拦截码）",
   SUBMIT_REJECTED: "服务端拒绝了提交登记",
   PLUGIN_SIMULATION_ONLY: "插件当前只做模拟执行，拒绝执行非模拟尝试",
@@ -77,7 +78,23 @@ export const ACCOUNT_LEVEL_CODES: ReadonlySet<string> = new Set([
   "CARD_DECLINED",
   "CAPTCHA_ENCOUNTERED",
   "IDENTITY_MISMATCH",
+  "PLUGIN_SIMULATION_ONLY",
 ]);
+
+/** 输入：进度返回的 cancel_code（服务端没给为 null）→ 输出：插件要上报的中止码；null = 不用上报
+ *  （尝试已经结束了）。
+ *
+ *  · UPSTREAM_CANCELLED → ABORTED_UPSTREAM_CANCELLED（只有真的是上游取消才这么报）；
+ *  · ATTEMPT_FINISHED → 不上报（服务端已经结束了这一笔，再报只会 409）；
+ *  · 其他（账号暂停 / 归档、身份不符或过期、来源有变化）→ ABORTED_BY_SERVER（中止类，任务回到已分配）；
+ *  · 服务端没给 cancel_code（旧服务端）→ ABORTED_UPSTREAM_CANCELLED：那时它认得的中止码只有这一个，
+ *    报一个它不认识的码会被当成任务级失败、任务转异常。 */
+export function abortCodeFor(cancelCode: string | null | undefined): string | null {
+  if (cancelCode === null || cancelCode === undefined || cancelCode === "") return "ABORTED_UPSTREAM_CANCELLED";
+  if (cancelCode === "UPSTREAM_CANCELLED") return "ABORTED_UPSTREAM_CANCELLED";
+  if (cancelCode === "ATTEMPT_FINISHED") return null;
+  return "ABORTED_BY_SERVER";
+}
 
 /** 执行阶段（`progress.stage`）的中文名。 */
 export const STAGE_LABEL: Record<string, string> = {
@@ -91,12 +108,14 @@ export const STAGE_LABEL: Record<string, string> = {
   done: "本笔完成",
 };
 
-/** 批次心跳 `stop_reason` 的中文名。 */
+/** 批次心跳 `stop_reason` 的中文名（服务端 execution._stop_reason 的四个值，外加两个批次结束原因）。 */
 export const STOP_REASON_LABEL: Record<string, string> = {
   account_paused: "账号已被暂停执行",
+  account_archived: "账号已归档",
+  device_unbound: "设备已解除绑定或改绑到别的账号",
+  identity_mismatch: "浏览器登录的买家账号与绑定账号不一致，或身份已过期",
   lease_expired: "执行租约已过期",
   device_revoked: "设备授权已被撤销",
-  swept: "批次已被服务端清扫",
 };
 
 /** 输入：停止原因码 → 输出：中文说明。 */

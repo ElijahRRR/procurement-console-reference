@@ -9,6 +9,7 @@
 - ``planned(A, D)``：已分配给 A、状态为 assigned、没有在途尝试、计划日期等于 D 的任务数。
   计划日期 ``plan = max(建议采购日期, 今天)``：过期未采的任务算在今天，未来任务算在它自己的日期。
 - ``fixed(A, D)``：planned 中 ``assignment_kind='manual'`` 的部分（分配算法里不可重算、但占用容量）。
+- ``attempted(A, D)``：D 日 A 的采购尝试数，不论结局（只排除外部单号与「清除模拟结果」中止的）：分配的「已覆盖」。
 - ``summary(A, today)``：``{limit, used, planned, available}``，
   ``available = max(0, limit − used(A, today) − planned(A, today))``，即今天还能再分给 A 的单数。
 """
@@ -53,6 +54,24 @@ def used_map(conn, workspace_id: int, dates: Iterable[date], simulated: bool) ->
         GROUP BY account_id, bj_date
         """,
         (workspace_id, ds, simulated, list(_QUOTA_FREE)),
+    ).fetchall()
+    return {(r["account_id"], r["bj_date"]): int(r["n"]) for r in rows}
+
+
+def attempted_map(conn, workspace_id: int, dates: Iterable[date], simulated: bool) -> dict[tuple[int, date], int]:
+    """输入：工作区、一组北京日期、模拟标记 → 输出：{(账号 id, 日期): 当天的采购尝试数}，**不论结局**（失败、中止也算），
+    只排除外部单号尝试与「清除模拟结果」中止的尝试。分配的「当天已覆盖」用它（方案 v2 §1 默认值 1：当天已有采购尝试即覆盖）。"""
+    ds = sorted(set(dates))
+    if not ds:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT account_id, bj_date, count(*) AS n FROM procure.purchase_attempts
+        WHERE workspace_id = %s AND account_id IS NOT NULL AND bj_date = ANY(%s) AND simulated = %s
+          AND kind <> 'external' AND resolution IS DISTINCT FROM 'simulation_reset'
+        GROUP BY account_id, bj_date
+        """,
+        (workspace_id, ds, simulated),
     ).fetchall()
     return {(r["account_id"], r["bj_date"]): int(r["n"]) for r in rows}
 

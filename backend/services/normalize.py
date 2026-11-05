@@ -6,7 +6,14 @@
 - 转换失败不抛异常：值置 None 并把问题写进 record.issues（「ASIN 格式不对」「数量不是正整数」等）；
 - NULL 不是 0：空串、空白、空列表一律视为 None，绝不补 0；
 - 文本时刻（如 ``2026/10/27 21:31``）与不带时区的单元格时刻按北京时间解释；带时区的时刻原样保留；
-- 人审结论与上游取消由准入规则（admission，契约 §6）判定，取值比较为去首尾空白后的完全相等。
+- 人审结论与上游取消由准入规则（admission，契约 §6）判定，取值比较为去首尾空白后的完全相等；多选值逐项比较
+  （任一项是取消值即取消；任一项是拒绝值即拒绝；全部是通过值才算通过）；
+- 表格错误值（#N/A、#REF! 等）当作没读到并记问题；平台订单号是错误值、多个值或科学计数法文本 → 不可用（invalid）；
+- 金额只认「1234.5」「$1,234.50」这类写法（逗号只能是千分位），绝对值须小于 10^10（numeric(12,2)）；限价向下取整到分；
+- 配送天数 0–60、年份 2000–2100 之外视为不可靠（None + 问题），不会让日期计算溢出；
+- 美国邮编：数字单元格的 3–4 位数补前导 0（并记问题）；文本不足 5 位只记问题（由 orders 判为资料待补齐）；
+- AMZ 订单号：明显的占位写法（「—」「无」「N/A」等）当作没有并记问题；其他不符合「3-7-7 位数字」格式的文本原样保留，
+  由 orders 判为待核实（不当作可信单号）。
 
 本模块不碰数据库，也不计算建议采购日期（由 services/orders 按「下单北京日期 + 6 − 配送天数」补算）。
 """
@@ -19,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from services import clock
-from services.models import UpstreamRecord, money
+from services.models import UpstreamRecord, money, money_cap
 
 # ── 系统字段清单 ──────────────────────────────────────────────────────────────
 # kind：text 文本 / int 整数 / money 美元金额 / datetime 时刻 / date 日期 / enum 来源取值原文（供准入规则匹配）
@@ -74,10 +81,34 @@ DEFAULT_ADMISSION: dict[str, Any] = {
 _ADMISSION_LIST_KEYS = ("approved_values", "rejected_values", "purchaser_values",
                         "skip_purchase_status_values", "cancel_after_sale_values")
 
+#: 文件来源的准入缺省（在 DEFAULT_ADMISSION 之上）：带 AMZ 订单号的行按历史采购登记（v1 §6.2）；
+#: 售后状态为「已取消」的行算上游取消（文件是快照，取消要靠更新后的文件表达，v1 §6.2）。工作区可在设置里改。
+FILE_ADMISSION_DEFAULTS: dict[str, Any] = {"import_historical": True, "cancel_after_sale_values": ["已取消"]}
+#: 准入规则每个取值列表的上限（条数 / 每条字数）
+_ADMISSION_MAX_ITEMS, _ADMISSION_MAX_LEN = 50, 50
+
 #: 缺少唯一键时写进 issues 的固定文案（调用方据此把该行判为 invalid）
 ISSUE_NO_ORDER_NO = "缺少平台订单号"
 
 _ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
+#: amazon.com 订单号：3-7-7 位数字
+AMAZON_ORDER_NO_RE = re.compile(r"^\d{3}-\d{7}-\d{7}$")
+#: 明显表示「没有单号」的占位写法（比较前去空白、转小写）
+_AMZ_PLACEHOLDERS = frozenset({"-", "--", "---", "—", "——", "–", "－", "/", "无", "没有", "空", "暂无", "n/a", "na",
+                               "none", "null", "nil", "0", "#"})
+#: Excel / WPS 的错误值（公式出错时单元格的缓存值）
+EXCEL_ERRORS = frozenset({"#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!", "#GETTING_DATA",
+                          "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#BUSY!", "#UNKNOWN!", "#N/A!"})
+#: 科学计数法文本（如 CSV 里的 1.23457E+12）：精度已丢失，不能当订单号
+_SCI_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$")
+#: 文本金额：普通数字，或逗号只作千分位（1,234.50）；可带 $ 与负号
+_MONEY_TEXT_RE = re.compile(r"^-?\$?-?\s*(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$")
+#: numeric(12,2) 能存的最大整数位：绝对值须小于 10^10
+_MONEY_LIMIT = Decimal(10) ** 10
+#: 配送天数的合理范围（天）
+SHIP_DAYS_MAX = 60
+#: 时刻与日期的合理年份范围
+YEAR_MIN, YEAR_MAX = 2000, 2100
 _COUNTRY_US = {"US", "USA", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA", "美国"}
 _UTC = timezone.utc
 
@@ -112,6 +143,38 @@ def effective_admission(admission: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def check_admission(admission: Any) -> dict[str, Any]:
+    """输入：用户提交的准入规则（可缺键）→ 输出：校验后的同一份规则（只含给出的键，取值去首尾空白）。
+
+    未知键、取值不是文本列表（import_historical 不是布尔）、列表过长 → errors.validation（field='admission'）。
+    """
+    from services.errors import validation
+
+    if admission is None:
+        return {}
+    if not isinstance(admission, dict):
+        raise validation("准入规则格式不对", field="admission")
+    unknown = set(admission) - set(DEFAULT_ADMISSION)
+    if unknown:
+        raise validation(f"准入规则里有未知的项：{'、'.join(sorted(unknown))}", field="admission")
+    out: dict[str, Any] = {}
+    for k, v in admission.items():
+        if k == "import_historical":
+            if v is not None and not isinstance(v, bool):
+                raise validation("「导入历史采购」只能是是或否", field="admission")
+            out[k] = v
+        elif v is None:
+            out[k] = None
+        elif not (isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v)):
+            raise validation(f"准入规则「{k}」必须是文本列表", field="admission")
+        elif len(v) > _ADMISSION_MAX_ITEMS or any(len(x.strip()) > _ADMISSION_MAX_LEN for x in v):
+            raise validation(f"准入规则「{k}」最多 {_ADMISSION_MAX_ITEMS} 项、每项不超过 {_ADMISSION_MAX_LEN} 字",
+                             field="admission")
+        else:
+            out[k] = [x.strip() for x in v if x.strip()]
+    return out
+
+
 def admission_skip_reason(record: UpstreamRecord, admission: dict[str, Any] | None) -> str | None:
     """输入：规范化后的记录、准入规则 → 输出：不得据此**新建**采购任务的中文原因；可以新建时为 None。
 
@@ -137,14 +200,56 @@ def admission_skip_reason(record: UpstreamRecord, admission: dict[str, Any] | No
         return f"采购方「{who}」不在本系统负责的采购方内，不新建采购"
     if record.upstream_cancelled:
         return f"售后状态为「{record.after_sale_value}」，上游已取消，不新建采购"
-    if record.external_amz_order_no:
+    if record.external_amz_order_no and amazon_order_no_ok(record.external_amz_order_no):
         if adm["import_historical"]:
             return None
         return "已有 AMZ 订单号（历史采购），未开启导入历史采购，不新建采购"
-    status = (record.purchase_status_value or "").strip()
-    if status and status in adm["skip_purchase_status_values"]:
+    status = _skip_status(record, adm)
+    if status:
         return f"采购状态为「{status}」但没有 AMZ 订单号，不新建采购"
+    # 不可信的 AMZ 订单号（格式不对）不当历史采购：交给 ingest 建成「待核实」
     return None
+
+
+def admission_hold(record: UpstreamRecord, admission: dict[str, Any] | None) -> dict[str, Any] | None:
+    """输入：规范化后的记录、准入规则 → 输出：**已有任务**因准入规则应暂停（转待核实、解除分配）的说明
+    {kind: 'purchaser' | 'purchase_status', field, value, reason}；没有 → None。
+
+    与 admission_skip_reason 对应，但只看「这一行现在说的已不归本系统采购」：
+
+    1. 采购方：purchaser_values 非空且 purchaser 不在其中（清空也算不在）；
+    2. 采购状态命中 skip_purchase_status_values（如「已拍单」「拿回」）且没有可信 AMZ 订单号（有单号走外部单号规则）。
+
+    上游取消、人审、外部单号由 orders.ingest 各自的规则处理，不在这里判断。是否适用（只限采购开始前、
+    本系统写回的「已拍单」不算）由 orders.ingest 决定。
+    """
+    adm = effective_admission(admission)
+    purchasers = adm["purchaser_values"]
+    if purchasers and (record.purchaser or "").strip() not in purchasers:
+        who = record.purchaser or "（空）"
+        return {"kind": "purchaser", "field": "purchaser", "value": record.purchaser,
+                "reason": f"采购方变为「{who}」，不在本系统负责的采购方内"}
+    if record.external_amz_order_no and amazon_order_no_ok(record.external_amz_order_no):
+        return None
+    status = _skip_status(record, adm)
+    if status:
+        return {"kind": "purchase_status", "field": "purchase_status_value", "value": status,
+                "reason": f"采购状态变为「{status}」（没有 AMZ 订单号），可能已在别处采购"}
+    return None
+
+
+def amazon_order_no_ok(no: str | None) -> bool:
+    """输入：AMZ 订单号文本 → 输出：是否为可信的 amazon.com 订单号（3-7-7 位数字）。"""
+    return bool(no) and bool(AMAZON_ORDER_NO_RE.match(str(no).strip()))
+
+
+def _skip_status(record: UpstreamRecord, adm: dict[str, Any]) -> str | None:
+    """采购状态（多选时逐项）命中 skip_purchase_status_values → 命中的原文；否则 None。"""
+    status = (record.purchase_status_value or "").strip()
+    if not status:
+        return None
+    parts = [status, *(x.strip() for x in status.split(", "))]
+    return status if any(x and x in adm["skip_purchase_status_values"] for x in parts) else None
 
 
 # ── 规范化 ───────────────────────────────────────────────────────────────────
@@ -159,15 +264,22 @@ def normalize(values: dict[str, Any], admission: dict[str, Any] | None = None) -
     adm = effective_admission(admission)
     issues: list[str] = []
     out: dict[str, Any] = {}
+    enums: dict[str, list[str]] = {}
+    key_problem: str | None = None
     for f in SYSTEM_FIELDS:
         key, label, kind = f["key"], f["label"], f["kind"]
         raw = values.get(key)
-        if kind in ("text", "enum"):
-            out[key] = _to_text(raw)
+        if key == "upstream_order_no":
+            out[key], key_problem = _order_no(raw)
+        elif kind in ("text", "enum"):
+            out[key] = _text_field(raw, label, issues)
+            if kind == "enum":
+                enums[key] = _enum_values(raw)
         elif kind == "int":
-            out[key] = _to_int(raw, label, issues, allow_zero=(key != "quantity"))
+            out[key] = _to_int(raw, label, issues, allow_zero=(key != "quantity"),
+                               max_value=SHIP_DAYS_MAX if key == "ship_days" else None)
         elif kind == "money":
-            out[key] = _to_money(raw, label, issues)
+            out[key] = _to_money(raw, label, issues, cap=(key == "price_cap"))
         elif kind == "datetime":
             out[key] = _to_datetime(raw, label, issues)
         elif kind == "date":
@@ -177,33 +289,28 @@ def normalize(values: dict[str, Any], admission: dict[str, Any] | None = None) -
 
     order_no = out.pop("upstream_order_no")
     if not order_no:
-        issues.insert(0, ISSUE_NO_ORDER_NO)
+        issues.insert(0, key_problem or ISSUE_NO_ORDER_NO)
         order_no = ""
 
     out["asin"] = _check_asin(out["asin"], issues)
-    out["postal_code"] = _check_postal(out["postal_code"], issues)
     out["country"] = _normalize_country(out["country"])
+    out["postal_code"] = _check_postal(out["postal_code"], issues, raw=values.get("postal_code"),
+                                       us=out["country"] == "US")
     if out["state"] and len(out["state"]) == 2:
         out["state"] = out["state"].upper()
+    out["external_amz_order_no"] = _check_amazon_no(out["external_amz_order_no"], issues)
 
-    review_value = out["review_value"]
-    if review_value is not None and review_value in adm["approved_values"]:
-        review = "approved"
-    elif review_value is not None and review_value in adm["rejected_values"]:
+    review_vals = enums.get("review_value") or []
+    if any(v in adm["rejected_values"] for v in review_vals):
         review = "rejected"
+    elif review_vals and all(v in adm["approved_values"] for v in review_vals):
+        review = "approved"
     else:
         review = "unknown"
-    after_sale = out["after_sale_value"]
-    cancelled = after_sale is not None and after_sale in adm["cancel_after_sale_values"]
+    cancelled = any(v in adm["cancel_after_sale_values"] for v in enums.get("after_sale_value") or [])
 
     return UpstreamRecord(upstream_order_no=order_no, review=review, upstream_cancelled=cancelled,
                           issues=issues, **out)
-
-
-def field_label(key: str) -> str:
-    """输入：系统字段键 → 输出：中文名（未知键原样返回）。"""
-    f = _FIELD_BY_KEY.get(key)
-    return f["label"] if f else key
 
 
 def parse_datetime_text(text: str) -> datetime | None:
@@ -265,7 +372,7 @@ def _to_text(v: Any) -> str | None:
     return _clean_str(v)
 
 
-def _to_int(v: Any, label: str, issues: list[str], *, allow_zero: bool) -> int | None:
+def _to_int(v: Any, label: str, issues: list[str], *, allow_zero: bool, max_value: int | None = None) -> int | None:
     v = _single(v)
     if _is_blank(v):
         return None
@@ -291,10 +398,25 @@ def _to_int(v: Any, label: str, issues: list[str], *, allow_zero: bool) -> int |
     if n is None or n < 0 or (n == 0 and not allow_zero):
         issues.append(f"{label}不是{what}：{_show(v)}")
         return None
+    if max_value is not None and n > max_value:
+        issues.append(f"{label}超出合理范围（0–{max_value}）：{_show(v)}")
+        return None
     return n
 
 
-def _to_money(v: Any, label: str, issues: list[str]) -> Decimal | None:
+def _money_value(x: Any, cap: bool) -> Decimal | None:
+    """数字或已校验格式的文本 → 两位小数（限价向下取整）；超出 numeric(12,2) 或无法换算 → None。"""
+    try:
+        d = (money_cap if cap else money)(x)
+    except (InvalidOperation, ValueError, ArithmeticError):
+        return None
+    if d is None or abs(d) >= _MONEY_LIMIT:
+        return None
+    return d
+
+
+def _to_money(v: Any, label: str, issues: list[str], *, cap: bool = False) -> Decimal | None:
+    """金额：数字原样换算；文本只认普通写法或千分位逗号（「12,5」「1.234,50」「1e3」都不认）。cap=True（限价）向下取整到分。"""
     v = _single(v)
     if _is_blank(v):
         return None
@@ -302,10 +424,10 @@ def _to_money(v: Any, label: str, issues: list[str]) -> Decimal | None:
     if isinstance(v, bool) or v is _MULTI:
         d = None
     elif isinstance(v, (int, float, Decimal)):
-        d = money(Decimal(str(v)) if isinstance(v, float) else v)
+        d = _money_value(Decimal(str(v)) if isinstance(v, float) else v, cap)
     else:
-        s = re.sub(r"(?i)usd", "", str(v)).replace("，", ",")
-        d = money(s)
+        s = re.sub(r"(?i)usd", "", str(v)).replace("，", ",").strip()
+        d = _money_value(s, cap) if _MONEY_TEXT_RE.match(s) else None
     if d is None:
         issues.append(f"{label}不是有效金额：{_show(v)}")
         return None
@@ -390,6 +512,9 @@ def _to_datetime(v: Any, label: str, issues: list[str]) -> datetime | None:
     if m is None:
         issues.append(f"{label}无法识别：{_show(v)}")
         return None
+    if not YEAR_MIN <= m.year <= YEAR_MAX:
+        issues.append(f"{label}年份不合理：{_show(v)}")
+        return None
     if not isinstance(m, datetime):
         m = datetime(m.year, m.month, m.day)
     return _bj_aware(m)
@@ -403,6 +528,9 @@ def _to_date(v: Any, label: str, issues: list[str]) -> date | None:
     m = _coerce_moment(v)
     if m is None:
         issues.append(f"{label}无法识别：{_show(v)}")
+        return None
+    if not YEAR_MIN <= m.year <= YEAR_MAX:
+        issues.append(f"{label}年份不合理：{_show(v)}")
         return None
     if isinstance(m, datetime):
         return clock.bj_date(m) if m.tzinfo is not None else m.date()
@@ -419,14 +547,71 @@ def _check_asin(asin: str | None, issues: list[str]) -> str | None:
     return up
 
 
-def _check_postal(text: str | None, issues: list[str]) -> str | None:
-    """邮编按文本保留（不补前导 0，以免猜错）；主体不足 5 位数字时记问题。"""
+def _check_postal(text: str | None, issues: list[str], *, raw: Any = None, us: bool = True) -> str | None:
+    """邮编按文本保留；美国地址、来源单元格是数字（Excel 数字格式 / 飞书数字列丢了前导 0）且只有 3–4 位时
+    补前导 0 到 5 位并记问题；其余主体不足 5 位数字时只记问题（orders 据此判为资料待补齐）。"""
     if text is None:
         return None
+    one = _single(raw)
+    numeric = isinstance(one, (int, float, Decimal)) and not isinstance(one, bool)
+    if us and numeric and text.isdigit() and 3 <= len(text) <= 4:
+        padded = text.zfill(5)
+        issues.append(f"邮编 {text} 是数字格式，已补前导 0 为 {padded}")
+        return padded
     digits = re.sub(r"\D", "", text.split("-")[0])
     if len(digits) < 5:
         issues.append(f"邮编不足 5 位：{_show(text)}")
     return text
+
+
+def _check_amazon_no(text: str | None, issues: list[str]) -> str | None:
+    """AMZ 订单号：占位写法（「—」「无」「N/A」…）→ None 并记问题；格式不对的原样保留并记问题（orders 判待核实）。"""
+    if text is None:
+        return None
+    s = text.strip()
+    if s.lower() in _AMZ_PLACEHOLDERS:
+        issues.append(f"AMZ订单号「{_show(s)}」不是订单号，按没有单号处理")
+        return None
+    if not AMAZON_ORDER_NO_RE.match(s):
+        issues.append(f"AMZ订单号「{_show(s)}」格式不对（应为 3-7-7 位数字），需人工核实")
+    return s
+
+
+def _order_no(raw: Any) -> tuple[str | None, str | None]:
+    """平台订单号 → (文本, None)；不可用时 (None, 原因)：多个值、表格错误值、科学计数法文本（精度已丢失）。"""
+    if isinstance(raw, (list, tuple)):
+        vals = list(dict.fromkeys(t for t in (_to_text(x) for x in raw) if t))
+        if len(vals) > 1:
+            return None, f"平台订单号有多个值（{_show('、'.join(vals))}），无法确定是哪一笔"
+        raw = vals[0] if vals else None
+    text = _to_text(raw)
+    if text is None:
+        return None, None
+    if text.upper() in EXCEL_ERRORS:
+        return None, f"平台订单号是表格错误值 {text}"
+    if isinstance(raw, str) and _SCI_RE.match(text):
+        return None, f"平台订单号「{text}」是科学计数法，位数已丢失，请把该列设为文本后重新导出"
+    return text, None
+
+
+def _text_field(raw: Any, label: str, issues: list[str]) -> str | None:
+    """文本 / 取值字段：同 _to_text；表格错误值（#N/A 等）→ None 并记问题。"""
+    text = _to_text(raw)
+    if text is not None and text.upper() in EXCEL_ERRORS:
+        issues.append(f"{label}是表格错误值 {text}，按没读到处理")
+        return None
+    return text
+
+
+def _enum_values(raw: Any) -> list[str]:
+    """取值字段（单选 / 多选）→ 去空白后的取值列表（多选逐项；表格错误值不算）。"""
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    out = []
+    for x in items:
+        t = _to_text(x)
+        if t is not None and t.upper() not in EXCEL_ERRORS:
+            out.append(t)
+    return out
 
 
 def _normalize_country(c: str | None) -> str:

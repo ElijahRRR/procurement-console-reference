@@ -53,7 +53,8 @@ def _settings_with(monkeypatch, app_id, secret):
 # ── 应用凭证 ──────────────────────────────────────────────────────────────────
 
 
-def test_not_configured_raises_feishu_not_configured(monkeypatch):
+def test_not_configured_raises_feishu_not_configured(monkeypatch, conn, workspace):
+    ws = workspace["id"]
     _settings_with(monkeypatch, None, None)
     assert fc.status() == {"configured": False}
     with pytest.raises(DomainError) as e:
@@ -61,7 +62,7 @@ def test_not_configured_raises_feishu_not_configured(monkeypatch):
     assert e.value.code == "FEISHU_NOT_CONFIGURED" and e.value.http_status == 409
     assert "FEISHU_APP_ID" in e.value.message
     with pytest.raises(DomainError) as e2:          # 不传 client 的函数走同一个钩子
-        fc.resolve_link(DEMO_LINK)
+        fc.resolve_link(conn, ws, DEMO_LINK)
     assert e2.value.code == "FEISHU_NOT_CONFIGURED"
 
 
@@ -85,31 +86,34 @@ def test_feishu_error_translation_keeps_code_and_hint():
 # ── 链接与字段 ────────────────────────────────────────────────────────────────
 
 
-def test_resolve_base_and_wiki_links(fake):
-    out = fc.resolve_link(DEMO_LINK)
+def test_resolve_base_and_wiki_links(fake, conn, workspace):
+    ws = workspace["id"]
+    out = fc.resolve_link(conn, ws, DEMO_LINK)
     assert out["app_token"] == DEMO_APP and out["table_id"] == DEMO_TABLE and out["view_id"] == "vewDEMOVIEW01"
     assert out["tables"] == [{"table_id": DEMO_TABLE, "name": "采购订单DEMO"}]
-    wiki = fc.resolve_link(DEMO_WIKI_LINK)
+    wiki = fc.resolve_link(conn, ws, DEMO_WIKI_LINK)
     assert wiki["app_token"] == DEMO_APP and wiki["table_id"] == DEMO_TABLE
     assert fake.calls_of("wiki_get_node") == [{"token": "wikcnDEMOWIKI0001"}]
 
 
-def test_resolve_link_rejects_unknown_table_and_non_bitable_wiki(fake):
+def test_resolve_link_rejects_unknown_table_and_non_bitable_wiki(fake, conn, workspace):
+    ws = workspace["id"]
     with pytest.raises(DomainError) as e:
-        fc.resolve_link(f"https://example-demo.feishu.cn/base/{DEMO_APP}?table=tblDEMONOPE99")
+        fc.resolve_link(conn, ws, f"https://example-demo.feishu.cn/base/{DEMO_APP}?table=tblDEMONOPE99")
     assert e.value.code == "VALIDATION"
     fake.wiki["wikcnDEMODOC0002"] = {"obj_token": "doxcnDEMO00001", "obj_type": "docx", "title": "DEMO 文档"}
     with pytest.raises(DomainError) as e2:
-        fc.resolve_link("https://example-demo.feishu.cn/wiki/wikcnDEMODOC0002")
+        fc.resolve_link(conn, ws, "https://example-demo.feishu.cn/wiki/wikcnDEMODOC0002")
     assert "不是多维表格" in e2.value.message
     fake.fail_next("list_tables")
     with pytest.raises(DomainError) as e3:
-        fc.resolve_link(DEMO_LINK)
+        fc.resolve_link(conn, ws, DEMO_LINK)
     assert e3.value.code == "FEISHU_ERROR" and "添加文档应用" in e3.value.message
 
 
-def test_fields_marks_formula_unwritable_and_suggests_maps(fake):
-    out = fc.fields(DEMO_APP, DEMO_TABLE)
+def test_fields_marks_formula_unwritable_and_suggests_maps(fake, conn, workspace):
+    ws = workspace["id"]
+    out = fc.fields(conn, ws, DEMO_APP, DEMO_TABLE)
     by_name = {x["field_name"]: x for x in out["fields"]}
     assert by_name["总成本USD"]["writable"] is False and by_name["总成本USD"]["type_zh"] == "公式"
     assert by_name["税前总额USD"]["writable"] is True
@@ -357,6 +361,73 @@ def test_connections_are_invisible_across_workspaces(conn, workspace, fake):
         with pytest.raises(DomainError) as e:
             call()
         assert e.value.code == "NOT_FOUND" and e.value.http_status == 404
-    # 乙工作区可以独立连接同一张表（各自的字段对应与结果互不影响）
-    other = create_demo_connection(conn, ws_b, fake, name="DEMO 乙")
-    assert other["id"] != c["id"] and fc.get(conn, ws_a, c["id"])["name"] == "DEMO 订单中心"
+    # v1 §6.1 第 3 步 / §10「甲尝试绑定乙的表」：链接只用来定位，乙粘贴甲的链接既不能读也不能绑定
+    data_b = demo_connection_data(fake, name="DEMO 乙")
+    reads_before = {m: len(fake.calls_of(m)) for m in ("list_tables", "list_fields", "search_records")}
+    for call in (
+        lambda: fc.resolve_link(conn, ws_b, DEMO_LINK, client=fake),
+        lambda: fc.resolve_link(conn, ws_b, DEMO_WIKI_LINK, client=fake),
+        lambda: fc.fields(conn, ws_b, DEMO_APP, DEMO_TABLE, client=fake),
+        lambda: fc.preview(conn, ws_b, app_token=DEMO_APP, table_id=DEMO_TABLE, field_map=c["field_map"], client=fake),
+        lambda: fc.create(conn, ws_b, data_b, None, client=fake),
+    ):
+        with pytest.raises(DomainError) as e:
+            call()
+        assert e.value.code == "FORBIDDEN" and e.value.http_status == 403
+        assert "connection_id" not in e.value.detail and "workspace" not in str(e.value.detail)
+    assert {m: len(fake.calls_of(m)) for m in reads_before} == reads_before     # 没有替乙读甲的表
+    assert f.count(conn, "feishu_connections", "workspace_id = %s", (ws_b,)) == 0
+
+
+def test_tables_not_granted_to_a_second_workspace_are_refused_until_cli_grant(conn, workspace, fake):
+    """部署所有者的工作区（第一个）绑定时自动登记授权；别的工作区必须由部署所有者用 CLI 授权，未授权的表格同样拒绝。"""
+    ws_a = workspace["id"]
+    ws_b = f.make_workspace(conn)["id"]
+    with pytest.raises(DomainError) as e:            # 尚无人授权的表格：第二个工作区也不能自己认领
+        create_demo_connection(conn, ws_b, fake, name="DEMO 乙")
+    assert e.value.code == "FORBIDDEN"
+    a = create_demo_connection(conn, ws_a, fake)
+    g = conn.execute("SELECT * FROM procure.feishu_base_grants WHERE app_token = %s", (DEMO_APP,)).fetchone()
+    assert g["workspace_id"] == ws_a and g["granted_by"] == "owner_workspace"
+    with pytest.raises(DomainError) as e:            # 已归甲：不转授就拒绝
+        fc.grant_base(conn, ws_b, DEMO_APP)
+    assert e.value.code == "VALIDATION"
+    moved = fc.grant_base(conn, ws_b, DEMO_APP, transfer=True)
+    assert moved["disabled_connections"] == [a["id"]]            # 甲在这个表格上的连接随即停用
+    b = create_demo_connection(conn, ws_b, fake, name="DEMO 乙")
+    assert b["id"] != a["id"]
+    with pytest.raises(DomainError) as e:            # 转走之后甲不能再启用、不能读、不能验收
+        fc.update(conn, ws_a, a["id"], {"enabled": True}, None, client=fake)
+    assert e.value.code == "FORBIDDEN"
+    conn.execute("UPDATE procure.feishu_connections SET enabled = true WHERE id = %s", (a["id"],))
+    with pytest.raises(DomainError) as e:
+        feishu_intake.run_connection(conn, ws_a, a["id"], trigger="manual", client=fake)
+    assert e.value.code == "FORBIDDEN" and e.value.detail["run_id"]
+    assert fc.get(conn, ws_a, a["id"])["last_error"].startswith("这个多维表格还没有授权")
+    with pytest.raises(DomainError) as e:
+        fc.verify_writeback(conn, ws_a, a["id"], "recDEMOTEST1", None, client=fake)
+    assert e.value.code == "FORBIDDEN"
+    fc.update(conn, ws_a, a["id"], {"name": "DEMO 甲（已停用）"}, None)     # 改名、停用仍可以
+    fc.disable(conn, ws_a, a["id"], None)
+    out = fc.revoke_base(conn, DEMO_APP)
+    assert out["workspace_id"] == ws_b and out["disabled_connections"] == [b["id"]]
+    # 重新执行 db_init 的回填不会把撤销掉的授权加回来（只看启用的连接）
+    from registry import paths
+
+    conn.execute(paths.SCHEMA_SQL.read_text(encoding="utf-8"))
+    assert f.count(conn, "feishu_base_grants") == 0
+    with pytest.raises(DomainError):
+        fc.fields(conn, ws_b, DEMO_APP, DEMO_TABLE, client=fake)
+
+
+def test_verify_writeback_refuses_records_linked_to_tasks(conn, workspace, fake):
+    """验收只能在专用测试记录上做：记录已关联采购任务 → VALIDATION，测试值不会写进真实订单行（D4-03）。"""
+    ws = workspace["id"]
+    fake.add_record(DEMO_APP, DEMO_TABLE, "recDEMO0001", order_fields("PO-DEMO-V01"))
+    c = create_demo_connection(conn, ws, fake)
+    feishu_intake.run_connection(conn, ws, c["id"], trigger="manual", client=fake)
+    before = len(fake.updates)
+    with pytest.raises(DomainError) as e:
+        fc.verify_writeback(conn, ws, c["id"], "recDEMO0001", None, client=fake)
+    assert e.value.code == "VALIDATION" and "PO-DEMO-V01" in e.value.message
+    assert len(fake.updates) == before

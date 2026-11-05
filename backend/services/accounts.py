@@ -14,11 +14,12 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
+import psycopg
+
 from services import clock, events, quota, settings_svc
 from services.errors import conflict, not_found, validation
 from services.models import ATTEMPT_INFLIGHT, money
 
-ONLINE_WINDOW = timedelta(minutes=3)
 CUSTOMER_ID_RE = re.compile(r"^A[0-9A-Z]{8,}$")
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _CARD_RE = re.compile(r"^[0-9]{4}$")
@@ -168,6 +169,20 @@ def _validate(conn, ws: int, data: dict[str, Any], current: dict[str, Any] | Non
     return out
 
 
+def _unique_write(conn, sql: str, params: list[Any] | tuple[Any, ...]):
+    """在保存点里执行一条会碰唯一约束的写入：并发下应用层检查没拦住的重复（名称、买家号 ID）→ VALIDATION。"""
+    try:
+        with conn.transaction():
+            return conn.execute(sql, params)
+    except psycopg.errors.UniqueViolation as exc:
+        cname = getattr(exc.diag, "constraint_name", None) or ""
+        if "customer_id" in cname:
+            raise validation("这个买家号 ID 已登记在另一个账号上", field="amazon_customer_id") from None
+        if "name" in cname:
+            raise validation("账号名称已存在", field="name") from None
+        raise conflict("账号与已有账号冲突，请刷新后重试") from None
+
+
 def _check_customer_id_unique(conn, ws: int, customer_id: str, account_id: int | None) -> None:
     other = conn.execute(
         "SELECT name FROM procure.buyer_accounts WHERE workspace_id = %s AND amazon_customer_id = %s "
@@ -212,9 +227,12 @@ def _iso(v: Any) -> str | None:
 
 
 def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days: int) -> dict[str, Any]:
+    from services import devices        # 延迟导入：devices 也导入本模块
+
     now = clock.now()
+    online_window = timedelta(seconds=devices.ONLINE_WINDOW_S)
     devs = conn.execute(
-        "SELECT id, name, last_seen_at, identity_status FROM procure.devices "
+        "SELECT id, name, last_seen_at, identity, identity_status FROM procure.devices "
         "WHERE workspace_id = %s AND bound_account_id = %s AND revoked_at IS NULL ORDER BY name, id",
         (ws, row["id"]),
     ).fetchall()
@@ -240,8 +258,10 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
         "expected_card_last4": row["expected_card_last4"], "notes": row["notes"],
         "quota_today": quota.summary(conn, row, clock.bj_today(), simulated),
         "devices": [{"id": d["id"], "name": d["name"],
-                     "online": d["last_seen_at"] is not None and now - d["last_seen_at"] <= ONLINE_WINDOW,
-                     "identity_status": d["identity_status"], "last_seen_at": _iso(d["last_seen_at"])} for d in devs],
+                     "online": d["last_seen_at"] is not None and now - d["last_seen_at"] <= online_window,
+                     # 与设备列表、执行检查同一个判定（按账号当前的买家号 ID 重算），不用存下的旧状态
+                     "identity_status": devices.effective_identity_status(d, row),
+                     "last_seen_at": _iso(d["last_seen_at"])} for d in devs],
         "active_run": ({"id": run["id"], "device_id": run["device_id"], "device_name": run["device_name"],
                         "started_at": _iso(run["started_at"])} if run else None),
         "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"]),
@@ -288,7 +308,8 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
     now = clock.now()
     vals.update(workspace_id=workspace_id, created_at=now, updated_at=now)
     names = list(vals)
-    row = conn.execute(
+    row = _unique_write(
+        conn,
         f"INSERT INTO procure.buyer_accounts ({', '.join(names)}) VALUES ({', '.join(['%s'] * len(names))}) "
         "RETURNING *",
         list(vals.values()),
@@ -312,7 +333,8 @@ def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], acto
     if not changes:
         return get(conn, workspace_id, account_id)
     sets = ", ".join(f"{k} = %s" for k in changes)
-    conn.execute(
+    _unique_write(
+        conn,
         f"UPDATE procure.buyer_accounts SET {sets}, updated_at = %s WHERE id = %s AND workspace_id = %s",
         [*(v[1] for v in changes.values()), clock.now(), account_id, workspace_id],
     )
@@ -441,8 +463,8 @@ def adopt_customer_id(conn, workspace_id: int, account_id: int, device_id: int,
         raise validation("插件没有识别到格式正确的买家号 ID")
     _check_customer_id_unique(conn, workspace_id, cid, account_id)
     now = clock.now()
-    conn.execute("UPDATE procure.buyer_accounts SET amazon_customer_id = %s, updated_at = %s "
-                 "WHERE id = %s AND workspace_id = %s", (cid, now, account_id, workspace_id))
+    _unique_write(conn, "UPDATE procure.buyer_accounts SET amazon_customer_id = %s, updated_at = %s "
+                  "WHERE id = %s AND workspace_id = %s", (cid, now, account_id, workspace_id))
     conn.execute("UPDATE procure.devices SET identity_status = 'match' WHERE id = %s AND workspace_id = %s "
                  "AND identity_status <> 'signed_out'", (did, workspace_id))
     ak, aid = _actor(actor_user_id)

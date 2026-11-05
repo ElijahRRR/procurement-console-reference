@@ -2,15 +2,20 @@
 
 reset 依次做：
 
+0. 取本工作区的执行闸门（execution.execution_gate 独占锁）：等进行中的开始批次 / 领取提交，清除期间不会冒出
+   新的批次或尝试。
 1. 结束本工作区未结束的模拟批次（end_reason='simulation_reset'；在途尝试不按超时处理，下一步统一清除）。
-2. 全部模拟尝试（尚未清除过的）→ aborted，resolution='simulation_reset'，说明「已清除模拟结果」。
+2. 这些任务的模拟尝试（尚未清除过的）→ aborted，resolution='simulation_reset'，说明「已清除模拟结果」。
    它们不再占额度（额度只数非 failed / aborted 的尝试）。
 3. 受影响的任务经 orders.revert_simulation 按派生规则回到开始前的状态（分配仍有效就保留），
-   页面错误自动重试计数清零。任务有真实尝试时跳过并列出原因。
-4. **只因**模拟尝试「结果待核实」而暂停的账号恢复执行（accounts.resume，会按今天重新分配）。
-   判断依据：账号最近一次恢复之后的每一次 'account.paused'，都有一条执行模块写的
-   PAUSE_MARKER_KIND 标记，且标记都是 {simulated: true, cause: 'result_unknown'}。人工暂停、真实结果、
-   账号级错误（登录失效、验证码等）造成的暂停都不会被自动恢复。
+   页面错误自动重试计数清零。回退前先把模拟采购期间被挡住的来源变化落到任务上（execution.drift_updates：
+   人审撤回 → 待确认；外部 AMZ 订单号、执行相关字段被改 → 待核实，incoming 为来源新值），任务不会带着
+   来源已改掉的旧值回到可领取。模拟尝试结束时写下的状态原因（如「遇到验证码…任务保留」）按派生规则重写
+   （待分配的原因由分配给出，不动）。任务有真实尝试时跳过并列出原因。
+4. **只因**模拟结果而暂停的账号恢复执行（accounts.resume，会按今天重新分配）。判断依据：账号最近一次恢复
+   之后的每一次 'account.paused'，都有一条执行模块写的 PAUSE_MARKER_KIND 标记，且标记都是
+   {simulated: true}（起因为模拟的「结果待核实」或模拟出来的账号级错误，如模拟遇到验证码）。人工暂停、
+   真实尝试造成的暂停都不会被自动恢复。
 5. 写 'simulation.reset' 事件（对象为工作区设置）。
 """
 
@@ -20,6 +25,10 @@ from typing import Any
 
 from services import accounts, clock, events, execution, orders
 from services.errors import DomainError
+from services.models import PRE_EXECUTION_STATUSES
+
+#: 可由「清除模拟结果」恢复的暂停起因（execution 写的 PAUSE_MARKER_KIND 标记，且须 simulated=true）
+RESUMABLE_CAUSES = ("result_unknown", "account_error")
 
 
 def _actor(actor_user_id: int | None) -> tuple[str, int | None]:
@@ -27,7 +36,7 @@ def _actor(actor_user_id: int | None) -> tuple[str, int | None]:
 
 
 def paused_only_by_simulation(conn, workspace_id: int, account_id: int) -> bool:
-    """输入：工作区、账号 → 输出：该账号当前的暂停是否只由模拟尝试的「结果待核实」造成。"""
+    """输入：工作区、账号 → 输出：该账号当前的暂停是否只由模拟尝试的结果（待核实或账号级错误）造成。"""
     last_resume = conn.execute(
         "SELECT COALESCE(max(id), 0) AS id FROM procure.events WHERE workspace_id = %s AND entity = 'account' "
         "AND entity_id = %s AND kind = 'account.resumed'",
@@ -41,7 +50,26 @@ def paused_only_by_simulation(conn, workspace_id: int, account_id: int) -> bool:
     pauses = sum(1 for r in rows if r["kind"] == "account.paused")
     markers = [r["detail"] or {} for r in rows if r["kind"] == execution.PAUSE_MARKER_KIND]
     return (pauses > 0 and len(markers) == pauses
-            and all(m.get("simulated") is True and m.get("cause") == "result_unknown" for m in markers))
+            and all(m.get("simulated") is True and m.get("cause") in RESUMABLE_CAUSES for m in markers))
+
+
+def _apply_drift(conn, workspace_id: int, order_id: int, *, actor_kind: str, actor_id: int | None) -> None:
+    """输入：工作区、要回退的任务 → 输出：无。任务还处在采购开始后的状态（采购中、已采购、结果待核实…）时，
+    按它最近一次模拟尝试的来源基线，把期间被挡住的来源变化写到任务上（状态由随后的 revert_simulation 派生）。
+    开始前、已取消、异常的任务不处理（异常在转入时已处理过）。"""
+    order = orders.get_row(conn, workspace_id, order_id, for_update=True)
+    if order["status"] in PRE_EXECUTION_STATUSES or order["status"] in ("cancelled", "exception"):
+        return
+    att = conn.execute(
+        "SELECT * FROM procure.purchase_attempts WHERE purchase_order_id = %s AND workspace_id = %s AND simulated "
+        "ORDER BY attempt_no DESC LIMIT 1",
+        (order_id, workspace_id),
+    ).fetchone()
+    if att is None:
+        return
+    upd = execution.drift_updates(conn, order, att, actor_kind=actor_kind, actor_id=actor_id)
+    if upd:
+        orders.transition(conn, order, order["status"], actor_kind=actor_kind, actor_id=actor_id, updates=upd)
 
 
 def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
@@ -51,6 +79,7 @@ def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
     """
     ws = workspace_id
     ak, aid = _actor(actor_user_id)
+    execution.execution_gate(conn, ws, exclusive=True)
     now = clock.now()
 
     runs = conn.execute(
@@ -74,9 +103,10 @@ def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
         SET status = 'aborted', resolution = 'simulation_reset', resolution_note = '已清除模拟结果',
             resolved_by = %s, resolved_at = %s, finished_at = COALESCE(finished_at, %s)
         WHERE workspace_id = %s AND simulated AND resolution IS DISTINCT FROM 'simulation_reset'
+          AND purchase_order_id = ANY(%s::bigint[])
         RETURNING id, purchase_order_id
         """,
-        (actor_user_id, now, now, ws),
+        (actor_user_id, now, now, ws, order_ids),
     ).fetchall()
 
     restored: list[int] = []
@@ -84,10 +114,18 @@ def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
     for oid in order_ids:
         try:
             with conn.transaction():
+                _apply_drift(conn, ws, oid, actor_kind=ak, actor_id=aid)
                 row = orders.revert_simulation(conn, ws, oid, actor_kind=ak, actor_id=aid)
+                fix: dict[str, Any] = {}
                 if row["page_load_retries"] or row["current_attempt_id"] is not None:
-                    row = orders.transition(conn, row, row["status"], actor_kind=ak, actor_id=aid,
-                                            updates={"page_load_retries": 0, "current_attempt_id": None})
+                    fix.update(page_load_retries=0, current_attempt_id=None)
+                if row["status"] in PRE_EXECUTION_STATUSES and row["status"] != "queued":
+                    # 模拟尝试结束时写的原因（如「遇到验证码…任务保留」）不再成立：按派生规则重写
+                    want = orders.derived_reason(row, row["status"])
+                    if row["status_reason"] != want:
+                        fix["status_reason"] = want
+                if fix:
+                    row = orders.transition(conn, row, row["status"], actor_kind=ak, actor_id=aid, updates=fix)
         except DomainError as exc:
             skipped.append({"order_id": oid, "reason": exc.message})
             continue

@@ -8,9 +8,14 @@ import { parseHTML } from "linkedom";
 import { isSignInUrl, readCustomerId, readLoginState } from "../build/dom/parse.js";
 import {
   IDENTITY_STATUS_TEXT,
+  emptyIdentityStore,
   identityFromPage,
   isFresh,
   isOrderHistoryPath,
+  normalizeIdentityStore,
+  observeIdentity,
+  reconcileIdentity,
+  retireIdentityTab,
   sameIdentity,
   sanitizePageUrl,
   toIdentity,
@@ -117,4 +122,98 @@ test("订单历史页识别；四种身份状态都有中文说明", () => {
     assert.equal(isOrderHistoryPath(p), false, String(p));
   }
   for (const k of ["match", "mismatch", "signed_out", "unknown"]) assert.ok(IDENTITY_STATUS_TEXT[k].short);
+});
+
+// ── 多个标签页的身份读数对账（按页面加载先后）──────────────────────────────
+
+const T0 = Date.parse("2026-11-05T01:00:00Z");
+const BOUND = "A1DEMO0000";
+const OTHER = "A9OTHER0000";
+const obs = (tab, cid, loadedMin, readMin = loadedMin) => ({
+  tab_id: tab,
+  signed_in: cid !== null,
+  customer_id: cid,
+  page_url: "https://www.amazon.com/gp/css/order-history",
+  loaded_at: T0 + loadedMin * 60_000,
+  read_at: T0 + readMin * 60_000,
+});
+const fold = (...steps) => steps.reduce((s, f) => f(s), emptyIdentityStore());
+const see = (o) => (s) => observeIdentity(s, o);
+const gone = (tab) => (s) => retireIdentityTab(s, tab);
+
+test("旧标签页（绑定账号）+ 新标签页（另一个买家号）：报另一个买家号、有分歧；旧页面重读不能翻回绑定账号", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)));
+  const r = reconcileIdentity(s, BOUND, T0 + 61 * 60_000);
+  assert.equal(r.customer_id, OTHER);
+  assert.equal(r.conflict, true);
+  assert.equal(r.source_tab, 2);
+  // 用户回到旧标签页点开始：旧页面（加载时刻没变）重读一次
+  const s2 = observeIdentity(s, obs(1, BOUND, 0, 62));
+  const r2 = reconcileIdentity(s2, BOUND, T0 + 62 * 60_000);
+  assert.equal(r2.customer_id, OTHER, "重读不改变加载先后");
+  assert.equal(r2.conflict, true);
+});
+
+test("新标签页里登录了另一个买家号又关掉：旧标签页不能因此算一致，直到它重新加载", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, OTHER, 60)), gone(2));
+  assert.equal(Object.keys(s.live).length, 1);
+  assert.equal(s.newest_gone.tab_id, 2, "最新加载的那一份留作证据");
+  const r = reconcileIdentity(s, BOUND, T0 + 70 * 60_000);
+  assert.equal(r.customer_id, OTHER);
+  assert.equal(r.conflict, true);
+  // 旧标签页刷新（新的加载时刻），而浏览器其实已经换回绑定账号：分歧消除，报绑定账号
+  const s2 = observeIdentity(s, obs(1, BOUND, 80));
+  assert.equal(s2.newest_gone, null, "比它新的开着的页面出现后，已关闭的读数作废");
+  const r2 = reconcileIdentity(s2, BOUND, T0 + 80 * 60_000);
+  assert.equal(r2.customer_id, BOUND);
+  assert.equal(r2.conflict, false);
+});
+
+test("分歧时绝不报「是绑定账号」：新页面是绑定账号、旧页面是别人，也按别人报（刷新或关掉旧页面后才一致）", () => {
+  const s = fold(see(obs(1, OTHER, 0)), see(obs(2, BOUND, 60)));
+  const r = reconcileIdentity(s, BOUND, T0 + 61 * 60_000);
+  assert.equal(r.customer_id, OTHER);
+  assert.equal(r.conflict, true);
+  const r2 = reconcileIdentity(retireIdentityTab(s, 1), BOUND, T0 + 62 * 60_000);
+  assert.equal(r2.customer_id, BOUND, "旧页面关掉（且比新页面旧）之后一致");
+  assert.equal(r2.conflict, false);
+});
+
+test("任一标签页显示未登录（例如停在 /ap/signin 的重新验证页）：报未登录（安全的一侧），关掉它之后仍保留到下一次页面加载", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see(obs(2, null, 30)));
+  const r = reconcileIdentity(s, BOUND, T0 + 31 * 60_000);
+  assert.equal(r.signed_in, false);
+  assert.equal(r.customer_id, null);
+  assert.equal(r.conflict, true);
+  const closed = retireIdentityTab(s, 2);
+  assert.equal(reconcileIdentity(closed, BOUND, T0 + 32 * 60_000).signed_in, false, "最新加载的读数说未登录");
+  const reloaded = observeIdentity(closed, obs(1, BOUND, 40));
+  const r3 = reconcileIdentity(reloaded, BOUND, T0 + 40 * 60_000);
+  assert.equal(r3.signed_in, true);
+  assert.equal(r3.conflict, false);
+});
+
+test("已登录但没读到买家号 ID 的页面是弱证据：不和读到 ID 的页面制造分歧", () => {
+  const s = fold(see(obs(1, BOUND, 0)), see({ ...obs(2, BOUND, 10), customer_id: null }));
+  const r = reconcileIdentity(s, BOUND, T0 + 11 * 60_000);
+  assert.equal(r.conflict, false);
+  assert.equal(r.customer_id, BOUND, "有 ID 的读数优先");
+});
+
+test("同一标签页：较早加载的页面迟到的读数不能覆盖较新页面的；新鲜度取最近一次读取，不取加载时刻", () => {
+  let s = fold(see(obs(1, BOUND, 50)));
+  s = observeIdentity(s, obs(1, OTHER, 10, 51)); // 刷新之前那一页的消息迟到了
+  assert.equal(s.live["1"].customer_id, BOUND);
+  const r = reconcileIdentity(observeIdentity(s, obs(1, BOUND, 50, 55)), BOUND, T0 + 56 * 60_000);
+  assert.equal(r.at, T0 + 55 * 60_000);
+  assert.equal(isFresh(r, T0 + 56 * 60_000), true);
+  // 只剩一个已关闭的页面：它的读数不再被重读，新鲜度随时间衰减（心跳不再捎带）
+  const lone = reconcileIdentity(retireIdentityTab(s, 1), BOUND, T0 + 120 * 60_000);
+  assert.equal(isFresh(lone, T0 + 120 * 60_000), false);
+});
+
+test("对账：没有读数为 null；存储被改坏时退回空仓库", () => {
+  assert.equal(reconcileIdentity(emptyIdentityStore(), BOUND, T0), null);
+  assert.deepEqual(normalizeIdentityStore({ live: { 1: { tab_id: "x" } }, newest_gone: 5 }), emptyIdentityStore());
+  assert.deepEqual(normalizeIdentityStore(null), emptyIdentityStore());
 });

@@ -1,7 +1,7 @@
 /** 插件本地设置与输入校验（纯函数）。
  *
- * 设置存在 chrome.storage.local，由设置页修改。设备令牌单独存（见 background/state.ts），
- * 只在后台使用，永不显示、永不写日志。
+ * 设置存在 chrome.storage.local，由设置页修改。设备令牌单独存在扩展源下的 IndexedDB 里
+ * （见 background/secrets.ts，内容脚本打不开），只在后台使用，永不显示、永不写日志。
  */
 
 import { normalizeOutcome, type SimOutcome } from "./simulate.js";

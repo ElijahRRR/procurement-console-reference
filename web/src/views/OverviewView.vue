@@ -11,8 +11,10 @@ import PageHeader from '@/components/PageHeader.vue'
 import StatCard from '@/components/StatCard.vue'
 import OrderTable from '@/components/orders/OrderTable.vue'
 import OrderDetailDrawer from '@/components/orders/OrderDetailDrawer.vue'
-import { formatCount, formatDate, formatDateTime, formatNumber } from '@/utils/format'
+import { formatCount, formatDate, formatDateTime, formatNumber, greeting } from '@/utils/format'
+import { displayName, session } from '@/stores/session'
 import { ALLOCATION_TRIGGER_LABEL, labelOf } from '@/utils/labels'
+import { exceptionManual, preStartManual, uncoveredTitle } from '@/utils/overview'
 import { confirmAction, notifyFailure, notifySuccess } from '@/utils/feedback'
 
 const router = useRouter()
@@ -37,14 +39,11 @@ async function load() {
 onMounted(load)
 
 const counts = computed(() => data.value?.counts ?? {})
-const pendingCount = computed(() => {
-  const c = counts.value
-  return (c.pending_review ?? 0) + (c.needs_info ?? 0) + (c.conflict ?? 0)
-})
-const exceptionCount = computed(() => {
-  const c = counts.value
-  return (c.exception ?? 0) + (c.result_unknown ?? 0) + (c.repurchase_pending ?? 0)
-})
+/** 待采购页的待确认 + 资料待补齐 + 待核实 */
+const preStart = computed(() => preStartManual(data.value?.counts))
+/** 异常处理页的异常 + 结果待核实 + 待决定重采 */
+const exceptions = computed(() => exceptionManual(data.value?.counts))
+const unknownCount = computed(() => counts.value.result_unknown ?? 0)
 const last = computed<AllocationSummary | null>(() => data.value?.last_allocation ?? null)
 
 async function reallocate() {
@@ -70,7 +69,8 @@ function open(row: OrderRow | { id: number }) {
 
 <template>
   <div>
-    <PageHeader title="概览">
+    <!-- 顶栏已显示「概览」；页面标题放本页自己的内容（EasyQuick AppLayout） -->
+    <PageHeader :title="session.me ? `${greeting()}，${displayName(session.me)}` : '今日概况'">
       <template #description>
         <template v-if="data">北京日期 {{ formatDate(data.bj_date) }} · 账号 {{ formatNumber(data.accounts.enabled) }}/{{ formatNumber(data.accounts.total) }} 个开启采购<template v-if="data.accounts.paused"> · {{ formatNumber(data.accounts.paused) }} 个暂停执行</template></template>
         <template v-else>今日采购任务、执行设备与最近一次分配</template>
@@ -83,7 +83,7 @@ function open(row: OrderRow | { id: number }) {
 
     <el-alert v-if="loadError" :title="`读取概览失败：${loadError}`" type="error" show-icon :closable="false" class="mb-6" />
 
-    <div v-loading="loading && !data" class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+    <div v-loading="loading && !data" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
       <StatCard
         label="今日可采购"
         :value="formatNumber(data?.today_executable)"
@@ -103,13 +103,22 @@ function open(row: OrderRow | { id: number }) {
         @click="router.push({ path: '/orders', query: { view: 'unassigned' } })"
       />
       <StatCard
-        label="待人工处理"
-        :value="formatNumber(pendingCount + exceptionCount)"
+        label="开始前待处理"
+        :value="formatNumber(data ? preStart.total : null)"
+        icon="clipboard"
+        tone="warning"
+        :hint="data ? preStart.hint : ''"
+        clickable
+        @click="router.push({ path: '/orders', query: { view: preStart.view } })"
+      />
+      <StatCard
+        label="异常待处理"
+        :value="formatNumber(data ? exceptions.total : null)"
         icon="exclamationTriangle"
         tone="danger"
-        :hint="data ? `待确认与补资料 ${formatNumber(pendingCount)} · 异常 ${formatNumber(exceptionCount)}` : ''"
+        :hint="data ? exceptions.hint : ''"
         clickable
-        @click="router.push('/exceptions')"
+        @click="router.push({ path: '/exceptions', query: { view: exceptions.view } })"
       />
       <StatCard
         label="设备在线"
@@ -127,15 +136,22 @@ function open(row: OrderRow | { id: number }) {
         <template #header>
           <div class="flex items-center justify-between">
             <h3 class="text-base font-semibold text-gray-900 dark:text-white">最近异常</h3>
-            <el-button text size="small" @click="router.push('/exceptions')">查看全部<AppIcon name="chevronRight" size="sm" class="ml-1" /></el-button>
+            <el-button text size="small" @click="router.push({ path: '/exceptions', query: { view: 'exception' } })">查看全部<AppIcon name="chevronRight" size="sm" class="ml-1" /></el-button>
           </div>
         </template>
+        <div v-if="unknownCount" class="px-4 pt-4">
+          <el-alert type="error" show-icon :closable="false" :title="`有 ${formatNumber(unknownCount)} 笔结果待核实：已登记提交但没有确认结果，对应账号已暂停执行。核实前不会重买。`">
+            <template #default>
+              <el-button size="small" class="mt-2" @click="router.push({ path: '/exceptions', query: { view: 'result_unknown' } })">去核实</el-button>
+            </template>
+          </el-alert>
+        </div>
         <OrderTable
           :rows="data?.recent_exceptions ?? []"
           mode="compact"
           :loading="loading && !data"
           empty-title="没有异常任务"
-          empty-description="护栏拦截、执行失败和结果待核实的任务会出现在这里。"
+          empty-description="护栏拦截、缺货、页面错误重试后仍失败的任务会出现在这里；结果待核实的任务见「异常处理 → 结果待核实」。"
           @open="open"
         />
       </el-card>
@@ -174,19 +190,22 @@ function open(row: OrderRow | { id: number }) {
 
           <div class="mt-5">
             <h4 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">未覆盖账号</h4>
-            <p v-if="!last.uncovered.length" class="text-sm text-gray-500 dark:text-dark-400">每个开启采购的账号都分到了当天首单。</p>
-            <ul v-else class="divide-y divide-gray-100 dark:divide-dark-700">
-              <li v-for="u in last.uncovered" :key="`${u.account_id}-${u.date}`" class="flex items-start justify-between gap-3 py-2 text-sm">
-                <span class="shrink-0 whitespace-nowrap text-gray-900 dark:text-gray-100">{{ u.name }}</span>
-                <span class="min-w-0 text-right text-gray-500 dark:text-dark-400">{{ u.reason }}</span>
-              </li>
-            </ul>
+            <p v-if="!last.uncovered.length" class="text-sm text-gray-500 dark:text-dark-400">每个开启采购的账号在各计划日期都分到了首单。</p>
+            <template v-else>
+              <p class="mb-1 text-xs text-gray-500 dark:text-dark-400">没写日期的是计划当天 {{ formatDate(last.bj_date) }}。</p>
+              <ul class="divide-y divide-gray-100 dark:divide-dark-700">
+                <li v-for="u in last.uncovered" :key="`${u.account_id}-${u.date}`" class="flex items-start justify-between gap-3 py-2 text-sm">
+                  <span class="shrink-0 whitespace-nowrap text-gray-900 dark:text-gray-100">{{ uncoveredTitle(u, last.bj_date) }}</span>
+                  <span class="min-w-0 text-right text-gray-500 dark:text-dark-400">{{ u.reason }}</span>
+                </li>
+              </ul>
+            </template>
           </div>
           <div v-if="last.unassigned.length" class="mt-5">
             <h4 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">未分出的任务</h4>
             <ul class="divide-y divide-gray-100 dark:divide-dark-700">
               <li v-for="u in last.unassigned.slice(0, 6)" :key="u.order_id" class="py-2 text-sm">
-                <button type="button" class="code cursor-pointer" @click="open({ id: u.order_id })">{{ u.upstream_order_no }}</button>
+                <button type="button" class="code pc-code-wrap max-w-full cursor-pointer text-left" :title="u.upstream_order_no" @click="open({ id: u.order_id })">{{ u.upstream_order_no }}</button>
                 <div class="mt-1 text-gray-500 dark:text-dark-400">{{ u.reason }}</div>
               </li>
             </ul>

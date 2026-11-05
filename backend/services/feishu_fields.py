@@ -103,7 +103,8 @@ def cell_to_python(value: Any, field_type: int | None = None) -> Any:
     - 数字 → 原数字；单选 → 文本；多选 → 文本列表；复选框 → bool；
     - 日期 / 创建时间 / 更新时间（毫秒时间戳）→ 带时区的 UTC datetime；
     - 人员 / 群组 / 附件 → 名称（多个用「, 」连接）；关联 → 关联记录的文本；超链接 ``{link, text}`` → text（无则 link）；
-    - 公式 / 查找引用 ``{type: 内部类型, value: [...]}`` → 按内部类型递归取值，单个值取出，多个值保留列表；
+    - 公式 / 查找引用 ``{type: 内部类型, value: [...]}`` → 按内部类型递归取值，单个值取出，多个值保留列表
+      （查找引用列引用了多条记录时，各文本片段各算一个值，不拼接；公式列的片段照常拼接）；
     - 空值、空列表 → None。
     """
     if value is None:
@@ -138,7 +139,16 @@ def _inner_type(t: Any) -> int | None:
 
 def _dict_to_python(v: dict[str, Any], field_type: int | None) -> Any:
     if "value" in v and "type" in v:                       # 公式 / 查找引用
-        return cell_to_python(v.get("value"), _inner_type(v.get("type")))
+        inner = v.get("value")
+        if field_type == LOOKUP and isinstance(inner, list):
+            segs = [x for x in inner if x is not None and x != ""]
+            if len(segs) > 1 and all(_is_segment(x) for x in segs):
+                # 查找引用引用了多条记录：每个片段是一个值，不拼成一个文本（拼起来会造出不存在的订单号或 ASIN）。
+                # 公式列（如「平台订单号 = 采购订单号 & SKU」）的文本片段仍是同一个值，照常拼接。
+                texts = [str(x.get("text") or "").strip() for x in segs]
+                texts = [t for t in texts if t]
+                return texts if len(texts) > 1 else (texts[0] if texts else None)
+        return cell_to_python(inner, _inner_type(v.get("type")))
     if "text_arr" in v and isinstance(v.get("text_arr"), list):
         return _join([str(x) for x in v["text_arr"] if x not in (None, "")]) or v.get("text") or None
     if "text" in v or "link" in v:                         # 超链接 / 单个文本片段

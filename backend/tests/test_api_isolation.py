@@ -94,3 +94,39 @@ def test_plugin_of_workspace_b_cannot_touch_runs_or_attempts_of_workspace_a(owne
         404, "NOT_FOUND")
     err(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/result",
                     json={"outcome": "failed", "error_code": "OUT_OF_STOCK"}, headers=hb), 404, "NOT_FOUND")
+
+
+def test_workspace_b_cannot_run_any_order_action_or_filter_on_workspace_a(owner, other, api):
+    """D3-10：其余人工动作、批量人审里夹带别人的 id、账号归档、按对象过滤事件、写回目标、清除提醒——全部 404 / 看不到。"""
+    acc = create_account(owner)
+    import_orders(owner, [import_row("PO-DEMO-W0201"), import_row("PO-DEMO-W0202", 人工审核=None)])
+    order = find_order(owner, "PO-DEMO-W0201")
+    pending = find_order(owner, "PO-DEMO-W0202")
+    oid = order["id"]
+    with tx() as conn:
+        conn.execute("UPDATE procure.purchase_orders SET needs_attention = true, attention_note = 'DEMO' "
+                     "WHERE id = %s", (oid,))
+        src = conn.execute("SELECT id FROM procure.order_sources WHERE purchase_order_id = %s", (oid,)).fetchone()["id"]
+    for method, path, body in [
+        ("POST", f"/api/v1/orders/{oid}/resume", {}),
+        ("POST", f"/api/v1/orders/{oid}/uncancel", {}),
+        ("POST", f"/api/v1/orders/{oid}/resolve-unknown", {"outcome": "not_ordered"}),
+        ("POST", f"/api/v1/orders/{oid}/mark-amazon-cancelled", {}),
+        ("POST", f"/api/v1/orders/{oid}/repurchase", {"decision": "approve"}),
+        ("POST", f"/api/v1/orders/{oid}/resolve-conflict", {"choice": "keep"}),
+        ("POST", f"/api/v1/orders/{oid}/clear-attention", {}),
+        ("POST", f"/api/v1/orders/{oid}/writeback-target", {"source_id": src}),
+        ("POST", f"/api/v1/accounts/{acc['id']}/archive", {}),
+    ]:
+        err(other.request(method, path, json=body), 404, "NOT_FOUND")
+    out = ok(other.post("/api/v1/orders/bulk-review", json={"ids": [pending["id"]], "decision": "approve"}))
+    assert out["updated"] == [] and out["skipped"][0]["id"] == pending["id"]
+    for params in ({"entity": "order", "entity_id": oid}, {"entity": "account", "entity_id": acc["id"]},
+                   {"order_id": oid}):
+        assert ok(other.get("/api/v1/events", params=params))["total"] == 0
+    assert ok(other.get("/api/v1/orders", params={"needs_attention": "true"}))["total"] == 0
+    # A 的数据原封不动
+    a = ok(owner.get(f"/api/v1/orders/{oid}"))
+    assert a["needs_attention"] is True and a["status"] == "assigned"
+    assert ok(owner.get(f"/api/v1/orders/{pending['id']}"))["status"] == "pending_review"
+    assert ok(owner.get(f"/api/v1/accounts/{acc['id']}"))["archived_at"] is None

@@ -99,8 +99,13 @@ def test_adopt_customer_id_from_device(owner, api):
 
 def test_settings_get_and_patch_validation(owner):
     s = ok(owner.get("/api/v1/settings"))
-    assert s == {"default_max_delivery_days": 10, "simulation_only": True, "logistics_sync_time": "08:30",
-                 "real_purchase_available": False}
+    assert {k: v for k, v in s.items() if k != "file_admission"} == {
+        "default_max_delivery_days": 10, "simulation_only": True, "logistics_sync_time": "08:30",
+        "real_purchase_available": False}
+    assert s["file_admission"]["cancel_after_sale_values"] == ["已取消"] and s["file_admission"]["import_historical"]
+    s = ok(owner.patch("/api/v1/settings", json={"file_admission": {"purchaser_values": ["自采购DEMO"]}}))
+    assert s["file_admission"]["purchaser_values"] == ["自采购DEMO"]
+    err(owner.patch("/api/v1/settings", json={"file_admission": {"bogus": 1}}), 422, "VALIDATION")
     s = ok(owner.patch("/api/v1/settings", json={"default_max_delivery_days": 12, "logistics_sync_time": "09:15",
                                                  "real_purchase_available": True}))
     assert s["default_max_delivery_days"] == 12 and s["logistics_sync_time"] == "09:15"

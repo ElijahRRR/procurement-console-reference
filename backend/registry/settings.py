@@ -30,7 +30,12 @@ class Settings:
     pairing_ttl_s: int
     sweep_interval_s: int
     writeback_interval_s: int
+    intake_check_s: int
     web_dist: Path
+    login_fail_limit: int
+    pair_fail_limit: int
+    rate_window_s: int
+    allowed_hosts: tuple[str, ...]
 
     @property
     def feishu_configured(self) -> bool:
@@ -55,6 +60,11 @@ def _load_dotenv(path: Path) -> None:
 def _int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     return int(raw) if raw else default
+
+
+def _list(name: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, "")
+    return tuple(x.strip().lower() for x in raw.split(",") if x.strip())
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -83,7 +93,12 @@ def get() -> Settings:
             pairing_ttl_s=_int("PC_PAIRING_TTL_S", 600),
             sweep_interval_s=_int("PC_SWEEP_INTERVAL_S", 30),
             writeback_interval_s=_int("PC_WRITEBACK_INTERVAL_S", 60),
+            intake_check_s=_int("PC_INTAKE_CHECK_S", 30),
             web_dist=Path(os.environ.get("PC_WEB_DIST", str(paths.REPO_DIR / "web" / "dist"))),
+            login_fail_limit=_int("PC_LOGIN_FAIL_LIMIT", 10),
+            pair_fail_limit=_int("PC_PAIR_FAIL_LIMIT", 20),
+            rate_window_s=_int("PC_RATE_WINDOW_S", 600),
+            allowed_hosts=_list("PC_ALLOWED_HOSTS"),
         )
     return _loaded
 

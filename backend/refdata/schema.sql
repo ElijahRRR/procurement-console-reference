@@ -433,3 +433,41 @@ CREATE INDEX IF NOT EXISTS events_order ON procure.events (order_id, at DESC) WH
 -- 写回列的飞书字段类型 {飞书列名: 字段类型}：建连接 / 改写回对应 / 写回验收时从飞书读取，
 -- 入队时按列类型转换写回值（数字列写数字、单选写选项文本），入队本身不访问飞书。
 ALTER TABLE procure.feishu_connections ADD COLUMN IF NOT EXISTS writeback_field_types jsonb NOT NULL DEFAULT '{}';
+
+-- ── 追加（幂等）：文件导入的准入规则、批次预览时用的准入规则 ──────────────────────────
+-- workspace_settings.file_admission：工作区改过的文件准入键（缺省见 services/normalize.FILE_ADMISSION_DEFAULTS）。
+-- import_batches.admission：预览时实际用的完整准入规则，提交时对已有任务做同样的准入检查。
+ALTER TABLE procure.workspace_settings ADD COLUMN IF NOT EXISTS file_admission jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE procure.import_batches ADD COLUMN IF NOT EXISTS admission jsonb;
+
+-- ── 追加（幂等）：import_rows 带工作区（契约 §0：每张业务表都有 workspace_id，查询都带工作区条件）────────────
+ALTER TABLE procure.import_rows ADD COLUMN IF NOT EXISTS workspace_id bigint REFERENCES procure.workspaces(id);
+UPDATE procure.import_rows r SET workspace_id = b.workspace_id
+    FROM procure.import_batches b WHERE b.id = r.batch_id AND r.workspace_id IS NULL;
+ALTER TABLE procure.import_rows ALTER COLUMN workspace_id SET NOT NULL;
+CREATE INDEX IF NOT EXISTS import_rows_ws_batch ON procure.import_rows (workspace_id, batch_id);
+
+-- ── 追加（幂等）：飞书多维表格的工作区授权（v1 §6.1 第 3 步：链接只用来定位，不等于授权）────────────
+-- 一个多维表格（app_token，含其中全部数据表）同一时刻只归一个工作区。部署所有者的工作区（第一个工作区）
+-- 绑定尚未授权的表格时自动登记；其他工作区必须由部署所有者在服务器上运行 python cli.py feishu_grant 授权。
+-- 这是跨工作区的登记表（与 users 一样不按工作区分区），只在授权检查与 CLI 里读写。
+CREATE TABLE IF NOT EXISTS procure.feishu_base_grants (
+    app_token     text PRIMARY KEY,
+    workspace_id  bigint NOT NULL REFERENCES procure.workspaces(id),
+    granted_by    text NOT NULL CHECK (granted_by IN ('owner_workspace', 'cli', 'migrated')),
+    granted_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS feishu_base_grants_ws ON procure.feishu_base_grants (workspace_id);
+-- 已有的启用连接：每个表格归最早连接它的工作区（其他工作区的同表连接读取时会被拒绝，需部署所有者用 CLI 转授）。
+-- 撤销 / 转授时原工作区的连接会被停用，所以重复执行本句不会把撤销掉的授权又加回来。
+INSERT INTO procure.feishu_base_grants (app_token, workspace_id, granted_by)
+SELECT DISTINCT ON (app_token) app_token, workspace_id, 'migrated'
+FROM procure.feishu_connections WHERE enabled ORDER BY app_token, id
+ON CONFLICT (app_token) DO NOTHING;
+
+-- ── 追加（幂等）：同一工作区里同一个亚马逊买家号 ID 只能登记在一个未归档账号上 ──────────────────
+-- 执行权互斥按账号行算：同一个亚马逊登录挂在两行上就可能两处同时执行、各占一份额度。应用层检查之外由唯一索引兜底
+-- （两次并发的新建 / 修改也只成功一次）。
+CREATE UNIQUE INDEX IF NOT EXISTS buyer_accounts_customer_id_uq
+    ON procure.buyer_accounts (workspace_id, amazon_customer_id)
+    WHERE amazon_customer_id IS NOT NULL AND archived_at IS NULL;

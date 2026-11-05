@@ -7,9 +7,19 @@ import { BROWSER_OPTIONS, DEFAULT_SERVER_URL, isValidPairingCode, validateServer
 import { SIM_OUTCOMES, type SimOutcome } from "../core/simulate.js";
 import { bjShort } from "../core/time.js";
 import type { Browser } from "../core/types.js";
-import { fetchState, onStateChange, toSw } from "../ui/bridge.js";
+import { fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
 import { LOGO_SVG, themeCss } from "../ui/theme.js";
-import { accountText, connectionText, h, identityText, quotaText, renderLogLines, scheduleText } from "../ui/view.js";
+import {
+  accountText,
+  connectionText,
+  h,
+  identityConflictText,
+  identityText,
+  quotaText,
+  receiptLines,
+  renderLogLines,
+  scheduleText,
+} from "../ui/view.js";
 
 const PAGE_CSS = `
 body { margin: 0; background: var(--pc-bg-page); color: var(--pc-text-body); font: 400 14px/20px var(--pc-font-sans); -webkit-font-smoothing: antialiased; }
@@ -172,9 +182,10 @@ function pairingCard(s: StateSnapshot): HTMLElement {
       h("dt", {}, "配对时间"), h("dd", {}, s.device.paired_at ? `${bjShort(s.device.paired_at)}（北京时间）` : "—"),
       h("dt", {}, "绑定账号"), h("dd", {}, accountText(s)),
       h("dt", {}, "身份状态"), h("dd", {}, h("span", { class: tagClass }, ident.short), h("div", { class: "hint" }, ident.long)),
-      h("dt", {}, "本页识别"), h("dd", {}, s.identity
+      h("dt", {}, "页面识别"), h("dd", {}, s.identity
         ? `${s.identity.signed_in ? `已登录，买家号 ID ${maskCustomerId(s.identity.customer_id)}` : "未登录"} · ${bjShort(s.identity.at)} · ${s.identity.page_url ?? "—"}`
-        : "还没有读到（打开任意亚马逊页面后自动读取）"),
+        : "还没有读到（打开任意亚马逊页面后自动读取）",
+        identityConflictText(s) ? h("div", { class: "hint" }, identityConflictText(s)!) : null),
     ),
     h("div", { class: "pc-sep" }),
     h(
@@ -183,6 +194,16 @@ function pairingCard(s: StateSnapshot): HTMLElement {
       h("button", { class: "pc-btn", type: "button", disabled: pending, onclick: () => void doSync() }, "立即同步"),
       h("button", { class: "pc-btn pc-btn-danger", type: "button", onclick: () => void doUnpair() }, "解除配对"),
     ),
+  );
+}
+
+function receiptsCard(s: StateSnapshot): HTMLElement | null {
+  const lines = receiptLines(s);
+  if (!s.device.paired || lines.length === 0) return null;
+  return card(
+    "待补交的结果回执",
+    h("p", { class: "desc" }, "这些结果在上报时没有送到服务端（断网、服务端重启或插件后台被回收）。插件保存了回执，服务端恢复后自动补交；补交的是同一份结果，服务端不会登记两次。"),
+    ...lines.map((t) => h("div", { class: "hint" }, t)),
   );
 }
 
@@ -257,6 +278,8 @@ function render(): void {
     return;
   }
   stack.append(pairingCard(state));
+  const rc = receiptsCard(state);
+  if (rc) stack.append(rc);
   stack.append(simulationCard(state));
   const cfg = configCard(state);
   if (cfg) stack.append(cfg);
@@ -291,4 +314,5 @@ onStateChange(() => {
   });
 });
 void refresh();
+keepFresh("打开设置页", () => state);
 setInterval(() => safeRender(), 30_000);

@@ -12,8 +12,34 @@ from tests import factories as f
 def test_get_creates_default_row(conn):
     ws = conn.execute("INSERT INTO procure.workspaces (name) VALUES ('DEMO 无设置') RETURNING id").fetchone()["id"]
     assert settings_svc.get(conn, ws) == {"default_max_delivery_days": 10, "simulation_only": True,
-                                          "logistics_sync_time": "08:30", "real_purchase_available": False}
+                                          "logistics_sync_time": "08:30", "real_purchase_available": False,
+                                          "file_admission": FILE_ADMISSION_DEFAULT}
     assert f.count(conn, "workspace_settings", "workspace_id = %s", (ws,)) == 1
+
+
+FILE_ADMISSION_DEFAULT = {"approved_values": ["通过"], "rejected_values": ["拒绝", "建议拒绝", "钓鱼"], "purchaser_values": [],
+                      "skip_purchase_status_values": ["已拍单", "拿回"], "cancel_after_sale_values": ["已取消"],
+                      "import_historical": True}
+
+
+def test_file_admission_is_editable_and_used_by_file_preview(conn, workspace):
+    """文件导入的准入规则可在设置里改（只存改过的键）；null 恢复缺省；取值不合格 → VALIDATION。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    out = settings_svc.update(conn, ws, {"file_admission": {"cancel_after_sale_values": ["已取消", " 退款 "],
+                                                            "purchaser_values": ["自采购DEMO"]}}, uid)
+    assert out["file_admission"]["cancel_after_sale_values"] == ["已取消", "退款"]
+    assert out["file_admission"]["purchaser_values"] == ["自采购DEMO"]
+    assert out["file_admission"]["import_historical"] is True          # 未改的键保持文件缺省
+    assert settings_svc.file_admission(conn, ws) == out["file_admission"]
+    out = settings_svc.update(conn, ws, {"file_admission": {"purchaser_values": []}}, uid)
+    assert out["file_admission"]["purchaser_values"] == [] and out["file_admission"]["cancel_after_sale_values"] == [
+        "已取消", "退款"]
+    assert settings_svc.update(conn, ws, {"file_admission": None}, uid)["file_admission"] == FILE_ADMISSION_DEFAULT
+    for bad in ({"nope": []}, {"cancel_after_sale_values": "已取消"}, {"import_historical": "yes"},
+                {"cancel_after_sale_values": ["x"] * 51}, [1]):
+        with pytest.raises(DomainError) as e:
+            settings_svc.update(conn, ws, {"file_admission": bad}, uid)
+        assert e.value.code == "VALIDATION"
 
 
 def test_update_valid_values_writes_event(conn, workspace):

@@ -1,8 +1,11 @@
 """飞书写回队列（契约 §6「写回」、v1 §6.3）：入队、发送、退避、按结果版本取代、人工重试、列表。
 
-- **入队**（enqueue_for_order）：采购结果变化的地方（插件回报成功、人工核实已下单）调用。只有同时满足才入队：
-  任务「已采购」、成功尝试**不是模拟、也不是来源带来的外部单号**、任务有飞书写回目标（order_sources.is_writeback_target）、
-  该连接启用且开启写回、写回对应非空。文件来源、模拟结果、历史 / 外部单号永不写回。
+- **入队**（enqueue_for_order）：采购结果变化的地方（插件回报成功、人工核实已下单、人工指定写回目标）调用。
+  只有同时满足才入队：任务「已采购」、成功尝试**不是模拟、也不是来源带来的外部单号**、任务有飞书写回目标
+  （order_sources.is_writeback_target）、写回对应非空。**连接停用或没开写回也照常入队**（只积压，发送时 flush 才看
+  启用 / 开启写回 / 已验收），恢复后自动补发。文件来源、模拟结果、历史 / 外部单号永不写回。
+- **补入队**（backfill_connection）：连接重新启用、开启写回或改了写回列时，把以该连接为写回目标、当前结果版本还没有
+  写回行的已采购真实结果补入队列（例如写回对应原来为空时登记的结果）。
   写回值按连接保存的写回列类型（feishu_connections.writeback_field_types）转换；入队不访问飞书。
   同一（任务、连接、结果版本）只有一行；新版本入队时，同一任务同一连接的旧 pending / failed 行标 superseded。
 - **发送**（flush，后台每 60 秒）：只发连接「启用 + 开启写回 + 已验收」且目标表仍是当前结果表的到期 pending 行；
@@ -103,8 +106,8 @@ def _build(att: dict[str, Any], writeback_map: dict[str, Any], types: dict[str, 
 def enqueue_for_order(conn, workspace_id: int, order_id: int) -> int | None:
     """输入：工作区、任务 id → 输出：该结果版本的写回 id（已入队过则返回原 id）；不需要写回时返回 None。
 
-    不需要写回：任务不是已采购、成功尝试是模拟或外部单号、没有飞书写回目标、连接停用 / 未开启写回 / 写回对应为空、
-    按对应没有可写的值。写回列配置有问题（列不可写、值无法转换）时不抛异常（不能挡住采购结果的登记），
+    不需要写回：任务不是已采购、成功尝试是模拟或外部单号、没有飞书写回目标、写回对应为空、按对应没有可写的值。
+    连接停用 / 未开启写回时照常入队（只积压，不发送）。写回列配置有问题（列不可写、值无法转换）时不抛异常（不能挡住采购结果的登记），
     而是入队一条 failed 行并写明原因，供写回队列页处理。
     """
     order = conn.execute("SELECT * FROM procure.purchase_orders WHERE id = %s AND workspace_id = %s",
@@ -113,7 +116,7 @@ def enqueue_for_order(conn, workspace_id: int, order_id: int) -> int | None:
     if att is None:
         return None
     tgt = _target(conn, workspace_id, order_id)
-    if tgt is None or not (tgt["c_enabled"] and tgt["c_writeback_enabled"] and tgt["c_writeback_map"]):
+    if tgt is None or not tgt["c_writeback_map"]:
         return None
     cid, version = tgt["c_id"], order["result_version"]
     existing = conn.execute(
@@ -154,6 +157,28 @@ def enqueue_for_order(conn, workspace_id: int, order_id: int) -> int | None:
         "writeback_id": wid, "connection_id": cid, "result_version": version, "status": status,
         "waiting_verification": tgt["c_verified_at"] is None, "superseded": superseded, "error": last_error})
     return wid
+
+
+def backfill_connection(conn, workspace_id: int, connection_id: int) -> int:
+    """输入：工作区、连接 id → 输出：补入队的写回行数。以该连接为写回目标、已采购且当前结果版本还没有写回行的任务
+    逐个交给 enqueue_for_order（它再判断是否真实结果、是否有可写的值）。"""
+    rows = conn.execute(
+        """
+        SELECT o.id FROM procure.purchase_orders o
+        JOIN procure.order_sources s ON s.purchase_order_id = o.id AND s.workspace_id = o.workspace_id
+        WHERE o.workspace_id = %s AND o.status = 'purchased' AND s.kind = 'feishu' AND s.is_writeback_target
+          AND s.feishu_connection_id = %s
+          AND NOT EXISTS (SELECT 1 FROM procure.writebacks w WHERE w.workspace_id = o.workspace_id
+                          AND w.purchase_order_id = o.id AND w.connection_id = %s AND w.result_version = o.result_version)
+        ORDER BY o.id
+        """,
+        (workspace_id, connection_id, connection_id),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        if enqueue_for_order(conn, workspace_id, r["id"]) is not None:
+            n += 1
+    return n
 
 
 def _supersede_older(conn, ws: int, order_id: int, connection_id: int, version: int) -> int:
@@ -208,7 +233,8 @@ def flush(conn, *, now: datetime | None = None,
     fresh = []
     for r in rows:
         if r["has_newer"]:
-            conn.execute("UPDATE procure.writebacks SET status = 'superseded' WHERE id = %s", (r["id"],))
+            conn.execute("UPDATE procure.writebacks SET status = 'superseded' WHERE id = %s AND workspace_id = %s",
+                         (r["id"], r["workspace_id"]))
             stats["superseded"] += 1
         else:
             fresh.append(dict(r))
@@ -299,7 +325,8 @@ def _resolve_records(conn, client, head: dict[str, Any], rows: list[dict[str, An
         ids = index.get(r["upstream_order_no"]) or []
         if len(ids) == 1:
             r["record_id"] = ids[0]
-            conn.execute("UPDATE procure.writebacks SET record_id = %s WHERE id = %s", (ids[0], r["id"]))
+            conn.execute("UPDATE procure.writebacks SET record_id = %s WHERE id = %s AND workspace_id = %s",
+                         (ids[0], r["id"], r["workspace_id"]))
         elif not ids:
             _failed_try(conn, r, now, f"结果表里找不到平台订单号 {r['upstream_order_no']} 的记录", stats)
         else:
@@ -338,8 +365,8 @@ def _send_chunk(conn, client, app_token: str, table_id: str, rows: list[dict[str
 def _mark_done(conn, r: dict[str, Any], now: datetime, stats: dict[str, Any]) -> None:
     conn.execute(
         "UPDATE procure.writebacks SET status = 'done', done_at = %s, tries = tries + 1, last_error = NULL "
-        "WHERE id = %s",
-        (now, r["id"]),
+        "WHERE id = %s AND workspace_id = %s",
+        (now, r["id"], r["workspace_id"]),
     )
     stats["done"] += 1
     stats["superseded"] += _supersede_older(conn, r["workspace_id"], r["purchase_order_id"], r["connection_id"],
@@ -353,20 +380,21 @@ def _mark_done(conn, r: dict[str, Any], now: datetime, stats: dict[str, Any]) ->
 def _failed_try(conn, r: dict[str, Any], now: datetime, error: str, stats: dict[str, Any]) -> None:
     tries = int(r["tries"]) + 1
     if tries >= MAX_TRIES:
-        conn.execute("UPDATE procure.writebacks SET status = 'failed', tries = %s, last_error = %s WHERE id = %s",
-                     (tries, error, r["id"]))
+        conn.execute("UPDATE procure.writebacks SET status = 'failed', tries = %s, last_error = %s WHERE id = %s "
+                     "AND workspace_id = %s", (tries, error, r["id"], r["workspace_id"]))
         stats["failed"] += 1
         events.record(conn, r["workspace_id"], "order", r["purchase_order_id"], "order.writeback_failed",
                       detail={"writeback_id": r["id"], "tries": tries, "error": error})
         return
-    conn.execute("UPDATE procure.writebacks SET tries = %s, last_error = %s, next_try_at = %s WHERE id = %s",
-                 (tries, error, now + timedelta(minutes=backoff_minutes(tries)), r["id"]))
+    conn.execute("UPDATE procure.writebacks SET tries = %s, last_error = %s, next_try_at = %s WHERE id = %s "
+                 "AND workspace_id = %s",
+                 (tries, error, now + timedelta(minutes=backoff_minutes(tries)), r["id"], r["workspace_id"]))
     stats["retrying"] += 1
 
 
 def _final_fail(conn, r: dict[str, Any], now: datetime, error: str, stats: dict[str, Any]) -> None:
-    conn.execute("UPDATE procure.writebacks SET status = 'failed', tries = tries + 1, last_error = %s WHERE id = %s",
-                 (error, r["id"]))
+    conn.execute("UPDATE procure.writebacks SET status = 'failed', tries = tries + 1, last_error = %s WHERE id = %s "
+                 "AND workspace_id = %s", (error, r["id"], r["workspace_id"]))
     stats["failed"] += 1
     events.record(conn, r["workspace_id"], "order", r["purchase_order_id"], "order.writeback_failed",
                   detail={"writeback_id": r["id"], "error": error})
@@ -400,11 +428,12 @@ def rebuild_pending(conn, workspace_id: int, connection_id: int) -> dict[str, in
     for w in rows:
         fields, error = _rebuild_fields(conn, workspace_id, w, c)
         if error:
-            conn.execute("UPDATE procure.writebacks SET status = 'failed', last_error = %s WHERE id = %s",
-                         (error, w["id"]))
+            conn.execute("UPDATE procure.writebacks SET status = 'failed', last_error = %s WHERE id = %s "
+                         "AND workspace_id = %s", (error, w["id"], workspace_id))
             out["failed"] += 1
         else:
-            conn.execute("UPDATE procure.writebacks SET fields = %s WHERE id = %s", (Jsonb(fields), w["id"]))
+            conn.execute("UPDATE procure.writebacks SET fields = %s WHERE id = %s AND workspace_id = %s",
+                         (Jsonb(fields), w["id"], workspace_id))
             out["rebuilt"] += 1
     return out
 
@@ -528,7 +557,8 @@ def retry(conn, workspace_id: int, writeback_id: int, actor_user_id: int | None)
     order = conn.execute("SELECT * FROM procure.purchase_orders WHERE id = %s AND workspace_id = %s",
                          (w["purchase_order_id"], workspace_id)).fetchone()
     if newer is not None or (order is not None and order["result_version"] > w["result_version"]):
-        conn.execute("UPDATE procure.writebacks SET status = 'superseded' WHERE id = %s", (w["id"],))
+        conn.execute("UPDATE procure.writebacks SET status = 'superseded' WHERE id = %s AND workspace_id = %s",
+                     (w["id"], workspace_id))
         new_id = None if newer is not None else enqueue_for_order(conn, workspace_id, w["purchase_order_id"])
         events.record(conn, workspace_id, "order", w["purchase_order_id"], "order.writeback_superseded",
                       actor_kind="user" if actor_user_id else "system", actor_id=actor_user_id,
@@ -539,8 +569,8 @@ def retry(conn, workspace_id: int, writeback_id: int, actor_user_id: int | None)
         raise validation(f"不能重试：{error}")
     conn.execute(
         "UPDATE procure.writebacks SET status = 'pending', tries = 0, last_error = NULL, next_try_at = %s, fields = %s "
-        "WHERE id = %s",
-        (clock.now(), Jsonb(fields), w["id"]),
+        "WHERE id = %s AND workspace_id = %s",
+        (clock.now(), Jsonb(fields), w["id"], workspace_id),
     )
     events.record(conn, workspace_id, "order", w["purchase_order_id"], "order.writeback_retry",
                   actor_kind="user" if actor_user_id else "system", actor_id=actor_user_id,

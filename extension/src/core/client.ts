@@ -8,9 +8,10 @@
  *        network       fetch 抛错（断网、拒绝连接、超时）—— 状态未知；
  *        http          服务端明确回了非 2xx（带 `{code, message, detail}`）—— 状态已定；
  *        bad_response  回了，但不是约定的形状 —— 当作没听懂，不当成功。
- *   4. **重试只针对 network，而且只对可以重复的请求。** 配对码一次性、开始批次会占执行权、
+ *   4. **重试只针对「没说上话」，而且只对可以重复的请求。** 配对码一次性、开始批次会占执行权、
  *      领取会建尝试、**提交登记绝不自动重试**（登记即「可能已下单」）。
- *      服务端明确拒绝就是拒绝，再问一遍答案一样，也不重试。
+ *      服务端明确拒绝（4xx）就是拒绝，再问一遍答案一样，也不重试；
+ *      5xx 表示服务端这次事务已回滚，只有跑单必需、可以重复的几个接口（RETRY_ON_5XX）再试。
  */
 
 import type {
@@ -72,6 +73,8 @@ export interface RunApi {
   submitting(attemptId: number): Promise<ApiResult<unknown>>;
   verifying(attemptId: number, note: string): Promise<ApiResult<unknown>>;
   result(attemptId: number, body: ResultIn): Promise<ApiResult<unknown>>;
+  /** reason：插件这一侧的细分原因（completed、stopped……）。上报时 `reason` 恒为契约缺省的 `finished`，
+   *  细分原因放在 `detail` 里（服务端不认识的结束原因码不会出现在它的批次记录里）。 */
   finishRun(runId: number, reason: string): Promise<ApiResult<unknown>>;
 }
 
@@ -87,11 +90,18 @@ export const RETRY_POLICY = {
   guard: true, // 护栏是同一份事实的重新裁决
   submitting: false, // 绝不自动重试：登记即「可能已下单」
   verifying: true,
-  result: true, // 结果送不到，尝试会一直在途；重复送达服务端会 409
+  result: true, // 结果送不到，尝试会一直在途；同一份结果重复送达，服务端回 200 duplicate
   finishRun: true,
 } as const;
 
 export type Endpoint = keyof typeof RETRY_POLICY;
+
+/** 服务端回 5xx 时（这次事务已回滚）也再试的接口：跑单必需、重复无害的那几个。
+ *  心跳每分钟都有、身份下一轮再报，不在这里；开始批次、领取、提交登记永远不在这里。 */
+export const RETRY_ON_5XX: ReadonlySet<Endpoint> = new Set<Endpoint>(["runHeartbeat", "progress", "verifying", "result", "finishRun"]);
+
+/** 结束批次时上报的 `reason`：契约 §5.12 的缺省值，服务端的批次结束原因表认得它。 */
+export const FINISH_REASON = "finished";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RETRY_DELAYS = [1000, 3000];
@@ -190,13 +200,19 @@ function parseHeartbeat(body: unknown): HeartbeatOut | null {
   };
 }
 
-/** 契约没规定 `POST /runs` 的返回形状；`{id}`、`{run_id}`、`{run: {id}}` 都认。 */
+/** `POST /runs` 的返回：服务端给 `{run_id, lease_ttl_s, lease_expires_at}`；早期的 `{id}`、`{run: {id}}` 也认。 */
 function parseRunStart(body: unknown): RunStartOut | null {
   if (!isObj(body)) return null;
   const run = isObj(body.run) ? body.run : null;
   const id = int(body.run_id) ?? int(body.id) ?? (run ? int(run.id) : null);
   if (id === null) return null;
-  return { run_id: id, lease_expires_at: str(body.lease_expires_at) ?? (run ? str(run.lease_expires_at) : null) };
+  const ttl = int(body.lease_ttl_s) ?? (run ? int(run.lease_ttl_s) : null);
+  return {
+    run_id: id,
+    lease_expires_at: str(body.lease_expires_at) ?? (run ? str(run.lease_expires_at) : null),
+    // 租约有效期只认正整数；读不出就是读不出（引擎按契约默认值算），不当成 0。
+    lease_ttl_s: ttl !== null && ttl > 0 ? ttl : null,
+  };
 }
 
 function parseRunHeartbeat(body: unknown): RunHeartbeatOut | null {
@@ -230,17 +246,19 @@ export function parseAttempt(v: unknown): Attempt | null {
 
 function parseNext(body: unknown): NextOut | null {
   if (!isObj(body) || !("attempt" in body)) return null;
-  if (body.attempt === null) return { attempt: null, reason: str(body.reason) };
+  const retry = int(body.retry_after_s);
+  const retry_after_s = retry !== null && retry > 0 ? retry : null;
+  if (body.attempt === null) return { attempt: null, reason: str(body.reason), retry_after_s };
   const a = parseAttempt(body.attempt);
   if (!a) return null;
-  return { attempt: a, reason: str(body.reason) };
+  return { attempt: a, reason: str(body.reason), retry_after_s: null };
 }
 
 function parseProgress(body: unknown): ProgressOut | null {
   if (!isObj(body)) return null;
   const c = bool(body.continue);
   if (c === null) return null;
-  return { continue: c, cancel_reason: str(body.cancel_reason) };
+  return { continue: c, cancel_reason: str(body.cancel_reason), cancel_code: str(body.cancel_code) };
 }
 
 function parseGuard(body: unknown): GuardOut | null {
@@ -278,6 +296,12 @@ export function httpError(status: number, body: unknown): ApiError {
   return { kind: "http", status, code, message, detail: "code" in b ? (b.detail ?? null) : null };
 }
 
+/** 输入：端点、失败 → 输出：这一次失败值不值得原样再发一次。 */
+function retryable(endpoint: Endpoint, e: ApiError): boolean {
+  if (e.kind === "network") return true;
+  return e.kind === "http" && e.status !== null && e.status >= 500 && RETRY_ON_5XX.has(endpoint);
+}
+
 /** 插件协议客户端。一个实例绑定一个服务端地址与设备令牌。 */
 export class PluginClient implements RunApi {
   private readonly base: string;
@@ -294,12 +318,13 @@ export class PluginClient implements RunApi {
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  /** 输入：端点名、路径、请求体、解析器 → 输出：ApiResult。按 RETRY_POLICY 决定是否在 network 失败后重试。 */
+  /** 输入：端点名、路径、请求体、解析器 → 输出：ApiResult。按 RETRY_POLICY 决定是否在 network 失败后重试，
+   *  按 RETRY_ON_5XX 决定是否在 5xx 后重试。重试发的是同一份请求体。 */
   async call<T>(endpoint: Endpoint, path: string, body: unknown, parse: Parser<T>): Promise<ApiResult<T>> {
     const retries = RETRY_POLICY[endpoint] ? this.retryDelays : [];
     let res = await this.once(path, body, parse);
     for (const delay of retries) {
-      if (res.ok || res.error.kind !== "network") break;
+      if (res.ok || !retryable(endpoint, res.error)) break;
       await this.sleep(delay);
       res = await this.once(path, body, parse);
     }
@@ -432,6 +457,6 @@ export class PluginClient implements RunApi {
   }
 
   finishRun(runId: number, reason: string): Promise<ApiResult<unknown>> {
-    return this.call("finishRun", `/plugin/v1/runs/${runId}/finish`, { reason }, parseAny);
+    return this.call("finishRun", `/plugin/v1/runs/${runId}/finish`, { reason: FINISH_REASON, detail: reason }, parseAny);
   }
 }

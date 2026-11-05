@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from server.app import create_app
+from server.app import TEST_CLIENT_HOST, create_app
 from server.serialize import content_disposition
 from tests.api_helpers import err, ok
 
@@ -25,7 +25,7 @@ def dist(tmp_path):
 
 
 def test_spa_fallback_serves_index_and_files(clean_db, dist):
-    c = TestClient(create_app(web_dist=dist))
+    c = TestClient(create_app(web_dist=dist, allowed_hosts=(TEST_CLIENT_HOST,)))
     for path in ("/", "/orders", "/orders/123", "/settings/feishu?tab=1", "/accounts/7/edit"):
         resp = c.get(path)
         assert resp.status_code == 200 and resp.text == INDEX, path
@@ -42,7 +42,7 @@ def test_spa_fallback_serves_index_and_files(clean_db, dist):
 
 
 def test_api_and_plugin_paths_never_fall_back_to_index(clean_db, dist):
-    c = TestClient(create_app(web_dist=dist))
+    c = TestClient(create_app(web_dist=dist, allowed_hosts=(TEST_CLIENT_HOST,)))
     err(c.get("/api/v1/does-not-exist"), 404, "NOT_FOUND")
     err(c.get("/api"), 404, "NOT_FOUND")
     err(c.get("/plugin/v1/does-not-exist"), 404, "NOT_FOUND")
@@ -51,7 +51,7 @@ def test_api_and_plugin_paths_never_fall_back_to_index(clean_db, dist):
 
 
 def test_without_dist_root_returns_json_hint(clean_db, tmp_path):
-    c = TestClient(create_app(web_dist=tmp_path / "missing"))
+    c = TestClient(create_app(web_dist=tmp_path / "missing", allowed_hosts=(TEST_CLIENT_HOST,)))
     body = ok(c.get("/"))
     assert body["ok"] is True and "npm run build" in body["message"] and body["api"] == "/api/v1"
     err(c.get("/orders"), 404, "NOT_FOUND")
@@ -59,7 +59,7 @@ def test_without_dist_root_returns_json_hint(clean_db, tmp_path):
 
 def test_dist_without_index_is_treated_as_missing(clean_db, tmp_path):
     (tmp_path / "half").mkdir()
-    c = TestClient(create_app(web_dist=tmp_path / "half"))
+    c = TestClient(create_app(web_dist=tmp_path / "half", allowed_hosts=(TEST_CLIENT_HOST,)))
     assert ok(c.get("/"))["ok"] is True
 
 

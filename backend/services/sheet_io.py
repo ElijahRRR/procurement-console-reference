@@ -6,6 +6,7 @@
 - xlsx 用 openpyxl 只读模式、取公式的缓存值（data_only）；日期单元格得到 naive datetime（由 normalize 按北京时间解释）；
 - csv 依次尝试 utf-8-sig → utf-8 → gb18030（兼容 GBK），分隔符在逗号、制表符、分号中按表头行自动判断；
 - 表头 = 第一个非空行；完全空白的行跳过；重复表头加后缀「 (2)」「 (3)」；表头为空但有数据的列命名为「第 N 列」；
+- 一行（去掉行尾空单元格后）超过 MAX_COLS 列 → 拒绝（防止「一格写在 XFD 列」的小文件把每行撑成 16384 列）；
 - row_numbers 为文件里的实际行号（从 1 起，与 Excel 左侧行号一致；表头在第 1 行时与契约的 row_no 一致）。
 
 不改写用户的原文件：只读取传入的字节。
@@ -29,6 +30,8 @@ from services import clock, errors
 MAX_BYTES = 10 * 1024 * 1024
 #: 单个文件的非空数据行上限（防止压缩炸弹把内存撑满）
 MAX_ROWS = 100_000
+#: 单行的列数上限（去掉行尾空单元格后）；订单表远用不到这么多列
+MAX_COLS = 512
 
 _CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
 _SHEET_NAME_BAD = re.compile(r"[\[\]:*?/\\]")
@@ -80,7 +83,7 @@ def _read_xlsx(data: bytes) -> list[Sheet]:
         for ws in wb.worksheets:
             if hasattr(ws, "reset_dimensions"):
                 ws.reset_dimensions()       # 有些导出工具写错尺寸信息，按实际单元格读
-            raw = ((i, list(r)) for i, r in enumerate(ws.iter_rows(values_only=True), start=1))
+            raw = ((i, _trim_row(r, ws.title)) for i, r in enumerate(ws.iter_rows(values_only=True), start=1))
             sheets.append(_build_sheet(ws.title, raw, budget))
         return sheets
     except errors.DomainError:
@@ -89,6 +92,16 @@ def _read_xlsx(data: bytes) -> list[Sheet]:
         raise errors.validation("这个 .xlsx 文件内容损坏，无法读取", reason=type(exc).__name__) from None
     finally:
         wb.close()
+
+
+def _trim_row(values, sheet_name: str) -> list[Any]:
+    """一行 → 去掉行尾空单元格后的值列表；仍超过 MAX_COLS 列 → 校验错误（只读模式会把行补到最右一格）。"""
+    row = list(values)
+    while row and _blank(row[-1]):
+        row.pop()
+    if len(row) > MAX_COLS:
+        raise errors.validation(f"工作表「{sheet_name}」超过 {MAX_COLS} 列，请删掉多余的列后再上传")
+    return row
 
 
 def _decode(data: bytes) -> str:
@@ -108,7 +121,7 @@ def _read_csv(data: bytes, name: str) -> Sheet:
         delimiter = ","
     try:
         reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
-        raw = [(i, [c if c != "" else None for c in r]) for i, r in enumerate(reader, start=1)]
+        raw = [(i, _trim_row([c if c != "" else None for c in r], name)) for i, r in enumerate(reader, start=1)]
     except csv.Error as exc:
         raise errors.validation(f"CSV 文件格式不对：{exc}") from None
     return _build_sheet(name, raw, [MAX_ROWS])
@@ -143,7 +156,7 @@ def _build_sheet(name: str, raw_rows, budget: list[int]) -> Sheet:
     seen: set[str] = set()
     for i in used_cols:
         h = header_row[i] if i < len(header_row) else None
-        base = _header_text(h) if not _blank(h) else f"第{i + 1}列"
+        base = _header_text(h) if not _blank(h) else f"第 {i + 1} 列"
         name_ = base
         n = 2
         while name_ in seen:
@@ -191,7 +204,7 @@ def write_xlsx(sheets: list[tuple[str, list[str], list[Any]]], *,
     """输入：[(工作表名, 表头, 行)]（行为 {表头: 值} 或与表头同序的列表）、可选「按文本格式」的列名 → 输出：xlsx 字节。
 
     表头加粗并冻结首行，列宽按内容估算（中文按两个字符宽）。带时区的时刻按北京时间写出（Excel 不支持时区）；
-    以「=」开头的文本按文本写入（不当公式）；dict / list 写成 JSON 文本。text_headers 里的列设为文本格式
+    以「=」开头的文本（表头与数据都一样）按文本写入（不当公式）；dict / list 写成 JSON 文本。text_headers 里的列设为文本格式
     （模板用：邮编、订单号等手填时保留前导 0）。
     """
     import openpyxl
@@ -208,16 +221,15 @@ def write_xlsx(sheets: list[tuple[str, list[str], list[Any]]], *,
         ws = wb.create_sheet(_unique_sheet_name(sheet_name, names))
         widths = [_display_width(h) for h in headers]
         for c, h in enumerate(headers, start=1):
-            cell = ws.cell(row=1, column=c, value=_clean_cell_text(str(h)))
+            cell = ws.cell(row=1, column=c)
+            _set_value(cell, _clean_cell_text(str(h)))
             cell.font = bold
         for r, row in enumerate(rows, start=2):
             values = [row.get(h) for h in headers] if isinstance(row, dict) else list(row)
             for c, v in enumerate(values, start=1):
                 cell = ws.cell(row=r, column=c)
                 xv = _excel_value(v)
-                cell.value = xv
-                if isinstance(xv, str) and xv.startswith("="):
-                    cell.data_type = "s"
+                _set_value(cell, xv)
                 if isinstance(xv, date) and not isinstance(xv, datetime):
                     cell.number_format = "yyyy-mm-dd"
                 elif isinstance(xv, datetime):
@@ -236,6 +248,13 @@ def write_xlsx(sheets: list[tuple[str, list[str], list[Any]]], *,
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _set_value(cell, value: Any) -> None:
+    """写单元格；以「=」开头的文本强制为文本（防公式注入：上传者写的表头 / 内容不能在下载者那里变成公式）。"""
+    cell.value = value
+    if isinstance(value, str) and value.startswith("="):
+        cell.data_type = "s"
 
 
 def _unique_sheet_name(name: str, used: set[str]) -> str:
