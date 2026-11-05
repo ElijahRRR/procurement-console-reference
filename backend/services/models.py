@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 
 # ── 任务状态 ──────────────────────────────────────────────────────────────────
@@ -104,6 +104,10 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("DELIVERY_TOO_LONG", "guard", "预计送达超过配送上限"),
     ErrorCode("DATA_UNRELIABLE", "guard", "结算页金额或配送日期读取不可靠"),
     ErrorCode("CARD_MISMATCH", "guard", "支付卡尾号与账号设置不符"),
+    ErrorCode("GUARD_BLOCKED", "guard", "护栏拦截"),
+    # 插件端自己的结局码（契约 §5「结果处理」）：都发生在提交登记之前
+    ErrorCode("SUBMIT_REJECTED", "task", "服务端拒绝了提交登记"),
+    ErrorCode("PLUGIN_SIMULATION_ONLY", "account", "插件只执行模拟任务，却领到了真实任务"),
 )}
 
 
@@ -208,9 +212,27 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
+_CENT = Decimal("0.01")
+_NOISE = Decimal("0.000001")
+
+
 def money(v: Any) -> Decimal | None:
-    """输入：数字 / 字符串（可带 $ 与千分位）/ None → 输出：两位小数的 Decimal 或 None。"""
-    if v is None:
+    """输入：数字 / 字符串（可带 $ 与千分位）/ None → 输出：两位小数的 Decimal（四舍五入）或 None。
+
+    先按 6 位小数抹掉浮点噪声（78.68999999 → 78.690000），再取两位。
+    """
+    d = _parse_decimal(v)
+    return None if d is None else d.quantize(_NOISE, rounding=ROUND_HALF_UP).quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def money_cap(v: Any) -> Decimal | None:
+    """输入：同 money → 输出：用作上限（限价）的两位小数，**向下取整**（78.685 → 78.68），宁可少放行 1 美分。"""
+    d = _parse_decimal(v)
+    return None if d is None else d.quantize(_NOISE, rounding=ROUND_HALF_UP).quantize(_CENT, rounding=ROUND_DOWN)
+
+
+def _parse_decimal(v: Any) -> Decimal | None:
+    if v is None or isinstance(v, bool):
         return None
     if isinstance(v, Decimal):
         d = v
@@ -224,4 +246,4 @@ def money(v: Any) -> Decimal | None:
             return None
     if not d.is_finite():
         return None
-    return d.quantize(Decimal("0.01"))
+    return d
