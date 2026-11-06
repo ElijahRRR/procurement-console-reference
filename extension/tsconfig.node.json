@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "build",
+    "rootDir": "src",
+    "types": ["chrome"]
+  },
+  "include": ["src/core", "src/dom", "src/background"]
+}

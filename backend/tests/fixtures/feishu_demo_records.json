@@ -1,0 +1,755 @@
+{
+ "_note": "虚构的飞书多维表格样例：字段定义沿用所有者真实表头的列名（类型为合理推测），记录全部为 DEMO 数据，按 records/search 的返回形状编写。",
+ "fields": [
+  {
+   "field_id": "fldDEMO0000000001",
+   "field_name": "order_line_id",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000002",
+   "field_name": "下单时间",
+   "type": 5,
+   "ui_type": "DateTime",
+   "is_primary": false,
+   "property": {
+    "auto_fill": false,
+    "date_formatter": "yyyy/MM/dd HH:mm"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000003",
+   "field_name": "店铺",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO03",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000004",
+   "field_name": "采购订单号",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000005",
+   "field_name": "SKU",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000006",
+   "field_name": "销售总额",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000007",
+   "field_name": "采购单价",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000008",
+   "field_name": "数量",
+   "type": 2,
+   "ui_type": "Number",
+   "is_primary": false,
+   "property": {
+    "formatter": "0"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000009",
+   "field_name": "建议采购日期",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": false,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000010",
+   "field_name": "售后状态",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO10",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000011",
+   "field_name": "人工审核",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO11",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000012",
+   "field_name": "采购状态",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO12",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000013",
+   "field_name": "订单状态",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO13",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000014",
+   "field_name": "采购方",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO14",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000015",
+   "field_name": "买家号",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000016",
+   "field_name": "买家物流单号",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000017",
+   "field_name": "承运商",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000018",
+   "field_name": "预计/签收时间",
+   "type": 5,
+   "ui_type": "DateTime",
+   "is_primary": false,
+   "property": {
+    "auto_fill": false,
+    "date_formatter": "yyyy/MM/dd HH:mm"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000019",
+   "field_name": "付款卡号",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000020",
+   "field_name": "总成本USD",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": false,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000021",
+   "field_name": "头程USD",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000022",
+   "field_name": "税前总额USD",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000023",
+   "field_name": "运费USD",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000024",
+   "field_name": "税费USD",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000025",
+   "field_name": "发货时间",
+   "type": 5,
+   "ui_type": "DateTime",
+   "is_primary": false,
+   "property": {
+    "auto_fill": false,
+    "date_formatter": "yyyy/MM/dd HH:mm"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000026",
+   "field_name": "备注",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000027",
+   "field_name": "主订单表",
+   "type": 18,
+   "ui_type": "SingleLink",
+   "is_primary": false,
+   "property": {
+    "multiple": false,
+    "table_id": "tblDEMO0000000002",
+    "table_name": "主订单"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000028",
+   "field_name": "店铺账号",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": false,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000029",
+   "field_name": "平台订单号",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": true,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000030",
+   "field_name": "收货人姓名",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000031",
+   "field_name": "收货人地址",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000032",
+   "field_name": "收货人城市",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000033",
+   "field_name": "收货人州/省",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000034",
+   "field_name": "邮编",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000035",
+   "field_name": "收货人电话",
+   "type": 13,
+   "ui_type": "Phone",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000036",
+   "field_name": "AMZ订单号",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000037",
+   "field_name": "买家号1",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": false,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000038",
+   "field_name": "买家号id",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000039",
+   "field_name": "国家",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO39",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000040",
+   "field_name": "ASIN",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000041",
+   "field_name": "数量1",
+   "type": 20,
+   "ui_type": "Formula",
+   "is_primary": false,
+   "property": {
+    "formatter": "",
+    "formula_expression": "bitable::$table[tblDEMO0000000001].$field[fldDEMO0000000001]"
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000042",
+   "field_name": "来源码",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000043",
+   "field_name": "配送方式",
+   "type": 3,
+   "ui_type": "SingleSelect",
+   "is_primary": false,
+   "property": {
+    "options": [
+     {
+      "color": 0,
+      "id": "optDEMO43",
+      "name": "示例选项"
+     }
+    ]
+   }
+  },
+  {
+   "field_id": "fldDEMO0000000044",
+   "field_name": "地址1",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000045",
+   "field_name": "地址2",
+   "type": 1,
+   "ui_type": "Text",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000046",
+   "field_name": "产品截图",
+   "type": 17,
+   "ui_type": "Attachment",
+   "is_primary": false,
+   "property": null
+  },
+  {
+   "field_id": "fldDEMO0000000047",
+   "field_name": "限价",
+   "type": 2,
+   "ui_type": "Currency",
+   "is_primary": false,
+   "property": {
+    "formatter": "0.00",
+    "currency_code": "USD"
+   }
+  }
+ ],
+ "records": [
+  {
+   "record_id": "recDEMO0001",
+   "fields": {
+    "平台订单号": {
+     "type": 1,
+     "value": [
+      {
+       "type": "text",
+       "text": "PO-DEMO-0001SKU-DEMO-A"
+      }
+     ]
+    },
+    "order_line_id": [
+     {
+      "type": "text",
+      "text": "OL-DEMO-0001"
+     }
+    ],
+    "下单时间": 1793107860000,
+    "店铺": "STORE-DEMO",
+    "采购订单号": [
+     {
+      "type": "text",
+      "text": "PO-DEMO-0001"
+     }
+    ],
+    "SKU": [
+     {
+      "type": "text",
+      "text": "SKU-DEMO-A"
+     }
+    ],
+    "销售总额": 59.99,
+    "采购单价": 41.97,
+    "数量": 1,
+    "建议采购日期": {
+     "type": 5,
+     "value": [
+      1793376000000
+     ]
+    },
+    "人工审核": "通过",
+    "采购方": "自采购DEMO",
+    "采购状态": "待拍单",
+    "收货人姓名": [
+     {
+      "type": "text",
+      "text": "Demo Buyer"
+     }
+    ],
+    "收货人地址": [
+     {
+      "type": "text",
+      "text": "100 Demo St"
+     }
+    ],
+    "收货人城市": [
+     {
+      "type": "text",
+      "text": "Demo City"
+     }
+    ],
+    "收货人州/省": [
+     {
+      "type": "text",
+      "text": "fl"
+     }
+    ],
+    "邮编": [
+     {
+      "type": "text",
+      "text": "02134"
+     }
+    ],
+    "收货人电话": "555-0100",
+    "国家": "US",
+    "ASIN": [
+     {
+      "type": "text",
+      "text": " b0demo0001 "
+     }
+    ],
+    "数量1": {
+     "type": 2,
+     "value": [
+      1
+     ]
+    },
+    "店铺账号": {
+     "type": 1,
+     "value": [
+      {
+       "type": "text",
+       "text": "STORE-DEMO"
+      }
+     ]
+    },
+    "限价": 78.69,
+    "总成本USD": {
+     "type": 2,
+     "value": [
+      44.49
+     ]
+    },
+    "主订单表": {
+     "link_record_ids": [
+      "recDEMOMAIN1"
+     ]
+    },
+    "产品截图": [
+     {
+      "file_token": "boxDEMO0000000001",
+      "name": "demo.png",
+      "size": 1024,
+      "type": "image/png",
+      "tmp_url": "https://example.invalid/tmp/demo.png",
+      "url": "https://example.invalid/demo.png"
+     }
+    ],
+    "备注": [
+     {
+      "type": "text",
+      "text": "请"
+     },
+     {
+      "type": "mention",
+      "mentionType": "User",
+      "text": "@Demo 同事",
+      "token": "ou_demo"
+     },
+     {
+      "type": "text",
+      "text": " 跟进"
+     }
+    ]
+   }
+  },
+  {
+   "record_id": "recDEMO0002",
+   "fields": {
+    "平台订单号": {
+     "type": 1,
+     "value": [
+      {
+       "type": "text",
+       "text": "PO-DEMO-0002SKU-DEMO-B"
+      }
+     ]
+    },
+    "下单时间": 1793149500000,
+    "采购单价": 19.5,
+    "限价": 45,
+    "数量1": {
+     "type": 2,
+     "value": [
+      2
+     ]
+    },
+    "来源码": [
+     {
+      "type": "text",
+      "text": "B0DEMO0002"
+     }
+    ],
+    "地址1": [
+     {
+      "type": "text",
+      "text": "200 Sample Ave"
+     }
+    ],
+    "地址2": [
+     {
+      "type": "text",
+      "text": "Apt 3"
+     }
+    ],
+    "收货人姓名": [
+     {
+      "type": "text",
+      "text": "Sample Person"
+     }
+    ],
+    "收货人城市": [
+     {
+      "type": "text",
+      "text": "Sample Town"
+     }
+    ],
+    "收货人州/省": [
+     {
+      "type": "text",
+      "text": "CA"
+     }
+    ],
+    "邮编": [
+     {
+      "type": "text",
+      "text": "90001"
+     }
+    ],
+    "收货人电话": "555-0101",
+    "建议采购日期": {
+     "type": 5,
+     "value": []
+    },
+    "买家号1": {
+     "type": 1,
+     "value": []
+    }
+   }
+  },
+  {
+   "record_id": "recDEMO0003",
+   "fields": {
+    "平台订单号": {
+     "type": 1,
+     "value": [
+      {
+       "type": "text",
+       "text": "PO-DEMO-0003SKU-DEMO-C"
+      }
+     ]
+    },
+    "人工审核": "通过",
+    "采购状态": "已拍单",
+    "AMZ订单号": [
+     {
+      "type": "text",
+      "text": "111-0000000-0000003"
+     }
+    ],
+    "买家号": [
+     {
+      "type": "text",
+      "text": "BUYER-DEMO-1"
+     }
+    ],
+    "买家号id": [
+     {
+      "type": "text",
+      "text": "A1DEMO0000"
+     }
+    ],
+    "ASIN": [
+     {
+      "type": "text",
+      "text": "B0DEMO0003"
+     }
+    ],
+    "数量": 1,
+    "采购单价": 25,
+    "限价": 30
+   }
+  }
+ ]
+}

@@ -1,0 +1,2 @@
+/* Tailwind 只生成布局工具类；基础重置（preflight）与 EasyQuick 样式类由 design-system/bundle.css 提供。 */
+@tailwind utilities;

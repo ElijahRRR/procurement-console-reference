@@ -1,0 +1,124 @@
+/*
+ * 本应用的少量补充样式：只用 EasyQuick 变量，不写十六进制色值，不改 --el-* 变量。
+ * 浅色写在默认选择器，深色写在 [data-theme="dark"] / html.dark 下。
+ */
+
+/* 表格里的订单号等编号：.code 小块不换行 */
+.code {
+  white-space: nowrap;
+}
+/* 很长的编号（平台订单号、亚马逊订单号）宁可折行也不被截断：人工核实要看全 */
+.code.pc-code-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* 详情抽屉：分区标题与键值网格 */
+.pc-section + .pc-section {
+  margin-top: var(--space-6);
+}
+.pc-section-title {
+  margin-bottom: var(--space-3);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.pc-kv {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
+  column-gap: var(--space-4);
+  row-gap: var(--space-2);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+:where(.pc-kv) > dt {
+  color: var(--text-muted);
+}
+:where(.pc-kv) > dd {
+  min-width: 0;
+  color: var(--text-body);
+  overflow-wrap: anywhere;
+}
+
+/* 抽屉头部：保持与 el-dialog 一致的分隔线 */
+.el-drawer__header {
+  margin-bottom: 0;
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--border-default);
+}
+.el-drawer__body {
+  padding: var(--space-6);
+}
+.el-drawer__footer {
+  padding: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--border-default);
+}
+
+/* 用 gap 排列的按钮组不再叠加 Element Plus 的相邻按钮左外边距 */
+:where([class*='gap-']) > .el-button + .el-button {
+  margin-left: 0;
+}
+
+/* 表格行可点击 */
+.pc-clickable-rows .el-table__row {
+  cursor: pointer;
+}
+
+/* 时间线里的护栏检查表 */
+.pc-checks {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.pc-checks td {
+  padding: var(--space-1) var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+
+/* 快照查看器 */
+.pc-snapshot {
+  max-height: 22rem;
+  overflow: auto;
+  border-radius: var(--radius-xl);
+  background: var(--bg-muted);
+  padding: var(--space-3) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  color: var(--text-body);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 文件上传拖放区跟随主题 */
+.el-upload-dragger {
+  border-radius: var(--radius-2xl);
+}
+
+/* 登录 / 首次设置页的卡片宽度 */
+.pc-auth-card {
+  width: 100%;
+  max-width: 26rem;
+}
+
+/* 窄屏（手机）下弹窗不超出视口：固定宽度的 el-dialog 最多占满视口减两侧 16px 留白 */
+.el-dialog {
+  max-width: calc(100vw - 2rem);
+}
+@media (max-width: 640px) {
+  .el-dialog__body {
+    overflow-x: auto;
+  }
+}
+
+/* 分段切换器（el-segmented）放在可横向滚动的容器里，窄屏时不把页面撑宽 */
+.pc-segmented-scroll {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+.pc-segmented-scroll > .el-segmented {
+  max-width: none;
+}
