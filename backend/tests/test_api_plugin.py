@@ -225,9 +225,9 @@ def test_plugin_requires_a_registered_token_but_no_csrf_header(owner, api):
     assert removed["hidden_at"] is not None
     ok(plugin.post("/plugin/v1/heartbeat", json={}, headers=bearer(dev["token"])))
     assert ok(owner.get(f"/api/v1/devices/{dev['device_id']}"))["hidden_at"] is None
-    # 配对接口已经不存在
+    # 配对已经删除：旧版插件还在调的接口只剩一个占位，恒回「插件版本过旧」
     err(plugin.post("/plugin/v1/pair", json={"code": "ZZZZZZZZ", "device_name": "x", "browser": "chrome",
-                                             "ext_version": "0.1.0"}), 404, "NOT_FOUND")
+                                             "ext_version": "0.1.0"}), 409, "PLUGIN_OUTDATED")
 
 
 def test_result_unknown_after_submit_pauses_account_and_resolve_via_console(owner, api):

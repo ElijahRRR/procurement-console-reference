@@ -126,7 +126,8 @@ def test_concurrent_registration_of_one_token_creates_one_browser(owner, api):
 
 def test_old_plugin_gets_readable_errors(owner, api):
     """旧版插件（0.1.0）：登记、心跳、身份上报都回 409 PLUGIN_OUTDATED 并说明要更新；不带版本、也不带 customer_id 的
-    开始批次请求回 422「插件版本过旧，请更新插件」；配对接口不存在。服务端状态不被旧插件改动。"""
+    开始批次请求回 422「插件版本过旧，请更新插件」；配对接口只剩一个占位，回 409 PLUGIN_OUTDATED 同一句话。
+    服务端状态不被旧插件改动。"""
     acc = create_account(owner)
     plugin = plugin_client(api)
     dev = register_device(plugin, acc)
@@ -153,8 +154,9 @@ def test_old_plugin_gets_readable_errors(owner, api):
         assert out["message"] == "插件版本过旧，请更新插件"
     out = err(plugin.post("/plugin/v1/runs", headers=h), 422, "VALIDATION")          # 连请求体都没有
     assert out["detail"]["field"] == "simulated"
-    err(plugin.post("/plugin/v1/pair", json={"code": "ZZZZZZZZ", "device_name": "Mac-DEMO", "browser": "chrome",
-                                             "ext_version": "0.1.0"}), 404, "NOT_FOUND")
+    out = err(plugin.post("/plugin/v1/pair", json={"code": "ZZZZZZZZ", "device_name": "Mac-DEMO", "browser": "chrome",
+                                                   "ext_version": "0.1.0"}), 409, "PLUGIN_OUTDATED")
+    assert out["message"] == "插件版本过旧，请更新插件" and out["detail"] == {"min_ext_version": "0.2.0"}
     # 什么都没被改：登录状态、最近联系时间、浏览器个数
     assert ok(owner.get(f"/api/v1/devices/{dev['device_id']}")) == {**seen_before, "online": True}
     assert ok(owner.get("/api/v1/devices", params={"include_hidden": 1}))["total"] == 1
@@ -362,28 +364,137 @@ def test_buyer_switch_after_submit_still_accepts_the_result(owner, api):
     assert fin["end_reason"] == "finished"
 
 
-def test_guard_checks_the_buyer_read_on_the_checkout_page(owner, api):
-    """护栏 buyer 项：结算页事实里的 customer_id 必须是批次账号登记的买家号 ID；缺失按数据不可靠拦截。"""
+ENDED = "执行批次已结束（结算页登录的买家号不是这个批次的买家号），请重新开始批次"
+
+
+def _assert_run_ended_answers(plugin, h, run_id: int, aid: int, att: dict) -> None:
+    """批次被服务端结束（end_reason = identity_mismatch）之后，插件每一种后续请求得到的答复（契约 §5）：
+    批次与尝试类请求一律 409 LEASE_LOST；这笔尝试再报结果，报的正是 IDENTITY_MISMATCH 的失败 → 200 duplicate，
+    别的 → 409 CONFLICT。都不是 500，也不会再建第二笔尝试。"""
+    for path, body in [
+        (f"/plugin/v1/runs/{run_id}/next", None),
+        (f"/plugin/v1/runs/{run_id}/heartbeat", None),
+        (f"/plugin/v1/runs/{run_id}/finish", {"reason": "buyer_changed"}),
+        (f"/plugin/v1/runs/{run_id}/finish", None),
+        (f"/plugin/v1/attempts/{aid}/progress", {"stage": "before_submit"}),
+        (f"/plugin/v1/attempts/{aid}/guard", good_facts(att)),
+        (f"/plugin/v1/attempts/{aid}/submitting", None),
+        (f"/plugin/v1/attempts/{aid}/verifying", {"note": "DEMO"}),
+    ]:
+        out = err(plugin.post(path, json=body, headers=h), 409, "LEASE_LOST")
+        assert out["message"] == ENDED and out["detail"] == {"run_id": run_id, "end_reason": "identity_mismatch"}, path
+    dup = ok(plugin.post(f"/plugin/v1/attempts/{aid}/result",
+                         json={"outcome": "failed", "error_code": "IDENTITY_MISMATCH", "error_detail": "DEMO"},
+                         headers=h))
+    assert dup == {"attempt_status": "aborted", "order_status": "assigned", "duplicate": True}
+    out = err(plugin.post(f"/plugin/v1/attempts/{aid}/result",
+                          json={"outcome": "failed", "error_code": "ABORTED_BY_SERVER", "error_detail": "DEMO"},
+                          headers=h), 409, "CONFLICT")
+    assert out["message"] == "该采购尝试的结果已登记为「已中止」，与本次上报不一致"
+    assert out["detail"] == {"attempt_status": "aborted", "reported": "failed"}
+
+
+def test_guard_buyer_block_aborts_the_attempt_and_ends_the_run(owner, api):
+    """验收第 10 条（HTTP，护栏判定处）：结算页读到的买家号不是批次账号的买家号——护栏照旧回 block / IDENTITY_MISMATCH；
+    这一笔提交前中止、任务回已分配、批次由服务端结束，不进异常、不暂停账号；之后同一批次领不到任何东西。"""
     acc, plugin, h, run, att = _claimed(owner, api)
     aid = att["attempt_id"]
+    import_orders(owner, [import_row("PO-DEMO-R0009")])                            # 账号上还有别的可领任务
     wrong = ok(plugin.post(f"/plugin/v1/attempts/{aid}/guard", json=good_facts(att, customer_id="A1DEMO000002"),
                            headers=h))
-    assert wrong["verdict"] == "block" and wrong["code"] == "IDENTITY_MISMATCH"
-    assert "A1DEMO000002" in wrong["reasons"][0] and DEMO_CUSTOMER_ID in wrong["reasons"][0]
-    assert wrong["checks"]["buyer"]["ok"] is False
+    reason = f"结算页登录的买家号（A1DEMO000002）不是这个批次的买家号（{DEMO_CUSTOMER_ID}）"
+    assert set(wrong) == {"verdict", "code", "reasons", "checks", "delivery_days", "total_for_cap", "fulfillment"}
+    assert wrong["verdict"] == "block" and wrong["code"] == "IDENTITY_MISMATCH" and wrong["reasons"] == [reason]
+    assert wrong["checks"]["buyer"] == {"ok": False, "expected": DEMO_CUSTOMER_ID, "actual": "A1DEMO000002"}
+
     row = find_order(owner, "PO-DEMO-R0001")
-    assert row["status"] == "exception" and row["latest_attempt"]["error_code"] == "IDENTITY_MISMATCH"
+    assert row["status"] == "assigned" and row["assigned_account"] == {"id": acc["id"], "name": acc["name"]}
+    assert row["status_reason"] == f"{reason}，未提交前中止，任务保留待重新领取"
+    assert row["latest_attempt"]["status"] == "aborted" and row["latest_attempt"]["error_code"] == "IDENTITY_MISMATCH"
+    assert "PO-DEMO-R0001" not in [r["upstream_order_no"]
+                                   for r in ok(owner.get("/api/v1/orders", params={"view": "exception"}))["rows"]]
+    a = ok(owner.get(f"/api/v1/accounts/{acc['id']}"))
+    assert a["execution_paused"] is False and a["quota_today"]["used"] == 0 and a["active_run"] is None
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert [x["status"] for x in detail["attempts"]] == ["aborted"]
+    assert detail["attempts"][0]["guard_verdict"]["code"] == "IDENTITY_MISMATCH"
+    kinds = [e["kind"] for e in detail["events"]]
+    assert "attempt.guard_blocked" in kinds and "attempt.aborted" in kinds and "attempt.failed" not in kinds
+    ended = ok(owner.get("/api/v1/events", params={"entity": "run", "entity_id": run["run_id"], "page_size": 50}))
+    end = [e for e in ended["rows"] if e["kind"] == "run.ended"]
+    assert len(end) == 1 and end[0]["detail"]["end_reason"] == "identity_mismatch"
+    assert end[0]["detail"]["attempt_id"] == aid and end[0]["detail"]["at"] == "guard"
+
+    _assert_run_ended_answers(plugin, h, run["run_id"], aid, att)
+    assert len(ok(owner.get(f"/api/v1/orders/{row['id']}"))["attempts"]) == 1       # 没有第二笔尝试
+    assert find_order(owner, "PO-DEMO-R0009")["status"] == "assigned"               # 别的任务没被碰
+    hb = ok(plugin.post("/plugin/v1/heartbeat", json={}, headers=h))
+    assert hb["device_run"] is None and hb["account"]["active_run"] is None
+    assert hb["account"]["executable_today"] == 2
+
+    # 重新开始批次后才会再领到这一笔（按顺序它排在前面）；这次结算页读数对了，照常买完
+    run2 = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h))
+    assert run2["run_id"] != run["run_id"]
+    again = ok(plugin.post(f"/plugin/v1/runs/{run2['run_id']}/next", headers=h))["attempt"]
+    assert again["upstream_order_no"] == "PO-DEMO-R0001" and again["attempt_no"] == 2
+    ok(plugin.post(f"/plugin/v1/attempts/{again['attempt_id']}/guard", json=good_facts(again), headers=h))
+    ok(plugin.post(f"/plugin/v1/attempts/{again['attempt_id']}/submitting", headers=h))
+    res = ok(plugin.post(f"/plugin/v1/attempts/{again['attempt_id']}/result",
+                         json={"outcome": "succeeded", "amazon_order_no": f"SIM-20261031-{again['attempt_id']}",
+                               "amounts": {"total": "25.00"}}, headers=h))
+    assert res == {"attempt_status": "succeeded", "order_status": "purchased"}
+
+
+def test_submitting_recheck_buyer_block_is_409_guard_blocked_and_is_committed(owner, api):
+    """验收第 10 条（HTTP，提交登记复核处）：护栏放行之后，存下的结算页买家号 ID 已不是批次账号当前登记的 ID——
+    提交登记回 409 GUARD_BLOCKED（detail.block_code = IDENTITY_MISMATCH），但这次拒绝是**落了库的**：尝试已中止、
+    任务回已分配、批次已结束、账号不暂停。"""
+    acc, plugin, h, run, att = _claimed(owner, api)
+    aid = att["attempt_id"]
+    ok(plugin.post(f"/plugin/v1/attempts/{aid}/guard", json=good_facts(att), headers=h))
+    # 执行中控制台不让改买家号 ID（409）：这里直接改库，模拟「账号的 ID 与浏览器的登录一起被换掉」
+    err(owner.patch(f"/api/v1/accounts/{acc['id']}", json={"amazon_customer_id": "A1DEMO000002"}), 409, "CONFLICT")
+    with tx() as conn:
+        conn.execute("UPDATE procure.buyer_accounts SET amazon_customer_id = 'A1DEMO000002' WHERE id = %s",
+                     (acc["id"],))
+    ok(plugin.post("/plugin/v1/identity", json=identity("A1DEMO000002"), headers=h))
+    reason = f"结算页登录的买家号（{DEMO_CUSTOMER_ID}）不是这个批次的买家号（A1DEMO000002）"
+    body = err(plugin.post(f"/plugin/v1/attempts/{aid}/submitting", headers=h), 409, "GUARD_BLOCKED")
+    assert body["message"] == f"按最新配置复核护栏未通过：{reason}，不能提交"
+    assert body["detail"] == {"block_code": "IDENTITY_MISMATCH", "reasons": [reason], "attempt_status": "aborted",
+                              "order_status": "assigned", "run_ended": True, "end_reason": "identity_mismatch"}
+
+    row = find_order(owner, "PO-DEMO-R0001")
+    assert row["status"] == "assigned" and row["assigned_account"]["id"] == acc["id"]
+    assert row["latest_attempt"]["status"] == "aborted" and row["latest_attempt"]["error_code"] == "IDENTITY_MISMATCH"
+    detail = ok(owner.get(f"/api/v1/orders/{row['id']}"))
+    assert detail["attempts"][0]["submitted_at"] is None
+    assert detail["attempts"][0]["guard_verdict"]["verdict"] == "block"
+    a = ok(owner.get(f"/api/v1/accounts/{acc['id']}"))
+    assert a["execution_paused"] is False and a["quota_today"]["used"] == 0 and a["active_run"] is None
+    with tx() as conn:
+        r = conn.execute("SELECT ended_at, end_reason, stats FROM procure.execution_runs WHERE id = %s",
+                         (run["run_id"],)).fetchone()
+        assert r["ended_at"] is not None and r["end_reason"] == "identity_mismatch"
+        assert r["stats"] == {"claimed": 1, "aborted": 1}
+        assert f.count(conn, "purchase_attempts") == 1
+    _assert_run_ended_answers(plugin, h, run["run_id"], aid, att)
+
+
+def test_guard_checks_the_buyer_read_on_the_checkout_page(owner, api):
+    """护栏 buyer 项的另外两种读数：结算页事实里没有 customer_id → 按数据不可靠拦截（任务转异常，批次继续）；
+    大小写、空白不同但是同一个 ID → 放行，入库的是规范化后的 ID。"""
+    acc, plugin, h, run, att = _claimed(owner, api)
+    facts = good_facts(att)
+    del facts["customer_id"]
+    missing = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/guard", json=facts, headers=h))
+    assert missing["verdict"] == "block" and missing["code"] == "DATA_UNRELIABLE"
+    row = find_order(owner, "PO-DEMO-R0001")
+    assert row["status"] == "exception" and row["latest_attempt"]["status"] == "failed"
     assert ok(owner.get(f"/api/v1/accounts/{acc['id']}"))["execution_paused"] is False
 
-    import_orders(owner, [import_row("PO-DEMO-R0002")])
-    att2 = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
-    facts = good_facts(att2)
-    del facts["customer_id"]
-    missing = ok(plugin.post(f"/plugin/v1/attempts/{att2['attempt_id']}/guard", json=facts, headers=h))
-    assert missing["verdict"] == "block" and missing["code"] == "DATA_UNRELIABLE"
-
     import_orders(owner, [import_row("PO-DEMO-R0003")])
-    att3 = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
+    att3 = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]     # 同一批次接着领
     passed = ok(plugin.post(f"/plugin/v1/attempts/{att3['attempt_id']}/guard",
                             json=good_facts(att3, customer_id=" a1demo000001"), headers=h))
     assert passed["verdict"] == "pass" and passed["checks"]["buyer"]["ok"] is True

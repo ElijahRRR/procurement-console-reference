@@ -1,6 +1,7 @@
 /**
  * 执行入口改造后的展示规则（纯函数）：浏览器的登录状态 → 「当前登录」一栏的文字与颜色、上报时间说明；
- * 待登记的买家号整理、「填到已有账号」的候选与确认文案；概览提示；页签取值。买家号 ID 全部虚构。
+ * 待登记的买家号整理（插件读到的与来源指定的合在一起）、「填到已有账号」的候选与确认文案；概览提示；页签取值。
+ * 买家号 ID 全部虚构。
  */
 import { describe, expect, it } from 'vitest'
 import type { Account, Device, DiscoveredBuyer, LoginState } from '@/api/types'
@@ -8,11 +9,15 @@ import { LOGIN_STATES } from '@/api/types'
 import {
   CUSTOMER_ID_RE,
   IGNORE_CONFIRM_TEXT,
+  NO_BROWSER_TEXT,
   accountsTab,
   discoveredNotice,
   fillConfirmText,
   fillTargets,
   normalizeCustomerId,
+  registerHelpText,
+  registeredEffectText,
+  sourceOrdersText,
   splitDiscovered,
   suggestedFillTarget,
 } from '@/utils/accounts'
@@ -116,9 +121,56 @@ describe('待登记的买家号整理', () => {
     expect(pending[0]).toMatchObject({ customer_id: 'A2TEST00005', last_reported_at: ago(2), name_hint: '环境-DEMO-05' })
     expect(pending[0].browsers.map((b) => b.id)).toEqual([10, 11])
     expect(splitDiscovered(null)).toEqual({ pending: [], ignored: [] })
+    // 旧服务端不给 source_orders：按 0
     expect(splitDiscovered([{ customer_id: 'A2TEST00007', ignored: false } as DiscoveredBuyer]).pending[0]).toEqual({
-      customer_id: 'A2TEST00007', ignored: false, browsers: [], last_reported_at: null, name_hint: null,
+      customer_id: 'A2TEST00007', ignored: false, browsers: [], last_reported_at: null, name_hint: null, source_orders: 0,
     })
+  })
+
+  it('只来自来源指定的买家号（没有浏览器、没有上报时间）排在后面，指定任务多的在前；同一个 ID 取较大的任务数', () => {
+    const fromSource = (id: string, n: number, extra: Partial<DiscoveredBuyer> = {}) => buyer(id, { browsers: [], last_reported_at: null, source_orders: n, ...extra })
+    const { pending, ignored } = splitDiscovered([
+      fromSource('A2TEST00008', 1),
+      fromSource('A2TEST00007', 3, { name_hint: '环境-DEMO-07' }),
+      buyer('A2TEST00005', { last_reported_at: ago(5), source_orders: 2 }),
+      fromSource('A2TEST00009', 1),
+      buyer('A2TEST00005', { last_reported_at: ago(9), source_orders: 1 }),
+      // 忽略名单里的 ID 此刻没有浏览器登录着也照样列出
+      fromSource('A2TEST00098', 0, { ignored: true }),
+      buyer('A2TEST00099', { ignored: true, last_reported_at: ago(600) }),
+    ])
+    expect(pending.map((x) => [x.customer_id, x.source_orders])).toEqual([['A2TEST00005', 2], ['A2TEST00007', 3], ['A2TEST00008', 1], ['A2TEST00009', 1]])
+    expect(pending[1]).toMatchObject({ browsers: [], last_reported_at: null, name_hint: '环境-DEMO-07' })
+    expect(ignored.map((x) => x.customer_id)).toEqual(['A2TEST00099', 'A2TEST00098'])
+    // 不是数字、负数都按 0
+    expect(splitDiscovered([buyer('A2TEST00004', { source_orders: -2 }), buyer('A2TEST00006', { source_orders: 'x' as unknown as number })]).pending.map((x) => x.source_orders)).toEqual([0, 0])
+  })
+
+  it('来源指定的任务数与没有浏览器登录的说法', () => {
+    expect(sourceOrdersText({ source_orders: 3 })).toBe('来源指定了 3 笔任务')
+    expect(sourceOrdersText({ source_orders: 0 })).toBe('')
+    expect(sourceOrdersText({})).toBe('')
+    expect(sourceOrdersText(null)).toBe('')
+    expect(NO_BROWSER_TEXT).toBe('还没有浏览器登录这个买家号')
+  })
+
+  it('登记之后的提示：有浏览器登录着 → 可以领取；来源指定了任务 → 按指定重新分配', () => {
+    expect(registeredEffectText(buyer('A2TEST00005'))).toBe('登录着这个买家号的浏览器现在可以领取它的任务。')
+    expect(registeredEffectText(buyer('A2TEST00005', { source_orders: 2 }))).toBe('登录着这个买家号的浏览器现在可以领取它的任务；来源指定给它的 2 笔任务会按指定重新分配。')
+    expect(registeredEffectText(buyer('A2TEST00007', { browsers: [], source_orders: 1 }))).toBe('来源指定给它的 1 笔任务会按指定重新分配。')
+    expect(registeredEffectText(buyer('A2TEST00098', { browsers: [] }))).toBe('')
+  })
+
+  it('登记对话框的说明：插件读到的写从浏览器读出；只来自来源的写明还没有浏览器登录', () => {
+    const fromBrowser = '买家号 ID 由插件从浏览器登录的亚马逊页面读出。登记后，登录着这个买家号的浏览器就能领取这个账号的任务；请确认名称、金额区间与每日单数。'
+    expect(registerHelpText(null)).toBe(fromBrowser)
+    expect(registerHelpText({ hasBrowser: true, sourceOrders: 0 })).toBe(fromBrowser)
+    expect(registerHelpText({ hasBrowser: true, sourceOrders: 2 })).toBe(
+      '买家号 ID 由插件从浏览器登录的亚马逊页面读出。登记后，登录着这个买家号的浏览器就能领取这个账号的任务；来源指定给它的 2 笔任务会按指定重新分配；请确认名称、金额区间与每日单数。',
+    )
+    expect(registerHelpText({ hasBrowser: false, sourceOrders: 2 })).toBe(
+      '这个买家号 ID 是来源指定的，还没有浏览器登录这个买家号。登记后，来源指定给它的 2 笔任务会按指定重新分配；登录着这个买家号的浏览器装上插件后才能领取。请确认名称、金额区间与每日单数。',
+    )
   })
 
   const acc = (id: number, name: string, customerId: string | null) => ({ id, name, amazon_customer_id: customerId }) as Account
@@ -138,7 +190,8 @@ describe('待登记的买家号整理', () => {
   it('确认文案与概览提示', () => {
     expect(fillConfirmText('A2TEST00004', '环境-DEMO-04')).toBe('确定要把买家号 ID A2TEST00004 登记到「环境-DEMO-04」吗？')
     expect(IGNORE_CONFIRM_TEXT).toBe('确定要忽略这个买家号吗？忽略后它不再出现在待登记列表里；之后可以在已忽略的买家号里恢复。')
-    expect(discoveredNotice(2)).toBe('插件发现了 2 个还没登记的买家号，登记后才会分到任务')
+    // 个数是插件读到的与来源指定的并集，所以不再写「插件发现了」
+    expect(discoveredNotice(2)).toBe('有 2 个还没登记的买家号（插件读到的或来源指定的），登记后才会分到任务')
     expect(discoveredNotice(0)).toBe('')
     expect(discoveredNotice(undefined)).toBe('')
     expect(discoveredNotice(null)).toBe('')

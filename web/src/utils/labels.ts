@@ -268,9 +268,11 @@ export const CONFLICT_KIND_LABEL: Record<ConflictKind, string> = {
   admission: '来源已不归本系统采购',
 }
 
+/** 分配方式；source = 来源（飞书表格或上传的表格）里写了买家号，按它指定的账号分配 */
 export const ASSIGNMENT_KIND_LABEL: Record<AssignmentKind, string> = {
   auto: '自动分配',
   manual: '人工改派',
+  source: '来源指定',
 }
 
 export const SUGGESTED_DATE_BASIS_LABEL: Record<SuggestedDateBasis, string> = {
@@ -344,6 +346,7 @@ export const RUN_END_REASON_LABEL: Record<RunEndReason | LegacyRunEndReason, str
   finished: '正常结束',
   lease_expired: '执行权超时',
   simulation_reset: '已清除模拟结果',
+  identity_mismatch: '结算页登录的买家号不是这个批次的买家号',
   device_revoked: '浏览器的授权已撤销（旧版）',
 }
 
@@ -468,6 +471,7 @@ export const EVENT_KIND_LABEL: Record<string, string> = {
   'order.created': '创建任务',
   'order.status_changed': '状态变化',
   'order.source_updated': '来源更新',
+  'order.designation_changed': '来源指定的买家号变了',
   'order.source_conflict': '来源内容冲突',
   'order.source_review_conflict': '来源人审结论冲突',
   'order.source_key_changed': '来源记录的平台订单号变了',
@@ -612,6 +616,8 @@ export const ORDER_FIELD_LABEL: Record<string, string> = {
   district: '区',
   review_value: '人工审核',
   external_amz_order_no: 'AMZ 订单号',
+  designated_buyer_name: '指定买家号',
+  designated_customer_id: '指定买家号 ID',
 }
 
 /** 输入：字段键或中文名 → 输出：中文名（已是中文的原样返回） */

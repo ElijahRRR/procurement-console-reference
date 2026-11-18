@@ -2,13 +2,14 @@
 
 - 账号由所有者在控制台登记；账号上登记的买家号 ID（亚马逊 customerId）就是它的执行身份：任何登录着这个买家号的
   浏览器都能执行它的任务，与哪台电脑、哪个浏览器无关。插件不会自动创建账号。
-- **待登记的买家号**（discovered）：浏览器上报了、但还没有被任何未归档账号登记的买家号 ID。所有者可以登记
-  （新建账号或填到已有账号）或忽略（ignore_buyer_id / unignore_buyer_id）；登记某个 ID 时同时清掉它的忽略记录。
+- **待登记的买家号**（discovered）：浏览器上报了、或来源给未采购的任务指定了（purchase_orders.designated_customer_id），
+  但还没有被任何未归档账号登记的买家号 ID。所有者可以登记（新建账号或填到已有账号）或忽略
+  （ignore_buyer_id / unignore_buyer_id）；登记某个 ID 时同时清掉它的忽略记录，并立即重新分配（指定它的任务随即分给它）。
 - 修改或清空买家号 ID：账号有未结束批次、在途或结果待核实的尝试时拒绝（执行中的身份检查拿它当基准）。
 - 账号名在工作区内唯一（含已归档的，库里有唯一约束）；跨工作区访问一律 NOT_FOUND。
-- 影响分配的配置变化（金额区间、每日额度、优先级、采购开关、站点）以及新建、恢复执行、归档后，
-  立即按今天重新分配（allocation.allocate(trigger='account_change')）。暂停执行不重新分配：
-  暂停的账号不参与自动分配，已分配给它的任务保留。
+- 影响分配的配置变化（金额区间、每日额度、优先级、采购开关、站点，以及**名称与买家号 ID**：来源指定靠它们对应
+  账号）以及新建（不论采购开关开没开）、恢复执行、归档后，立即按今天重新分配
+  （allocation.allocate(trigger='account_change')）。暂停执行不重新分配：暂停的账号不参与自动分配，已分配给它的任务保留。
 - 在线 = 3 分钟内有联系。
 """
 
@@ -35,8 +36,11 @@ _READONLY = frozenset({"id", "workspace_id", "created_at", "updated_at", "archiv
 _EDITABLE = ("name", "amazon_customer_id", "site", "min_amount", "max_amount", "daily_limit", "priority",
              "max_delivery_days", "purchase_enabled", "sync_enabled", "purchase_mode", "schedule_times",
              "expected_card_last4", "notes")
-#: 这些字段变化会改变分配结果
-ALLOCATION_FIELDS = frozenset({"min_amount", "max_amount", "daily_limit", "priority", "purchase_enabled", "site"})
+#: 这些字段变化会改变分配结果（名称与买家号 ID 决定来源指定的任务去哪个账号）
+ALLOCATION_FIELDS = frozenset({"min_amount", "max_amount", "daily_limit", "priority", "purchase_enabled", "site",
+                               "name", "amazon_customer_id"})
+#: 待登记的买家号只看这些状态之外的任务上的来源指定（已经买完或不会再买的不算）
+_DESIGNATION_DONE_STATUSES = ("purchased", "closed", "cancelled")
 #: 账号输出的 pause_cause 取值（未暂停为 None）
 PAUSE_CAUSES = ("result_unknown", "account_error", "manual")
 #: 执行模块写的暂停标记里可能出现的起因（见 execution.PAUSE_MARKER_KIND）
@@ -371,7 +375,8 @@ def _forget_ignored(conn, workspace_id: int, customer_id: str | None) -> None:
 
 
 def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、账号字段、操作人 → 输出：账号（契约 §10）。新建后立即重新分配。"""
+    """输入：工作区、账号字段、操作人 → 输出：账号（契约 §10）。新建后一律立即重新分配（不论采购开关开没开：
+    来源指定给它的任务要么分给它，要么把「还没有登记」的原因换成当前的原因）。"""
     vals = _validate(conn, workspace_id, data, None)
     now = clock.now()
     vals.update(workspace_id=workspace_id, created_at=now, updated_at=now)
@@ -386,13 +391,13 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
     _forget_ignored(conn, workspace_id, row["amazon_customer_id"])
     events.record(conn, workspace_id, "account", row["id"], "account.created", actor_kind=ak, actor_id=aid,
                   detail={k: v for k, v in vals.items() if k not in ("workspace_id", "created_at", "updated_at")})
-    if row["purchase_enabled"]:
-        _reallocate(conn, workspace_id, ak, aid)
+    _reallocate(conn, workspace_id, ak, aid)
     return get(conn, workspace_id, row["id"])
 
 
 def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、账号、要改的字段、操作人 → 输出：改后的账号。影响分配的字段变化后立即重新分配。
+    """输入：工作区、账号、要改的字段、操作人 → 输出：改后的账号。影响分配的字段（ALLOCATION_FIELDS，含名称与
+    买家号 ID）变化后立即重新分配。
 
     修改或清空买家号 ID：账号有未结束批次、在途或结果待核实的尝试时 → CONFLICT（执行中的身份检查以它为基准，
     待核实的结果也要对着原来的买家号去核实）；允许时 'account.updated' 事件的 changes 里记下旧值。
@@ -514,7 +519,7 @@ def _customer_id_arg(customer_id: Any) -> str:
 
 def _name_hints(conn, workspace_id: int, customer_ids: list[str]) -> dict[str, str]:
     """输入：工作区、一组买家号 ID → 输出：{买家号 ID: 来源数据（飞书 / 文件）里同一「买家号 ID」最近出现的「买家号」}；
-    查不到的 ID 不在结果里。只读现成的来源关联（order_sources.normalized），一次查完。"""
+    查不到的 ID 不在结果里。只读现成的来源关联（order_sources.normalized），一次查完。以 # 开头的值（表格错误值）不算。"""
     if not customer_ids:
         return {}
     rows = conn.execute(
@@ -525,6 +530,7 @@ def _name_hints(conn, workspace_id: int, customer_ids: list[str]) -> dict[str, s
             FROM procure.order_sources
             WHERE workspace_id = %s AND upper(btrim(normalized->>'external_buyer_customer_id')) = ANY(%s)
               AND btrim(COALESCE(normalized->>'external_buyer_account', '')) <> ''
+              AND left(btrim(normalized->>'external_buyer_account'), 1) <> '#'
         ) s ORDER BY cid, last_seen_at DESC, id DESC
         """,
         (workspace_id, customer_ids),
@@ -532,62 +538,115 @@ def _name_hints(conn, workspace_id: int, customer_ids: list[str]) -> dict[str, s
     return {r["cid"]: r["name"][:64] for r in rows}
 
 
-def discovered(conn, workspace_id: int, include_ignored: bool = False) -> list[dict[str, Any]]:
-    """输入：工作区、是否含已忽略的 → 输出：待登记的买家号（按最近上报时间倒序）：
-    [{customer_id, ignored, browsers: [{id, name, online, last_seen_at}], last_reported_at, name_hint}]。
+#: 「没有任何未归档账号登记这个买家号 ID」的条件（{ws}、{cid} 处填工作区与买家号 ID 的 SQL 表达式）
+_UNREGISTERED = ("NOT EXISTS (SELECT 1 FROM procure.buyer_accounts a WHERE a.workspace_id = {ws} "
+                 "AND a.amazon_customer_id = {cid} AND a.archived_at IS NULL)")
 
-    = 本工作区未移除的浏览器里，登录买家号 ID 非空、且没有被任何未归档账号登记的 ID，按 ID 聚合。
-    name_hint 是来源数据里同一买家号 ID 最近出现的买家号（给「登记」对话框预填账号名），查不到为 None。
+
+def _designated_ids(conn, workspace_id: int) -> dict[str, dict[str, Any]]:
+    """输入：工作区 → 输出：{买家号 ID: {orders: 指定它的未采购任务数, name: 这些任务最近写的买家号 | None}}。
+
+    只看未采购的任务（状态不在已采购 / 已关闭 / 已取消）上形状合格、且没有任何未归档账号登记的 designated_customer_id。
+    """
+    rows = conn.execute(
+        f"""
+        SELECT o.designated_customer_id AS cid, count(*) AS n,
+               (array_agg(o.designated_buyer_name ORDER BY o.updated_at DESC, o.id DESC)
+                    FILTER (WHERE o.designated_buyer_name IS NOT NULL
+                            AND left(o.designated_buyer_name, 1) <> '#'))[1] AS name
+        FROM procure.purchase_orders o
+        WHERE o.workspace_id = %s AND o.status <> ALL(%s) AND o.designated_customer_id ~ '^A[0-9A-Z]{{8,}}$'
+          AND {_UNREGISTERED.format(ws="o.workspace_id", cid="o.designated_customer_id")}
+        GROUP BY o.designated_customer_id
+        """,
+        (workspace_id, list(_DESIGNATION_DONE_STATUSES)),
+    ).fetchall()
+    return {r["cid"]: {"orders": int(r["n"]), "name": r["name"]} for r in rows}
+
+
+def discovered(conn, workspace_id: int, include_ignored: bool = False) -> list[dict[str, Any]]:
+    """输入：工作区、是否含已忽略的 → 输出：待登记的买家号（按最近上报时间倒序，没有浏览器上报的排在后面）：
+    [{customer_id, ignored, browsers: [{id, name, online, last_seen_at}], last_reported_at, name_hint, source_orders}]。
+
+    = 没有被任何未归档账号登记的买家号 ID，来自两处的并集，按 ID 聚合：
+    ① 本工作区未移除的浏览器此刻上报的登录买家号 ID；
+    ② 来源指定：未采购的任务（状态不在已采购 / 已关闭 / 已取消）上形状合格的 designated_customer_id。
+    source_orders = 指定它的未采购任务数（0 = 只来自浏览器）；只来自来源的项 browsers 为空、last_reported_at 为 None。
+    name_hint 给「登记」对话框预填账号名：优先取这些任务最近写的买家号，否则来源数据里同一买家号 ID 最近出现的
+    买家号，查不到为 None。include_ignored=True 时另外列出忽略名单里的**全部** ID（不要求此刻有浏览器登录着它，
+    否则被忽略的 ID 无处恢复）。
     """
     from services import devices        # 延迟导入：devices 也导入本模块
 
     rows = conn.execute(
-        """
-        SELECT d.id, d.name, d.last_seen_at, d.identity_at, d.login_customer_id AS customer_id,
-               (ig.customer_id IS NOT NULL) AS ignored
+        f"""
+        SELECT d.id, d.name, d.last_seen_at, d.identity_at, d.login_customer_id AS customer_id
         FROM procure.devices d
-        LEFT JOIN procure.ignored_buyer_ids ig
-               ON ig.workspace_id = d.workspace_id AND ig.customer_id = d.login_customer_id
         WHERE d.workspace_id = %s AND d.hidden_at IS NULL AND d.login_customer_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM procure.buyer_accounts a
-                          WHERE a.workspace_id = d.workspace_id AND a.amazon_customer_id = d.login_customer_id
-                            AND a.archived_at IS NULL)
+          AND {_UNREGISTERED.format(ws="d.workspace_id", cid="d.login_customer_id")}
         ORDER BY d.name, d.id
         """,
         (workspace_id,),
     ).fetchall()
+    ignored = {r["customer_id"] for r in conn.execute(
+        f"""
+        SELECT ig.customer_id FROM procure.ignored_buyer_ids ig
+        WHERE ig.workspace_id = %s AND {_UNREGISTERED.format(ws="ig.workspace_id", cid="ig.customer_id")}
+        """,
+        (workspace_id,),
+    ).fetchall()}
+    designated = _designated_ids(conn, workspace_id)
     now = clock.now()
     grouped: dict[str, dict[str, Any]] = {}
+
+    def group(cid: str) -> dict[str, Any] | None:
+        if cid in ignored and not include_ignored:
+            return None
+        return grouped.setdefault(cid, {"customer_id": cid, "ignored": cid in ignored, "browsers": [], "at": None})
+
     for r in rows:
-        if r["ignored"] and not include_ignored:
+        g = group(r["customer_id"])
+        if g is None:
             continue
-        g = grouped.setdefault(r["customer_id"], {"customer_id": r["customer_id"], "ignored": bool(r["ignored"]),
-                                                  "browsers": [], "at": None})
         g["browsers"].append(devices.browser_brief(r, now))
         if r["identity_at"] is not None and (g["at"] is None or r["identity_at"] > g["at"]):
             g["at"] = r["identity_at"]
+    for cid in designated:
+        group(cid)
+    if include_ignored:
+        for cid in ignored:
+            group(cid)
     floor = datetime.min.replace(tzinfo=timezone.utc)
     items = sorted(grouped.values(), key=lambda g: g["customer_id"])
     items.sort(key=lambda g: g["at"] or floor, reverse=True)
     hints = _name_hints(conn, workspace_id, [g["customer_id"] for g in items])
-    return [{"customer_id": g["customer_id"], "ignored": g["ignored"], "browsers": g["browsers"],
-             "last_reported_at": _iso(g["at"]), "name_hint": hints.get(g["customer_id"])}
-            for g in items]
+    out = []
+    for g in items:
+        d = designated.get(g["customer_id"]) or {"orders": 0, "name": None}
+        out.append({"customer_id": g["customer_id"], "ignored": g["ignored"], "browsers": g["browsers"],
+                    "last_reported_at": _iso(g["at"]),
+                    "name_hint": (d["name"][:64] if d["name"] else None) or hints.get(g["customer_id"]),
+                    "source_orders": d["orders"]})
+    return out
 
 
 def discovered_count(conn, workspace_id: int) -> int:
-    """输入：工作区 → 输出：未忽略的待登记买家号个数（与 discovered(include_ignored=False) 的条数相同；概览用）。"""
+    """输入：工作区 → 输出：未忽略的待登记买家号个数（与 discovered(include_ignored=False) 的条数相同；概览用）：
+    浏览器上报的与来源指定的未登记买家号 ID 的并集。"""
     return int(conn.execute(
-        """
-        SELECT count(DISTINCT d.login_customer_id) AS n FROM procure.devices d
-        WHERE d.workspace_id = %s AND d.hidden_at IS NULL AND d.login_customer_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM procure.buyer_accounts a
-                          WHERE a.workspace_id = d.workspace_id AND a.amazon_customer_id = d.login_customer_id
-                            AND a.archived_at IS NULL)
+        f"""
+        SELECT count(*) AS n FROM (
+            SELECT d.login_customer_id AS cid FROM procure.devices d
+            WHERE d.workspace_id = %s AND d.hidden_at IS NULL AND d.login_customer_id IS NOT NULL
+            UNION
+            SELECT o.designated_customer_id FROM procure.purchase_orders o
+            WHERE o.workspace_id = %s AND o.status <> ALL(%s) AND o.designated_customer_id ~ '^A[0-9A-Z]{{8,}}$'
+        ) x
+        WHERE {_UNREGISTERED.format(ws="%s", cid="x.cid")}
           AND NOT EXISTS (SELECT 1 FROM procure.ignored_buyer_ids ig
-                          WHERE ig.workspace_id = d.workspace_id AND ig.customer_id = d.login_customer_id)
+                          WHERE ig.workspace_id = %s AND ig.customer_id = x.cid)
         """,
-        (workspace_id,),
+        (workspace_id, workspace_id, list(_DESIGNATION_DONE_STATUSES), workspace_id, workspace_id),
     ).fetchone()["n"])
 
 

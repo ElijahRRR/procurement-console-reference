@@ -81,7 +81,10 @@ def list_orders(view: str = "all", q: str | None = Query(None, max_length=200),
                 needs_attention: bool | None = None,
                 pg: deps.Paging = Depends(deps.paging), ctx: deps.Console = Depends(deps.console)):
     """输入：视图（today / future / unassigned / 各状态 / all）、搜索词、账号、来源种类、needs_attention（true / false，
-    可选）、分页 → 输出：{total, rows: [任务列表行]}（各条件可组合，total 按全部条件计数）。"""
+    可选）、分页 → 输出：{total, rows: [任务列表行]}（各条件可组合，total 按全部条件计数）。
+
+    行里 assignment_kind 取 auto / manual / source（来源指定）；designated_buyer = {customer_id, name,
+    account: {id, name} | null} | null 是来源给这笔任务指定的买家号与它此刻解析到的未归档账号（没有指定为 null）。"""
     return respond(orders.list_orders(ctx.conn, ctx.workspace_id, view=view or "all", q=q, account_id=account_id,
                                       source=source or None, needs_attention=needs_attention, page=pg.page,
                                       page_size=pg.page_size))
@@ -109,14 +112,15 @@ def review_order(order_id: int, body: ReviewBody, ctx: deps.Console = Depends(de
 
 @router.post("/{order_id}/assign")
 def assign_order(order_id: int, body: AssignBody, ctx: deps.Console = Depends(deps.console)):
-    """输入：任务 id、{account_id} → 输出：任务详情（人工改派，assignment_kind='manual'）。"""
+    """输入：任务 id、{account_id} → 输出：任务详情（人工改派，assignment_kind='manual'；任务留在改派账号期间不跟随
+    来源的指定）。"""
     return respond(orders.assign_manual(ctx.conn, ctx.workspace_id, order_id, body.account_id,
                                         actor_user_id=ctx.user_id))
 
 
 @router.post("/{order_id}/unassign")
 def unassign_order(order_id: int, ctx: deps.Console = Depends(deps.console)):
-    """输入：任务 id → 输出：任务详情（已分配 → 待分配）。"""
+    """输入：任务 id → 输出：任务详情（已分配 → 待分配；来源指定了买家号的任务下次分配时会再分给指定的账号）。"""
     return respond(orders.unassign(ctx.conn, ctx.workspace_id, order_id, actor_user_id=ctx.user_id))
 
 

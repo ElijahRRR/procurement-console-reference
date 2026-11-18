@@ -81,7 +81,8 @@ EXECUTION_FIELDS = (
 # category：task = 本任务转异常；account = 暂停账号执行、任务保留；retry_once = 提交前页面错误自动重试一次；
 #           abort = 未提交前中止（任务回已分配、不暂停账号、不占额度）；guard = 服务端护栏拦截（按 task 处理）。
 # IDENTITY_MISMATCH 是中止类：执行中途换了买家号不是账号的问题，不暂停账号；它同时是护栏 buyer 项的拦截码
-# （结算页登录的买家号不是批次的买家号，见 services/guard）。
+# （结算页登录的买家号不是批次的买家号，见 services/guard）。护栏在这一项拦下时落地也是中止类（尝试 aborted、任务回
+# 已分配、不进异常），服务端同时把批次结束（end_reason = identity_mismatch，见 services/execution._buyer_blocked）。
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,12 @@ class UpstreamRecord:
 
 @dataclass
 class SourceRef:
-    """一条上游记录来自哪里。飞书：connection_id + record_id；文件：batch_id + row_no。"""
+    """一条上游记录来自哪里。飞书：connection_id + record_id；文件：batch_id + row_no。
+
+    buyer_readable：来源这次是否读得到「买家号」「买家号 ID」两列。飞书连接给它们配了列、而列在来源表里找不到
+    （被改名或删除）时为 False，字段对应里这两个字段都没配列时也是 False：这次读取对来源指定不表态，既不设置也不
+    清除任务上的指定（没读到不等于清空）。文件来源恒为 True。
+    """
 
     kind: str                               # feishu / file
     snapshot: dict[str, Any]                # 来源原始字段 → 值（已转成可 JSON 的形式）
@@ -212,6 +218,7 @@ class SourceRef:
     record_id: str | None = None
     batch_id: int | None = None
     row_no: int | None = None
+    buyer_readable: bool = True
 
     def __post_init__(self) -> None:
         if self.kind == "feishu" and (self.connection_id is None or not self.record_id):

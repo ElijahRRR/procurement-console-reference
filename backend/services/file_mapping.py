@@ -33,8 +33,11 @@ STANDARD_COLUMNS: list[tuple[str, str | None, str]] = [
     ("邮编", "postal_code", "5 位邮编，请设为文本格式以保留前导 0（如 02134）"),
     ("收货人电话", "phone", "收件人电话"),
     ("AMZ订单号", "external_amz_order_no", "已有亚马逊订单号的行视为历史采购，不会重新下单"),
-    ("买家号", "external_buyer_account", "历史采购使用的买家号"),
-    ("买家号ID", "external_buyer_customer_id", "历史采购使用的买家号 ID"),
+    ("买家号", "external_buyer_account",
+     "指定由哪个买家号采购，须与控制台的账号名称一致；留空由系统自动分配。已有 AMZ 订单号的行表示历史采购使用的买家号。"
+     "文件来源要改指定请重新上传并填上新的买家号；空着重新上传不会清除指定"),
+    ("买家号ID", "external_buyer_customer_id",
+     "指定采购的买家号 ID（亚马逊 customerId，A 开头）；与「买家号」同时填写时以它为准。留空由系统自动分配"),
     ("收货人国家", "country", "国家，留空按 US"),
     ("ASIN", "asin", "10 位字母或数字，如 B0DEMO0001"),
     ("数量", "quantity", "正整数"),

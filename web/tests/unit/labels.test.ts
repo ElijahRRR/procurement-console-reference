@@ -331,11 +331,23 @@ describe('每张标签表恰好覆盖对应枚举', () => {
     for (const k of current) expect(L.eventKindLabel(k)).not.toMatch(/设备|绑定|配对/)
     expect(L.EVENT_ENTITY_LABEL.device).toBe('浏览器')
     expect(L.RUN_END_REASON_LABEL.device_revoked).not.toMatch(/设备/)
+    // 历史结束原因的中文三端统一（backend END_REASON_ZH、插件 codes）
+    expect(L.RUN_END_REASON_LABEL.device_revoked).toBe('浏览器的授权已撤销（旧版）')
   })
 
   it('现行的错误码与叫停原因的中文里不出现「设备」「绑定」「配对」', () => {
     const all = [...Object.values(L.API_ERROR_LABEL), ...Object.values(L.PLUGIN_ERROR_LABEL), ...Object.values(L.PROGRESS_CANCEL_LABEL), ...Object.values(L.LOGIN_STATE_LABEL)]
     for (const text of all) expect(text).not.toMatch(/设备|绑定|配对/)
+  })
+
+  it('分配方式三种：自动分配、人工改派、来源指定；来源指定的买家号两列有中文名（时间线的字段变化）', () => {
+    expect([...T.ASSIGNMENT_KINDS]).toEqual(['auto', 'manual', 'source'])
+    expect(L.ASSIGNMENT_KIND_LABEL).toEqual({ auto: '自动分配', manual: '人工改派', source: '来源指定' })
+    expect(L.eventKindLabel('order.designation_changed')).toBe('来源指定的买家号变了')
+    expect(L.fieldLabel('designated_buyer_name')).toBe('指定买家号')
+    expect(L.fieldLabel('designated_customer_id')).toBe('指定买家号 ID')
+    // 界面上只叫「来源指定」
+    for (const s of [...Object.values(L.ASSIGNMENT_KIND_LABEL), ...Object.values(L.EVENT_KIND_LABEL), ...Object.values(L.ORDER_FIELD_LABEL)]) expect(s).not.toContain('按表指定')
   })
 
   it('执行所需字段都有中文名（missing_fields 展示）', () => {

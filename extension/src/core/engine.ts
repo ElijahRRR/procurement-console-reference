@@ -30,8 +30,13 @@
  *     —— 读不到、报不上不影响流程，服务端是裁决者：登录状态过期或买家号变了时它让进度 continue=false
  *     （IDENTITY_STALE / IDENTITY_MISMATCH）。
  *   · **护栏事实带买家号 ID**（取事实那一刻页面上读到的；模拟执行时取当前页面的读数）：服务端的 buyer 项
- *     把「谁在下单」钉在下单那一页，读不到按数据不可靠拦截，对不上按 IDENTITY_MISMATCH 拦截，本批次随即结束。
- *     执行中换了买家号是中止类：任务回已分配，**不暂停账号**。
+ *     把「谁在下单」钉在下单那一页，读不到按数据不可靠拦截（一般的拦截：任务转异常，批次继续），对不上按
+ *     IDENTITY_MISMATCH 拦截。后一种是中止类，而且**服务端自己把批次结束**（契约 §4 / §5）：尝试记为中止、任务回
+ *     已分配（不进异常）、**不暂停账号**、批次的结束原因记 identity_mismatch。提交登记前的复核拦下时也一样
+ *     （409 GUARD_BLOCKED，detail.block_code = IDENTITY_MISMATCH、detail.run_ended = true）。引擎这时
+ *     **不上报这一笔的结果、不再领取、也不调用结束批次**（服务端都已经做完，再问只会得到 409），以
+ *     「浏览器登录的买家号变了，这一笔在提交前中止」结束本批次；重新开始批次后会再领到这一笔。
+ *     拦截的答复丢了、请求被重发时拿到的是 409 LEASE_LOST（detail.end_reason = identity_mismatch），同样处理。
  *   · **服务端要求中止时按原因码上报**（cancel_code，契约 §5 第 7 步）：只有 UPSTREAM_CANCELLED 报
  *     ABORTED_UPSTREAM_CANCELLED；ATTEMPT_FINISHED 不再上报；其余报 ABORTED_BY_SERVER（中止类，任务回到已分配）。
  *   · 本阶段尝试是「原子」的：模拟的一笔在毫秒级内完成，批次心跳的 stop 在两笔之间生效。
@@ -60,7 +65,8 @@ export type EnginePhase = "idle" | "starting" | "running" | "finishing" | "ended
 
 /** 批次怎么结束的。 */
 export type RunEndStatus =
-  /** 正常结束：领不到新尝试，或按要求停下，并已调用结束批次。 */
+  /** 正常结束：领不到新尝试，或按要求停下，并已调用结束批次；或者服务端自己把批次结束了
+   *  （护栏 buyer 项拦截，reason = buyer_changed），这时不再调用结束批次。 */
   | "finished"
   /** 409 ACCOUNT_BUSY（这个买家号正在别的浏览器里执行）或 DEVICE_BUSY（这个浏览器上一个批次还没结束）：本次没有开始。 */
   | "busy"
@@ -203,6 +209,26 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 /** 输入：409 的 detail → 输出：服务端说的尝试状态（attempt_status）；没有为 null。 */
 function attemptStatusOf(e: ApiError): string | null {
   return isObj(e.detail) && typeof e.detail.attempt_status === "string" ? e.detail.attempt_status : null;
+}
+
+/** 护栏 buyer 项拦截时服务端结束批次所写的结束原因（服务端 execution.BUYER_BLOCK_END_REASON）。 */
+const BUYER_END_REASON = "identity_mismatch";
+/** 护栏 buyer 项的拦截码（服务端 execution.BUYER_BLOCK_CODE）。 */
+const BUYER_BLOCK_CODE = "IDENTITY_MISMATCH";
+
+/** 输入：某一步的失败 → 输出：是不是「服务端已经因为护栏 buyer 项拦截把这个批次结束了」
+ *  （409 LEASE_LOST，detail.end_reason = identity_mismatch）。护栏或提交登记的第一次答复丢了、
+ *  请求被重发时会拿到它：第一次已经把这一笔中止、把批次结束了。 */
+function endedForBuyer(e: ApiError): boolean {
+  return e.kind === "http" && e.code === "LEASE_LOST" && isObj(e.detail) && e.detail.end_reason === BUYER_END_REASON;
+}
+
+/** 输入：提交登记的失败 → 输出：是不是「提交前复核时护栏的 buyer 项拦下，服务端已经中止这一笔并结束了批次」
+ *  （409 GUARD_BLOCKED，detail.block_code = IDENTITY_MISMATCH，且 detail.run_ended 为 true 或 attempt_status 为 aborted）。
+ *  只回 {block_code, reasons}、什么都没改的服务端（旧版本）不算：那时照一般的复核拦截走。 */
+function buyerBlockedAtSubmit(e: ApiError): boolean {
+  if (e.kind !== "http" || e.code !== "GUARD_BLOCKED" || !isObj(e.detail)) return false;
+  return e.detail.block_code === BUYER_BLOCK_CODE && (e.detail.run_ended === true || e.detail.attempt_status === "aborted");
 }
 
 const zeroCounts = (): RunCounts => ({ attempts: 0, succeeded: 0, failed: 0, blocked: 0, unknown: 0, aborted: 0 });
@@ -364,11 +390,13 @@ export class RunEngine {
     let endReason = "completed";
     let abandoned = false;
     let abandonError: ApiError | null = null;
+    let serverEnded = false;
     try {
       const out = await this.loop();
       endReason = out.reason;
       abandoned = out.abandon;
       abandonError = out.error;
+      serverEnded = out.ended;
     } catch (e) {
       // 引擎自身的意外异常：当作没说上话处理（不再继续），交给服务端清扫。
       abandoned = true;
@@ -381,6 +409,16 @@ export class RunEngine {
 
     const c = this.view.counts;
     const tally = `成功 ${c.succeeded}，失败 ${c.failed}，拦截 ${c.blocked}，待核实 ${c.unknown}，中止 ${c.aborted}`;
+
+    if (serverEnded) {
+      // 护栏 buyer 项拦截：服务端在拦截的同一个事务里已经把这一笔中止、把批次结束了。不调用结束批次（只会得到
+      // 409 LEASE_LOST），也没有在途尝试留给清扫。放在「中断」之前判：并发的那一次批次心跳可能已经拿到 409、
+      // 记了「执行权已失效」，但批次是服务端按规矩结束的，不是中断。
+      const message = `执行批次 #${this.runId} 已结束：${BUYER_CHANGED_TEXT}（${tally}）`;
+      this.log("warn", message);
+      this.emit({ phase: "ended", attempt: null, stage: null, stage_label: null, message });
+      return this.summary("finished", endReason, trigger, null, null, message);
+    }
 
     if (abandoned || this.stopNoFinish) {
       const why = abandonError ? abandonError.message : this.stopReason ?? END_REASON_TEXT[endReason] ?? "执行中断";
@@ -467,15 +505,18 @@ export class RunEngine {
     }
   }
 
-  private async loop(): Promise<{ reason: string; abandon: boolean; error: ApiError | null }> {
+  /** 领取循环：一笔一笔跑到领不到、被要求停下、服务端自己结束了批次或中断为止。 */
+  private async loop(): Promise<LoopEnd> {
+    const done = (reason: string): LoopEnd => ({ reason, abandon: false, error: null, ended: false });
+    const abandon = (reason: string, error: ApiError): LoopEnd => ({ reason, abandon: true, error, ended: false });
     let claimWaits = 0;
     for (;;) {
       await this.beatIfDue();
       await this.identityIfDue();
-      if (this.stopReason !== null) return { reason: "stopped", abandon: false, error: null };
+      if (this.stopReason !== null) return done("stopped");
       if (this.view.counts.attempts >= this.maxAttempts) {
         this.log("warn", `本批次已领取 ${this.maxAttempts} 笔，达到单批次上限，停止领取`);
-        return { reason: "attempt_cap", abandon: false, error: null };
+        return done("attempt_cap");
       }
 
       const n = await this.deps.api.next(this.runId!);
@@ -483,11 +524,11 @@ export class RunEngine {
         const e = n.error;
         if (e.kind !== "http") {
           // 领取的响应丢了：服务端可能已经建了尝试。不再继续，交给清扫。
-          return { reason: "network", abandon: true, error: e };
+          return abandon("network", e);
         }
-        if (e.code === "LEASE_LOST") return { reason: "lease_lost", abandon: true, error: e };
+        if (e.code === "LEASE_LOST") return abandon("lease_lost", e);
         this.log("err", `领取任务失败：${e.message}`);
-        return { reason: e.code.toLowerCase(), abandon: false, error: null };
+        return done(e.code.toLowerCase());
       }
       if (n.data.attempt === null) {
         if (n.data.retry_after_s !== null && claimWaits < CLAIM_RETRY_MAX) {
@@ -500,18 +541,29 @@ export class RunEngine {
         }
         if (n.data.retry_after_s !== null) {
           this.log("warn", `可执行的任务一直被其他操作占用（已再领 ${CLAIM_RETRY_MAX} 次），本批次先结束，稍后再执行`);
-          return { reason: "completed", abandon: false, error: null };
+          return done("completed");
         }
         this.log("info", `没有可执行的任务了${n.data.reason ? `：${n.data.reason}` : ""}`);
-        return { reason: "completed", abandon: false, error: null };
+        return done("completed");
       }
       claimWaits = 0;
 
       const step = await this.runAttempt(n.data.attempt);
       this.emit({ attempt: null, stage: null, stage_label: null });
-      if (step.kind === "abandon") return { reason: step.reason, abandon: true, error: step.error };
-      if (step.kind === "stop") return { reason: step.reason, abandon: false, error: null };
+      if (step.kind === "abandon") return abandon(step.reason, step.error);
+      if (step.kind === "ended") return { reason: step.reason, abandon: false, error: null, ended: true };
+      if (step.kind === "stop") return done(step.reason);
     }
+  }
+
+  /** 输入：尝试、写进日志括号里的说明 → 输出：这一笔与本批次的结局。护栏的 buyer 项拦下了这一笔（结算页登录的买家号
+   *  不是这个批次的买家号）：服务端在拦截的同一个事务里已经把它记为中止（任务回已分配，不进异常、不暂停账号）并把
+   *  批次结束了。所以**不上报结果**（再报只会与服务端记下的结局对不上）、不再领取、也不调用结束批次。 */
+  private buyerChanged(a: Attempt, note: string): StepResult {
+    this.log("warn", `尝试 #${a.attempt_id}：${BUYER_CHANGED_TEXT}（${note}）`);
+    this.emit({ message: `${BUYER_CHANGED_TEXT}。` });
+    this.bump("aborted");
+    return { kind: "ended", reason: "buyer_changed" };
   }
 
   private setStage(stage: string): void {
@@ -652,11 +704,16 @@ export class RunEngine {
     this.setStage("guard");
     const g = await this.deps.api.guard(a.attempt_id, facts);
     if (!g.ok) {
+      if (endedForBuyer(g.error)) {
+        // 护栏的响应丢了、请求被重发：服务端第一次已按 buyer 项拦下 —— 这一笔已中止（任务回已分配），批次也已结束。
+        return this.buyerChanged(a, `第一次的响应没有收到，服务端：${g.error.message}`);
+      }
       if (g.error.kind !== "http" || g.error.code === "LEASE_LOST") {
         return { kind: "abandon", reason: "guard_not_delivered", error: g.error };
       }
       if (g.error.status === 409 && attemptStatusOf(g.error) === "failed") {
-        // 护栏的响应丢了、请求被重发：服务端第一次已按拦截结束了这一笔（任务转异常）。算拦截，继续下一笔。
+        // 护栏的响应丢了、请求被重发：服务端第一次已按一般的拦截码结束了这一笔（尝试失败、任务转异常；buyer 项拦截
+        // 不走这里，见上）。算拦截，继续下一笔。
         this.log("warn", `尝试 #${a.attempt_id} 护栏已拦截（第一次的响应没有收到，服务端：${g.error.message}），继续下一笔`);
         this.bump("blocked");
         return { kind: "continue" };
@@ -667,15 +724,12 @@ export class RunEngine {
     if (g.data.verdict !== "pass") {
       const code = g.data.code ?? "GUARD_BLOCKED";
       const why = g.data.reasons.length ? g.data.reasons.join("；") : codeLabel(code);
-      if (code === "IDENTITY_MISMATCH") {
-        // 护栏的 buyer 项：结算页登录的买家号不是这个批次的买家号。再领下一笔结论也一样，本批次到此为止。
-        // 这一笔服务端在拦截时已经结束了，不再上报结果：IDENTITY_MISMATCH 在结果处理里是中止类，
-        // 再报一次只会与护栏记下的结局对不上（409）。
-        this.log("warn", `尝试 #${a.attempt_id}：${BUYER_CHANGED_TEXT}（${why}）`);
-        this.emit({ message: `${BUYER_CHANGED_TEXT}。` });
-        this.bump("aborted");
-        return { kind: "stop", reason: "buyer_changed" };
+      if (code === BUYER_BLOCK_CODE) {
+        // 护栏的 buyer 项：结算页登录的买家号不是这个批次的买家号。服务端按中止类落地（尝试中止、任务回已分配，
+        // 不进异常、不暂停账号），并且已经把批次结束：不上报结果、不再领取、不调用结束批次。
+        return this.buyerChanged(a, `${why}；服务端已结束本批次`);
       }
+      // 一般的拦截码：服务端已把这一笔记为失败、任务转异常；照常上报同一份失败（服务端认出重复），继续下一笔。
       this.log("warn", `尝试 #${a.attempt_id} 护栏拦截：${codeLabel(code)}（${why}）`);
       const rep = await this.report(a, failureResult("failed", code, why));
       if (typeof rep === "object") return rep;
@@ -699,6 +753,10 @@ export class RunEngine {
         this.log("err", `尝试 #${a.attempt_id} 提交登记没有得到确认（${s.error.message}），不再继续`);
         return { kind: "abandon", reason: "submitting_unconfirmed", error: s.error };
       }
+      if (endedForBuyer(s.error)) {
+        // 登记的响应丢了、浏览器把请求重发：服务端第一次复核时已按 buyer 项拦下 —— 没有登记提交，这一笔已中止，批次也已结束。
+        return this.buyerChanged(a, `第一次的响应没有收到，服务端：${s.error.message}`);
+      }
       if (s.error.code === "LEASE_LOST") return { kind: "abandon", reason: "lease_lost", error: s.error };
       const st = attemptStatusOf(s.error);
       if (s.error.status === 409 && (st === "submitting" || st === "verifying")) {
@@ -711,6 +769,13 @@ export class RunEngine {
         this.log("warn", "结果待核实：服务端会暂停该账号执行，本批次结束");
         return { kind: "stop", reason: "result_unknown" };
       }
+      if (buyerBlockedAtSubmit(s.error)) {
+        // 提交前复核时护栏的 buyer 项拦下了（存下的结算页买家号 ID 已不是批次账号当前登记的 ID）：没有登记提交，
+        // 服务端已把这一笔中止（任务回已分配）并结束了批次。和护栏判定处一样：不上报结果、不调用结束批次。
+        const d = isObj(s.error.detail) ? s.error.detail : {};
+        const reasons = Array.isArray(d.reasons) ? d.reasons.filter((r): r is string => typeof r === "string" && r !== "") : [];
+        return this.buyerChanged(a, `${reasons.length ? reasons.join("；") : s.error.message}；服务端已结束本批次`);
+      }
       if (st !== null && ["succeeded", "failed", "unknown", "aborted"].includes(st)) {
         // 尝试已经被服务端结束了（清扫、清除模拟结果……）：再报只会 409。本批次不再继续。
         this.log("warn", `尝试 #${a.attempt_id} 提交登记被拒绝：${s.error.message}（服务端已结束这一笔）`);
@@ -718,7 +783,8 @@ export class RunEngine {
         return { kind: "stop", reason: "submit_rejected" };
       }
       if (s.error.code === "GUARD_BLOCKED") {
-        // 按最新配置复核护栏不再放行：和护栏拦截一样，这一笔转异常，其他任务继续。
+        // 按最新配置复核护栏不再放行（一般的拦截码；服务端什么都没改）：按拦截码上报失败，这一笔转异常，其他任务继续。
+        // buyer 项的复核拦截由服务端自己落地并结束批次，在上面已经处理。
         const d = isObj(s.error.detail) ? s.error.detail : {};
         const block = typeof d.block_code === "string" && d.block_code ? d.block_code : "GUARD_BLOCKED";
         this.log("warn", `尝试 #${a.attempt_id} 提交前复核护栏未通过：${codeLabel(block)}（${s.error.message}）`);
@@ -762,7 +828,25 @@ export class RunEngine {
   }
 }
 
+/** 领取循环怎么收场的。 */
+interface LoopEnd {
+  /** 结束原因（插件这一侧的细分原因：completed、stopped、buyer_changed……）。 */
+  reason: string;
+  /** 中断：不调用结束批次，交给服务端清扫。 */
+  abandon: boolean;
+  /** 中断时的那个错误。 */
+  error: ApiError | null;
+  /** 服务端已经自己把批次结束了（护栏 buyer 项拦截）：不调用结束批次，也不算中断。 */
+  ended: boolean;
+}
+
+/** 一笔尝试跑完之后，批次接下来怎么走。 */
 type StepResult =
+  /** 这一笔结束了，领下一笔。 */
   | { kind: "continue" }
+  /** 本批次到此为止：调用结束批次。 */
   | { kind: "stop"; reason: string }
+  /** 服务端已经自己把批次结束了（护栏 buyer 项拦截）：不再领取，也不调用结束批次。 */
+  | { kind: "ended"; reason: string }
+  /** 中断：不再续租、不再调用，交给服务端清扫。 */
   | { kind: "abandon"; reason: string; error: ApiError };

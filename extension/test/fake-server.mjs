@@ -24,24 +24,46 @@
  *     返回 {run_id, lease_ttl_s, lease_expires_at, account: {id, name}}，租约按 lease_ttl_s 过期，只有批次心跳续租；
  *   · 执行中的身份检查（领取、进度、提交登记）：这台设备最新的登录状态是 signed_in、买家号 ID 等于批次账号
  *     **当前**登记的 ID、且不过期；批次心跳 stop_reason 取 account_paused / account_archived / identity_mismatch；
- *   · 领取（同一批次已有在途尝试 → 409 ATTEMPT_IN_FLIGHT）；
+ *   · 领取（同一批次已有在途尝试 → 409 ATTEMPT_IN_FLIGHT）。领取时复核来源指定：任务上来源指定的买家号已经不是
+ *     这个账号（task.off_target，真实服务端 designation.off_target）→ 解除分配回待分配、跳过这一笔，领不到任务时
+ *     原因里带「N 笔来源指定的买家号已不是本账号、已解除分配」。插件不看分配方式，只把原因写进日志；
  *   · 进度：{continue, cancel_reason, cancel_code}。尝试已结束 → ATTEMPT_FINISHED；未登记提交时依次看
  *     上游取消（UPSTREAM_CANCELLED）、账号归档（ACCOUNT_ARCHIVED）、暂停（ACCOUNT_PAUSED）、买家号不符
  *     （IDENTITY_MISMATCH）、登录状态过期（IDENTITY_STALE）、来源暂停（task.hold → SOURCE_HOLD）、领取后来源有变化
  *     （task.drift → SOURCE_CHANGED）。legacy: true 模拟旧服务端：不给 cancel_code、不认 ABORTED_BY_SERVER；
- *   · 护栏：放行 → guard_passed；拦截 → 尝试**结束为 failed**、任务转异常；对已结束的尝试再判 → 409
- *     detail.attempt_status。buyer 项：事实里没有 customer_id → DATA_UNRELIABLE；与批次账号登记的 ID 不同 →
- *     IDENTITY_MISMATCH（原因「结算页登录的买家号（…）不是这个批次的买家号（…）」）；
+ *   · 护栏：裁决 {verdict, code, reasons, checks: {检查名: {ok, expected, actual}}, delivery_days, total_for_cap,
+ *     fulfillment}（真实服务端 guard.evaluate 的形状与次序）。放行 → guard_passed；一般的拦截 → 尝试**结束为
+ *     failed**、任务转异常，批次继续下一笔；对已结束的尝试再判 → 409 detail.attempt_status。buyer 项：事实里没有
+ *     customer_id → DATA_UNRELIABLE（一般的拦截）；与批次账号登记的 ID 不同 → IDENTITY_MISMATCH（原因「结算页登录的
+ *     买家号（…）不是这个批次的买家号（…）」）；账号没有登记 ID → IDENTITY_MISMATCH「这个批次的账号没有登记买家号 ID，
+ *     不能放行」；
+ *   · **护栏 buyer 项拦截（IDENTITY_MISMATCH）的落地是中止类，而且服务端自己把批次结束**（真实服务端
+ *     execution._buyer_blocked，护栏判定与提交登记复核两处相同）：尝试 aborted（error_code = IDENTITY_MISMATCH、
+ *     未登记提交）、任务回已分配（上游已取消 → cancelled；领取后的来源变化照样落到任务上）、不进异常、不暂停账号、
+ *     批次统计记 aborted、批次 end_reason = identity_mismatch。`/guard` 处照旧回 200 的拦截裁决（形状不变）；
+ *     提交登记复核处回 409 GUARD_BLOCKED，detail {block_code, reasons, attempt_status: aborted, order_status,
+ *     run_ended: true, end_reason: identity_mismatch}。之后这个批次的领取、批次心跳、结束批次，以及这笔尝试的
+ *     进度、护栏、提交登记、等待验证一律 409 LEASE_LOST「执行批次已结束（结算页登录的买家号不是这个批次的买家号），
+ *     请重新开始批次」，detail {run_id, end_reason}；这笔尝试再报结果：报的正是 IDENTITY_MISMATCH 的失败 →
+ *     200 duplicate，别的 → 409 CONFLICT；设备心跳的 device_run、account.active_run 为 null；重新开始批次马上可以，
+ *     新批次会再领到这一笔。被它结束的定时批次不占时间点（只有 finished 才占）；
  *   · 提交登记：不在 guard_passed → 409（detail.attempt_status，已登记的是 submitting）、任务已取消 → 409、
  *     账号归档 → 409、暂停 → 409 ACCOUNT_PAUSED、买家号不符或过期 → 409 IDENTITY_MISMATCH（detail.login_state /
- *     stale）、来源暂停或有变化 → 409 SOURCE_CHANGED（detail.fields）、复核护栏不过 → 409 GUARD_BLOCKED；
+ *     stale）、来源暂停或有变化 → 409 SOURCE_CHANGED（detail.fields）、按最新配置对存下的结算事实复核护栏不过 →
+ *     409 GUARD_BLOCKED（detail {block_code, reasons}，什么都没改；buyer 项除外，见上一条）；
  *   · 结果处理表（账号级错误暂停账号、PAGE_LOAD_FAILED 首次重试、登记后非成功 → unknown、
  *     中止类（含 ABORTED_BY_SERVER、IDENTITY_MISMATCH）回已分配、**不暂停账号**，再按领取后的来源变化重新定状态
  *     （task.drift.to），未知错误码按任务级失败）；已结束的尝试再报同一份 → 200 duplicate；
  *     已是 unknown 而这次不同 → 409 detail.late_receipt_recorded；其他不同 → 409；
  *     未登记提交、批次已失效 → LEASE_LOST；**结果上报、结束批次不做身份检查**；
- *   · 结束批次 {reason, detail?}：detail 去掉首尾空白截到 200 字（非字符串先转成 JSON 文本）记为 finish_detail；
- *     在途尝试按租约过期处理（已登记 → unknown + 暂停账号，否则 aborted）。
+ *   · 结束批次 {reason, detail?} → {run_id, ended_at, end_reason, stats}：end_reason 是封闭取值（finished /
+ *     lease_expired / simulation_reset / identity_mismatch），插件结束的恒为 finished，插件给的短码记为
+ *     plugin_reason；detail 去掉首尾空白截到 200 字（非字符串先转成 JSON 文本）记为 finish_detail；
+ *     在途尝试按租约过期处理（已登记 → unknown + 暂停账号，否则 aborted）；
+ *   · 批次失效的答复（409 LEASE_LOST）：已结束 →「执行批次已结束（<结束原因的中文>），请重新开始批次」，
+ *     detail {run_id, end_reason}；租约过期 →「执行权已超时（租约过期），请重新开始批次」，
+ *     detail {run_id, lease_expires_at}；
+ *   · 批次统计 stats：claimed / succeeded / failed / blocked / unknown / aborted（真实服务端 _bump）。
  *
  * 为了让引擎、客户端测试不用先走一遍登记：缺省预先登记一个浏览器（令牌 DEMO_TOKEN，登着账号的买家号、
  * 刚上报过身份）。后台测试传 preRegistered: false，让真正的后台自己生成令牌、自己登记。
@@ -108,6 +130,20 @@ function laDate(ms) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
+/** 输入：整数分 → 输出：两位小数的金额文本；null 原样。 */
+function money2(c) {
+  if (c === null || c === undefined) return null;
+  const abs = Math.abs(c);
+  return `${c < 0 ? "-" : ""}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, "0")}`;
+}
+
+/** 输入：上报的买家号 ID → 输出：去空白、大写后形状合格的 ID；缺失、类型不对、形状不对 → null（真实服务端 guard._buyer_id）。 */
+function buyerId(v) {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/\s+/g, "").toUpperCase();
+  return s.length <= 64 && CUSTOMER_ID_RE.test(s) ? s : null;
+}
+
 function daysBetween(a, b) {
   return Math.round((Date.parse(b + "T00:00:00Z") - Date.parse(a + "T00:00:00Z")) / 86400000);
 }
@@ -130,6 +166,20 @@ const ACCOUNT_ZH = {
 const IN_FLIGHT = new Set(["claimed", "checking", "guard_passed", "submitting", "verifying"]);
 const PRE_SUBMIT = new Set(["claimed", "checking", "guard_passed"]);
 const FINAL = new Set(["succeeded", "failed", "unknown", "aborted"]);
+/** 批次结束原因的中文（真实服务端 execution.END_REASON_ZH）。 */
+export const END_REASON_ZH = {
+  finished: "插件结束了批次", lease_expired: "执行权超时（租约过期）",
+  identity_mismatch: "结算页登录的买家号不是这个批次的买家号", device_revoked: "浏览器的授权已撤销（旧版）",
+  simulation_reset: "已清除模拟结果",
+};
+/** 护栏 buyer 项的拦截码，以及它拦下时服务端结束批次所写的 end_reason。 */
+const BUYER_BLOCK_CODE = "IDENTITY_MISMATCH";
+const BUYER_BLOCK_END_REASON = "identity_mismatch";
+/** 护栏检查的次序与各自的拦截码（真实服务端 guard.CHECK_ORDER）。 */
+const CHECK_ORDER = [
+  ["buyer", "IDENTITY_MISMATCH"], ["item", "ITEM_MISMATCH"], ["zip", "ZIP_MISMATCH"], ["subtotal", "SUBTOTAL_OUT_OF_RANGE"],
+  ["price_cap", "PRICE_OVER_CAP"], ["delivery", "DELIVERY_TOO_LONG"], ["data", "DATA_UNRELIABLE"], ["card", "CARD_MISMATCH"],
+];
 const STATUS_ZH = { claimed: "已领取", checking: "结算中", guard_passed: "护栏已放行", submitting: "已登记提交", verifying: "等待验证", succeeded: "成功", failed: "失败", unknown: "结果待核实", aborted: "已中止" };
 
 /** 输入：初始数据与选项 → 输出：{ fetch, state, calls, count(path 片段), now, setNow }。 */
@@ -218,10 +268,13 @@ export function createFakeServer(opts = {}) {
   const attemptOf = (id) => state.attempts.get(Number(id));
   const taskOf = (a) => state.tasks.find((t) => t.id === a.task_id);
   const runActive = (run) => run && !run.ended && clock <= run.lease_until;
-  const leaseLost = (run) =>
-    err(409, "LEASE_LOST", run && run.ended ? `执行批次已结束（${run.end_reason ?? "已结束"}），请重新开始批次` : "执行权已超时（租约过期），请重新开始批次",
-      { run_id: run?.id ?? null });
   const iso = (ms) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
+  /** 批次失效的答复（真实服务端 _require_active）：已结束的带结束原因，租约过期的带过期时刻。 */
+  const leaseLost = (run) =>
+    run && run.ended
+      ? err(409, "LEASE_LOST", `执行批次已结束（${END_REASON_ZH[run.end_reason ?? ""] ?? run.end_reason ?? "已结束"}），请重新开始批次`,
+          { run_id: run.id, end_reason: run.end_reason ?? null })
+      : err(409, "LEASE_LOST", "执行权已超时（租约过期），请重新开始批次", { run_id: run?.id ?? null, lease_expires_at: iso(run?.lease_until) });
   const accountOf = (run) => state.accounts.find((x) => x.id === run.account_id) ?? state.account;
   const deviceOf = (run) => state.devices.find((d) => d.id === run.device_id) ?? state.device;
   /** 身份清洗（真实服务端 devices.clean_identity）：坏 ID 当没读到，绝不报错；page_url 只留 origin + path。 */
@@ -318,42 +371,107 @@ export function createFakeServer(opts = {}) {
     return null;
   };
 
+  /** 输入：尝试、结算页事实 → 输出：护栏裁决（真实服务端 guard.evaluate 的形状与次序），按任务与账号**当前**的值判。
+   *  checks 里 ok 为 true（通过）/ false（不通过）/ null（缺数据无法判定，由 data 检查拦截）；code 是按 CHECK_ORDER
+   *  第一个不通过的检查的拦截码。 */
   function guardEval(a, facts) {
     const t = taskOf(a);
     const acc = accountOf(runOf(a.run_id));
-    const checks = [];
-    const fail = (code, reason) => checks.push({ code, ok: false, reason });
-    // buyer：把「谁在下单」钉在下单那一页。没读到 → 数据不可靠；不是批次账号登记的 ID → 拦截。
-    const buyer = typeof facts.customer_id === "string" && CUSTOMER_ID_RE.test(facts.customer_id.trim().toUpperCase()) ? facts.customer_id.trim().toUpperCase() : null;
-    if (buyer === null) fail("DATA_UNRELIABLE", "结算页没有读到买家号 ID");
-    else if (buyer !== acc.amazon_customer_id) fail("IDENTITY_MISMATCH", `结算页登录的买家号（${buyer}）不是这个批次的买家号（${acc.amazon_customer_id}）`);
-    const items = Array.isArray(facts.items) ? facts.items : [];
-    if (items.length !== 1 || items[0].asin !== t.asin || items[0].quantity !== t.quantity) fail("ITEM_MISMATCH", "商品或数量不符");
-    const zip = String(facts.ship_to?.postal_code ?? "").slice(0, 5);
-    if (zip !== String(t.postal_code).slice(0, 5)) fail("ZIP_MISMATCH", "邮编不符");
-    const sub = cents(facts.subtotal);
-    const total = cents(facts.total);
-    if (sub === null || total === null || facts.currency !== "USD") fail("DATA_UNRELIABLE", "金额不可解析或币种不是 USD");
-    if (sub !== null && (sub < cents(acc.min_amount) || (acc.max_amount !== null && sub > cents(acc.max_amount)))) {
-      fail("SUBTOTAL_OUT_OF_RANGE", "商品小计不在区间内");
+    const f = facts && typeof facts === "object" ? facts : {};
+    const checks = {};
+    const reasons = {};
+    const problems = [];
+    // buyer：把「谁在下单」钉在下单那一页。没读到 → 数据不可靠；不是批次账号登记的 ID（或账号没登记 ID）→ 拦截。
+    const expBuyer = buyerId(acc.amazon_customer_id);
+    const actBuyer = buyerId(f.customer_id);
+    if (actBuyer === null) {
+      checks.buyer = { ok: null, expected: expBuyer, actual: null };
+      problems.push("结算页没有读到买家号 ID");
+    } else if (expBuyer === null) {
+      checks.buyer = { ok: false, expected: null, actual: actBuyer };
+      reasons.buyer = "这个批次的账号没有登记买家号 ID，不能放行";
+    } else {
+      checks.buyer = { ok: actBuyer === expBuyer, expected: expBuyer, actual: actBuyer };
+      if (actBuyer !== expBuyer) reasons.buyer = `结算页登录的买家号（${actBuyer}）不是这个批次的买家号（${expBuyer}）`;
     }
-    const gift = cents(facts.gift_card_amount) ?? 0;
-    if (total !== null && total + gift > cents(t.price_cap)) fail("PRICE_OVER_CAP", `总额 ${facts.total} 超过限价 ${t.price_cap}`);
+    const items = Array.isArray(f.items) ? f.items : [];
+    const itemOk = items.length === 1 && items[0].asin === t.asin && items[0].quantity === t.quantity;
+    checks.item = { ok: itemOk, expected: { asin: t.asin, quantity: t.quantity }, actual: items.length === 1 ? items[0] : items };
+    if (!itemOk) reasons.item = "商品或数量不符";
+    const zip = String(f.ship_to?.postal_code ?? "").slice(0, 5);
+    const expZip = String(t.postal_code).slice(0, 5);
+    checks.zip = { ok: zip === expZip, expected: expZip, actual: zip || null };
+    if (zip !== expZip) reasons.zip = "邮编不符";
+    const sub = cents(f.subtotal);
+    const total = cents(f.total);
+    if (sub === null) problems.push("商品小计读取不到或格式不对");
+    if (total === null) problems.push("结算总额读取不到或格式不对");
+    const range = { min: acc.min_amount, max: acc.max_amount };
+    if (sub === null) {
+      checks.subtotal = { ok: null, expected: range, actual: null };
+    } else {
+      const ok = sub >= cents(acc.min_amount) && (acc.max_amount === null || sub <= cents(acc.max_amount));
+      checks.subtotal = { ok, expected: range, actual: money2(sub) };
+      if (!ok) reasons.subtotal = "商品小计不在区间内";
+    }
+    const totalForCap = total === null ? null : total + Math.abs(cents(f.gift_card_amount) ?? 0);
+    if (totalForCap === null) {
+      checks.price_cap = { ok: null, expected: t.price_cap, actual: null };
+    } else {
+      const ok = totalForCap <= cents(t.price_cap);
+      checks.price_cap = { ok, expected: t.price_cap, actual: money2(totalForCap) };
+      if (!ok) reasons.price_cap = `总额 ${f.total} 超过限价 ${t.price_cap}`;
+    }
     let days = null;
-    if (facts.delivery?.date) days = daysBetween(laDate(clock), facts.delivery.date);
-    else if (Number.isInteger(facts.delivery?.days)) days = facts.delivery.days;
-    if (days === null) fail("DATA_UNRELIABLE", "配送天数不可得");
-    else if (days > acc.max_delivery_days) fail("DELIVERY_TOO_LONG", `配送 ${days} 天超过上限 ${acc.max_delivery_days} 天`);
-    if (acc.expected_card_last4 && facts.card_last4 !== acc.expected_card_last4) fail("CARD_MISMATCH", "卡尾号不符");
-    const order = ["IDENTITY_MISMATCH", "ITEM_MISMATCH", "ZIP_MISMATCH", "SUBTOTAL_OUT_OF_RANGE", "PRICE_OVER_CAP", "DELIVERY_TOO_LONG", "DATA_UNRELIABLE", "CARD_MISMATCH"];
-    const first = order.find((c) => checks.some((x) => x.code === c)) ?? null;
-    return { verdict: first ? "block" : "pass", code: first, reasons: checks.map((c) => c.reason), checks };
+    if (f.delivery?.date) days = daysBetween(laDate(clock), f.delivery.date);
+    else if (Number.isInteger(f.delivery?.days)) days = f.delivery.days;
+    if (days !== null && days < 0) {
+      days = null;
+      problems.push("预计送达日期早于今天，读取不可靠");
+    } else if (days === null) {
+      problems.push("读取不到预计送达日期或天数");
+    }
+    if (days === null) {
+      checks.delivery = { ok: null, expected: acc.max_delivery_days, actual: null };
+    } else {
+      const ok = days <= acc.max_delivery_days;
+      checks.delivery = { ok, expected: acc.max_delivery_days, actual: days };
+      if (!ok) reasons.delivery = `配送 ${days} 天超过上限 ${acc.max_delivery_days} 天`;
+    }
+    if (f.currency !== "USD") problems.push(`币种不是 USD（${typeof f.currency === "string" && f.currency ? f.currency : "读取不到"}）`);
+    checks.data = { ok: problems.length === 0, expected: "USD；小计、总额可解析；配送天数可得；读到买家号 ID", actual: problems };
+    if (problems.length) reasons.data = `结算数据不可靠：${problems.join("；")}`;
+    const card = typeof f.card_last4 === "string" && f.card_last4 ? f.card_last4 : null;
+    if (acc.expected_card_last4) {
+      checks.card = { ok: card === acc.expected_card_last4, expected: acc.expected_card_last4, actual: card };
+      if (card !== acc.expected_card_last4) reasons.card = "卡尾号不符";
+    } else {
+      checks.card = { ok: true, expected: null, actual: card };
+    }
+    const passed = CHECK_ORDER.every(([name]) => checks[name].ok === true);
+    const code = passed ? null : (CHECK_ORDER.find(([name]) => checks[name].ok === false)?.[1] ?? "DATA_UNRELIABLE");
+    return {
+      verdict: passed ? "pass" : "block",
+      code,
+      reasons: CHECK_ORDER.filter(([name]) => name in reasons).map(([name]) => reasons[name]),
+      checks,
+      delivery_days: days,
+      total_for_cap: money2(totalForCap),
+      fulfillment: typeof f.fulfillment === "string" && f.fulfillment ? f.fulfillment : null,
+    };
   }
 
   function finishAttempt(a, status, fields = {}) {
     Object.assign(a, fields);
     a.status = status;
     a.finished_at = clock;
+  }
+
+  /** 批次统计（真实服务端 _bump：execution_runs.stats[key] += 1）。 */
+  function bump(run, key) {
+    if (!run) return;
+    run.stats = run.stats ?? {};
+    run.stats[key] = (run.stats[key] ?? 0) + 1;
   }
 
   /** 尝试被迫结束（结束批次、清扫）：已登记 → unknown + 暂停；否则 aborted、任务回已分配。 */
@@ -365,10 +483,40 @@ export function createFakeServer(opts = {}) {
       const acc = accountOf(runOf(a.run_id));
       acc.execution_paused = true;
       acc.pause_reason = "结果待核实";
+      bump(runOf(a.run_id), "unknown");
     } else {
       finishAttempt(a, "aborted", { error_detail: cause });
       release(t);
+      bump(runOf(a.run_id), "aborted");
     }
+  }
+
+  /** 结束批次（真实服务端 end_run）：它的在途尝试按租约过期同样处理；已经结束的批次不重复处理。 */
+  function endRun(run, endReason, cause = END_REASON_ZH[endReason] ?? "执行批次已结束") {
+    if (run.ended) return;
+    for (const a of state.attempts.values()) {
+      if (a.run_id === run.id && IN_FLIGHT.has(a.status)) settleInflight(a, cause);
+    }
+    run.ended = true;
+    run.ended_at = clock;
+    run.end_reason = endReason;
+  }
+
+  /** 护栏 buyer 项拦截的落地（真实服务端 execution._buyer_blocked；护栏判定与提交登记复核两处共用）。
+   *  结算页上要下单的不是这个批次的买家号：不是任务的问题，也不是账号的问题，按**中止类**处理 ——
+   *    · 尝试 → aborted（error_code = IDENTITY_MISMATCH，error_detail 为裁决的原因；未登记提交，不占额度）；
+   *    · 任务回已分配、保留分配（上游已取消 → cancelled；领取后的来源变化照样落到任务上）；不进异常、不暂停账号；
+   *    · 同一个事务里把批次结束（end_reason = identity_mismatch），批次统计记 aborted（不是 blocked）——
+   *      否则只要浏览器上报的登录状态没变，同一批次会立刻再领到同一笔。
+   *  at：'guard' = 护栏判定处，'submitting' = 提交登记前的复核处。 */
+  function buyerBlocked(a, t, run, verdict, at) {
+    const zh = END_REASON_ZH[BUYER_BLOCK_END_REASON];
+    const why = verdict.reasons[0] ?? zh;
+    finishAttempt(a, "aborted", { error_code: BUYER_BLOCK_CODE, error_detail: verdict.reasons.join("；") || zh, stage: at === "guard" ? "guard" : "submitting", blocked_at: at });
+    release(t);
+    if (t.status === "assigned") t.status_reason = `${why}，未提交前中止，任务保留待重新领取`;
+    bump(run, "aborted");
+    endRun(run, BUYER_BLOCK_END_REASON, zh);
   }
 
   /** 输入：尝试、上报体 → 输出：尝试应有的结局（真实服务端 _target_status）。 */
@@ -455,7 +603,8 @@ export function createFakeServer(opts = {}) {
     }
     const run = {
       id: state.nextRunId++, trigger: body.trigger, account_id: acc.id, device_id: dev.id, customer_id: cid, scheduled_slot: slot, bj_date: bjDate(clock),
-      started_at: clock, lease_until: clock + leaseTtlS * 1000, ended: false, stop: false, stop_reason: null, end_reason: null, finish_detail: null, beats: 0,
+      started_at: clock, lease_until: clock + leaseTtlS * 1000, ended: false, ended_at: null, stop: false, stop_reason: null, end_reason: null,
+      plugin_reason: null, finish_detail: null, beats: 0, stats: {},
     };
     state.runs.set(run.id, run);
     return json(200, { run_id: run.id, lease_ttl_s: leaseTtlS, lease_expires_at: iso(run.lease_until), account: { id: acc.id, name: acc.name } });
@@ -496,20 +645,40 @@ export function createFakeServer(opts = {}) {
       if (sr !== null) return json(200, { attempt: null, reason: `${identityProblem(dev, acc)}，停止领取` });
       if (identityStale(dev)) return json(200, { attempt: null, reason: `${STALE_TEXT}，停止领取（请打开或刷新亚马逊页面后重新开始）` });
       if (hooks.beforeClaim) { const r = hooks.beforeClaim(state); if (r) return json(200, r); }
+      // 领取时复核来源指定（真实服务端 designation.off_target）：来源指定的买家号已经不是这个账号 → 解除分配回待分配、跳过
+      let redesignated = 0;
+      for (const x of state.tasks) {
+        if (x.account_id === acc.id && x.status === "assigned" && !x.cancelled && !x.hold && !x.future && x.off_target) {
+          x.status = "queued";
+          x.account_id = null;
+          x.status_reason = `来源指定的买家号已不是账号 ${acc.name}，领取时解除分配`;
+          redesignated += 1;
+        }
+      }
       const t = state.tasks.find((x) => x.account_id === acc.id && x.status === "assigned" && !x.cancelled && !x.hold && !x.future);
-      if (!t) return json(200, { attempt: null, reason: "今天没有可执行的任务" });
+      if (!t) {
+        const extras = [];
+        const future = state.tasks.filter((x) => x.account_id === acc.id && x.status === "assigned" && !x.cancelled && x.future).length;
+        if (future) extras.push(`另有 ${future} 笔建议采购日期在未来`);
+        if (redesignated) extras.push(`${redesignated} 笔来源指定的买家号已不是本账号、已解除分配`);
+        return json(200, { attempt: null, reason: `今天没有可执行的任务${extras.length ? `（${extras.join("，")}）` : ""}` });
+      }
       t.status = "executing";
-      const a = { id: state.nextAttemptId++, task_id: t.id, run_id: run.id, status: "claimed", submitted_at: null, guard: null, guards: 0, submits: 0, results: [] };
+      const a = { id: state.nextAttemptId++, task_id: t.id, run_id: run.id, attempt_no: [...state.attempts.values()].filter((x) => x.task_id === t.id).length + 1, status: "claimed", submitted_at: null, guard: null, guard_input: null, guards: 0, submits: 0, results: [] };
       state.attempts.set(a.id, a);
+      bump(run, "claimed");
       if (hooks.afterClaim) hooks.afterClaim(t, a, state);
       return json(200, {
+        // 载荷照真实服务端 execution._payload（插件用到的那些键）：里面没有分配方式，也没有来源指定的买家号
         attempt: {
-          attempt_id: a.id, upstream_order_no: t.upstream_order_no, asin: t.asin, quantity: t.quantity,
+          attempt_id: a.id, attempt_no: a.attempt_no, kind: "auto", order_id: t.id,
+          upstream_order_no: t.upstream_order_no, asin: t.asin, quantity: t.quantity,
           unit_price: t.unit_price, price_cap: t.price_cap, max_delivery_days: acc.max_delivery_days,
           amount_range: { min: acc.min_amount, max: acc.max_amount },
           recipient_name: "Demo Buyer", address1: "1 Demo Way", address2: null, city: "Demo City", state: "FL",
           postal_code: t.postal_code, phone: "000-000-0000", country: "US",
           expected_card_last4: acc.expected_card_last4, simulated: t.simulated ?? true,
+          account: { id: acc.id, name: acc.name },
         },
         reason: null,
       });
@@ -517,13 +686,11 @@ export function createFakeServer(opts = {}) {
     if ((m = /^\/plugin\/v1\/runs\/(\d+)\/finish$/.exec(path))) {
       const run = runOf(m[1]);
       if (!runActive(run)) return leaseLost(run);
-      run.ended = true;
-      run.end_reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 64) : "finished";
+      // end_reason 是封闭取值：插件结束的批次恒为 finished；插件给的短码另记（真实服务端记进 run.ended 事件的 plugin_reason）
+      run.plugin_reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 64) : "finished";
       run.finish_detail = pluginDetail(body.detail);
-      for (const a of state.attempts.values()) {
-        if (a.run_id === run.id && IN_FLIGHT.has(a.status)) settleInflight(a, "插件结束了执行批次");
-      }
-      return json(200, { run_id: run.id, end_reason: run.end_reason });
+      endRun(run, "finished", "插件结束了执行批次");
+      return json(200, { run_id: run.id, ended_at: iso(run.ended_at), end_reason: run.end_reason, stats: run.stats ?? {} });
     }
 
     if ((m = /^\/plugin\/v1\/attempts\/(\d+)\/(progress|guard|submitting|verifying|result)$/.exec(path))) {
@@ -557,15 +724,20 @@ export function createFakeServer(opts = {}) {
         a.guards += 1;
         if (a.status === "submitting" || a.status === "verifying") return err(409, "CONFLICT", "已登记提交，不能再次做护栏判定", { attempt_status: a.status });
         if (!PRE_SUBMIT.has(a.status)) return err(409, "CONFLICT", `本次采购尝试已结束（${STATUS_ZH[a.status]}）`, { attempt_status: a.status });
+        a.guard_input = body; // 存下的结算事实：提交登记时按最新配置再复核一次
         a.guard = guardEval(a, body);
         if (a.guard.verdict === "pass") {
           a.status = "guard_passed";
           if (hooks.afterGuard) hooks.afterGuard(t, a, state);
+        } else if (a.guard.code === BUYER_BLOCK_CODE) {
+          // buyer 项拦截：中止类，服务端同时把批次结束。答复照旧是 200 的拦截裁决，形状不变（没有 run_ended 之类的键）。
+          buyerBlocked(a, t, run, a.guard, "guard");
         } else {
-          // 拦截：尝试结束为 failed（错误码 = 拦截码），任务转异常 —— 和真实服务端一样，不等插件上报。
+          // 一般的拦截：尝试结束为 failed（错误码 = 拦截码），任务转异常 —— 和真实服务端一样，不等插件上报；批次继续。
           finishAttempt(a, "failed", { error_code: a.guard.code });
           t.status = t.cancelled ? "cancelled" : "exception";
           t.status_reason = a.guard.code;
+          bump(run, "blocked");
         }
         return json(200, a.guard);
       }
@@ -586,11 +758,27 @@ export function createFakeServer(opts = {}) {
         if (t.drift) return err(409, "SOURCE_CHANGED", `${t.drift.text}，不能提交`, { fields: t.drift.fields ?? [], review: false, external: false });
         const refused = hooks.submitRefusal ? hooks.submitRefusal(a, t) : null;
         if (refused) return err(409, refused.code ?? "CONFLICT", refused.message, refused.detail ?? {});
-        // recheck 钩子返回拦截码（字符串），或 {code: null} 模拟服务端没给 block_code
-        const recheck = hooks.recheck ? hooks.recheck(a, t) : null;
-        if (recheck) {
-          const code = typeof recheck === "string" ? recheck : recheck.code ?? null;
-          return err(409, "GUARD_BLOCKED", `按最新配置复核护栏未通过：${code ?? "护栏拦截"}，不能提交`, code ? { block_code: code, reasons: [code] } : { reasons: [] });
+        // 按最新配置（账号**当前**登记的买家号 ID、金额区间、配送上限、卡尾号、任务限价、站点今天）对存下的结算事实复核护栏。
+        // recheck 钩子直接指定复核的结论：返回拦截码（字符串），或 {code: null} 模拟服务端没给 block_code。
+        let recheck = guardEval(a, a.guard_input ?? {});
+        const forced = hooks.recheck ? hooks.recheck(a, t) : null;
+        if (forced) {
+          const code = typeof forced === "string" ? forced : forced.code ?? null;
+          recheck = { verdict: "block", code, reasons: code ? [code] : [] };
+        }
+        if (recheck.verdict !== "pass") {
+          const message = `按最新配置复核护栏未通过：${recheck.reasons[0] ?? "护栏拦截"}，不能提交`;
+          if (recheck.code === BUYER_BLOCK_CODE) {
+            // 唯一会改状态的拒绝：存下的结算页买家号 ID 已不是批次账号当前登记的 ID。和护栏判定处同样落地
+            // （尝试 aborted、任务回已分配、批次结束），照样回 409 —— 真实服务端这里不抛异常、事务照常提交。
+            a.guard = recheck;
+            buyerBlocked(a, t, run, recheck, "submitting");
+            return err(409, "GUARD_BLOCKED", message, {
+              block_code: recheck.code, reasons: recheck.reasons, attempt_status: a.status, order_status: t.status,
+              run_ended: true, end_reason: BUYER_BLOCK_END_REASON,
+            });
+          }
+          return err(409, "GUARD_BLOCKED", message, recheck.code ? { block_code: recheck.code, reasons: recheck.reasons } : { reasons: [] });
         }
         a.submitted_at = clock;
         a.status = "submitting";
@@ -618,16 +806,19 @@ export function createFakeServer(opts = {}) {
       if (!a.submitted_at && !runActive(run)) return leaseLost(run);
       if (target === "succeeded") {
         finishAttempt(a, "succeeded", { amazon_order_no: body.amazon_order_no }); t.status = "purchased";
+        bump(run, "succeeded");
         return json(200, { attempt_status: "succeeded", order_status: t.status });
       }
       if (target === "unknown") {
         finishAttempt(a, "unknown", { error_code: body.error_code ?? null }); t.status = "result_unknown";
         acc.execution_paused = true; acc.pause_reason = "结果待核实";
+        bump(run, "unknown");
         return json(200, { attempt_status: "unknown", order_status: t.status });
       }
       if (target === "aborted") {
         // 中止类（ABORTED_*）：任务回到已分配、再按来源变化重新定状态；不暂停账号、不占额度
         finishAttempt(a, "aborted", { error_code: body.error_code }); release(t);
+        bump(run, "aborted");
         return json(200, { attempt_status: "aborted", order_status: t.status });
       }
       const category = categories[body.error_code ?? ""] ?? "task";
@@ -640,6 +831,7 @@ export function createFakeServer(opts = {}) {
       } else {
         t.status = "exception"; t.status_reason = body.error_code;
       }
+      bump(run, "failed");
       return json(200, { attempt_status: "failed", order_status: t.status });
     }
     return err(404, "NOT_FOUND", "Not Found");

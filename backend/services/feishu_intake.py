@@ -20,6 +20,12 @@
   人审未通过），跳过的计 skipped 并写明原因；其余 ingest 新建。已有的单把准入规则一并交给 ingest（采购方移走、
   采购状态变为已拍单 / 拿回 → 开始前转待核实）。
 - 连接的写回验收测试记录（writeback_test_record）一律 skipped：验收写进去的测试值不能被当成订单结果接收。
+- **来源表里找不到买家号列**（字段对应给「买家号」「买家号 ID」配了列，而列已被改名或删除）：这次读取对来源指定不表态
+  （每条记录 SourceRef.buyer_readable=False：既不设置也不清除任务上的指定，来源关联里保留上次读到的买家号），并在
+  读取结果的 problems 最前面加一条 {record_id: None, upstream_order_no: BUYER_COLUMNS_LABEL, verdict: 'skipped',
+  reason, scope: 'connection'}（不计入 skipped 统计）。
+- **字段对应里「买家号」「买家号 ID」都没配列**（连接不读买家号，或所有者取消了对应）：同样不表态，但不报问题
+  （这是所有者自己的设置）。要清掉一笔任务的指定，得在对应着的列里把格子清空。
 
 来源快照 = 本次读到的已对应列（列名 → 可读值）。本模块不 commit。
 """
@@ -43,6 +49,8 @@ STAT_KEYS = ("read", "new", "update", "unchanged", "conflict", "historical", "sk
 TRIGGERS = ("schedule", "manual")
 #: 读取记录里保留的问题行样本条数
 PROBLEM_SAMPLES = 100
+#: 「来源表里找不到买家号列」这条连接级问题在 problems 里占 upstream_order_no 的位置（控制台按「谁：结论，原因」显示）
+BUYER_COLUMNS_LABEL = "买家号列"
 _LOCK_NS = feishu_connections.INTAKE_LOCK_NS   # 同一连接同一时刻只有一次读取（写回验收也持有它）
 
 
@@ -65,17 +73,28 @@ def _normalize_one(rec: dict[str, Any], field_map: dict[str, Any], field_types: 
             f"记录内容无法解析（{type(exc).__name__}）"
 
 
+def buyer_columns_problem(field_map: dict[str, Any], field_types: dict[str, int]) -> str | None:
+    """输入：字段对应、来源表的列类型 → 输出：来源表里找不到买家号列时的问题文案；都在（或没配）→ None。"""
+    missing = feishu_fields.missing_buyer_columns(field_map, field_types)
+    if not missing:
+        return None
+    return f"来源表里找不到买家号列{'、'.join(f'「{c}」' for c in missing)}，本次没有更新指定"
+
+
 def evaluate_records(conn, workspace_id: int, connection_id: int, records: list[dict[str, Any]],
                      field_map: dict[str, Any], field_types: dict[str, int], admission: dict[str, Any], *,
-                     dry_run: bool, skip_record_ids: set[str] | frozenset[str] | None = None) -> list[dict[str, Any]]:
+                     dry_run: bool, skip_record_ids: set[str] | frozenset[str] | None = None,
+                     buyer_readable: bool | None = None) -> list[dict[str, Any]]:
     """输入：工作区、连接 id（预览可为占位 id）、records/search 的记录 [{record_id, fields}]、字段对应、列类型、准入规则、
-    是否只预演、要跳过的记录 id（写回验收测试记录）→ 输出：每条记录一个
-    {record_id, upstream_order_no, verdict, reason, record, issues, status, order_id}。
+    是否只预演、要跳过的记录 id（写回验收测试记录）、这次是否读得到买家号两列（None = 按字段对应与列类型现算）
+    → 输出：每条记录一个 {record_id, upstream_order_no, verdict, reason, record, issues, status, order_id}。
 
     verdict 取 new / update / unchanged / conflict / historical / skipped / invalid。dry_run=True 时不写库。
     每条记录的规范化与 ingest 各自兜底：任何异常只让这一条成为 invalid（写明原因），其余照常。
     """
     skip_ids = set(skip_record_ids or ())
+    if buyer_readable is None:
+        buyer_readable = feishu_fields.buyer_columns_readable(field_map, field_types)
     normalized = [_normalize_one(rec, field_map, field_types, admission) for rec in records]
     items: list[tuple[dict[str, Any], UpstreamRecord]] = [(rec, n[0]) for rec, n in zip(records, normalized)]
     broken = {i: n[1] for i, n in enumerate(normalized) if n[1]}
@@ -134,15 +153,16 @@ def evaluate_records(conn, workspace_id: int, connection_id: int, records: list[
                 continue
         snapshot = feishu_fields.snapshot_fields(rec.get("fields") or {}, field_types)
         link = links.get(rid)
+        src = SourceRef(kind="feishu", snapshot=snapshot, connection_id=connection_id, record_id=rid,
+                        buyer_readable=buyer_readable)
         if (not dry_run and link is not None and link["upstream_order_no"] == key
-                and link["normalized"] == r.to_json()):
-            # 与上次读到的规范化记录完全相同：ingest 的结论必然是 unchanged。直接记 last_seen_at，
-            # 不再逐条锁任务行（大表定时读取时不挡插件领取）。
+                and link["normalized"] == orders.link_normalized(r, src, link)):
+            # 与上次读到的规范化记录完全相同（读不到买家号列时，这两个字段按上次读到的算）：ingest 的结论必然是
+            # unchanged。直接记 last_seen_at，不再逐条锁任务行（大表定时读取时不挡插件领取）。
             seen_unchanged.append((Jsonb(snapshot), clock.now(), link["id"], workspace_id))
             out.append({**base, "verdict": "unchanged", "reason": None, "status": link["status"],
                         "order_id": link["purchase_order_id"]})
             continue
-        src = SourceRef(kind="feishu", snapshot=snapshot, connection_id=connection_id, record_id=rid)
         try:
             with conn.transaction():
                 outcome = orders.ingest(conn, workspace_id, r, src, dry_run=dry_run, admission=admission)
@@ -215,10 +235,12 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
 
     admission = feishu_connections.clean_admission(row["admission"])
     skip = {row["writeback_test_record"]} if row.get("writeback_test_record") else set()
+    buyer_problem = buyer_columns_problem(field_map, types)
     try:
         with conn.transaction():
             results = evaluate_records(conn, workspace_id, cid, records, field_map, types, admission, dry_run=False,
-                                       skip_record_ids=skip)
+                                       skip_record_ids=skip,
+                                       buyer_readable=feishu_fields.buyer_columns_readable(field_map, types))
     except Exception as exc:  # noqa: BLE001 - 接收阶段的意外异常：记失败（调用方提交），不让连接每 30 秒重读
         log.exception("飞书连接 %s 接收记录时出错", cid)
         msg = f"接收飞书记录时出错（{type(exc).__name__}），本次读取未写入任何任务"
@@ -226,6 +248,10 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
         raise DomainError("INTERNAL", msg, 500, {"run_id": run_id, "connection_id": cid}) from exc
     stats = empty_stats()
     problems: list[dict[str, Any]] = []
+    if buyer_problem is not None:
+        # 没读到不等于清空：这次读取没有动任何任务的来源指定，要让所有者看到
+        problems.append({"record_id": None, "upstream_order_no": BUYER_COLUMNS_LABEL, "verdict": "skipped",
+                         "reason": buyer_problem, "scope": "connection"})
     for r in results:
         stats["read"] += 1
         stats[r["verdict"]] += 1

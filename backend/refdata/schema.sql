@@ -242,9 +242,13 @@ CREATE TABLE IF NOT EXISTS procure.purchase_orders (
     attention_note           text,
     primary_source_kind      text NOT NULL CHECK (primary_source_kind IN ('feishu', 'file')),
     assigned_account_id      bigint REFERENCES procure.buyer_accounts(id),
-    assignment_kind          text CHECK (assignment_kind IN ('auto', 'manual')),
+    assignment_kind          text CHECK (assignment_kind IN ('auto', 'manual', 'source')),  -- source = 按来源指定的买家号
     assigned_at              timestamptz,
     assignment_note          text,
+    -- 来源指定的买家号（清洗后的值；都为 NULL = 没指定，由系统自动分配）。不加形状约束：格式不对的值也要能存下，
+    -- 由分配给出「待分配」的原因。解除分配、同意重采、清除模拟结果都不动这两列。
+    designated_customer_id   text,
+    designated_buyer_name    text,
     page_load_retries        integer NOT NULL DEFAULT 0,      -- 提交前页面错误的自动重试次数
     current_attempt_id       bigint,
     purchased_attempt_id     bigint,
@@ -298,7 +302,7 @@ CREATE TABLE IF NOT EXISTS procure.execution_runs (
     heartbeat_at      timestamptz NOT NULL DEFAULT now(),
     lease_expires_at  timestamptz NOT NULL,
     ended_at          timestamptz,
-    end_reason        text,                                   -- finished / lease_expired / simulation_reset（历史行可能有 device_revoked）
+    end_reason        text,                                   -- finished / lease_expired / simulation_reset / identity_mismatch（历史行可能有 device_revoked）
     stats             jsonb NOT NULL DEFAULT '{}',
     bj_date           date NOT NULL,                          -- 开始批次时的北京日期（定时时间点按它去重）
     scheduled_slot    text CHECK (scheduled_slot IS NULL OR scheduled_slot ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$')
@@ -407,9 +411,9 @@ CREATE TABLE IF NOT EXISTS procure.allocation_runs (
     trigger       text NOT NULL,                              -- intake / import / manual / account_change / daily
     bj_date       date NOT NULL,
     at            timestamptz NOT NULL DEFAULT now(),
-    stats         jsonb NOT NULL,                             -- {considered, assigned, coverage, fill, unassigned}
+    stats         jsonb NOT NULL,                             -- {considered, assigned, coverage, fill, designated, unassigned}
     uncovered     jsonb NOT NULL DEFAULT '[]',                -- [{account_id, name, date, reason}]
-    unassigned    jsonb NOT NULL DEFAULT '[]'                 -- [{order_id, upstream_order_no, reason}]
+    unassigned    jsonb NOT NULL DEFAULT '[]'                 -- [{order_id, upstream_order_no, reason, designated?}]
 );
 
 CREATE TABLE IF NOT EXISTS procure.events (
@@ -575,3 +579,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_one_active_per_device
 CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_slot_once
     ON procure.execution_runs (account_id, bj_date, scheduled_slot)
     WHERE trigger = 'scheduled' AND scheduled_slot IS NOT NULL AND (ended_at IS NULL OR end_reason = 'finished');
+
+-- ── 追加（幂等）：来源指定买家号——任务上存来源指定的两列，分配方式多一种 'source' ──────────────────────
+-- 旧库升级：① 加两列；② 把 assignment_kind 的 CHECK 换成三个取值。表上另有一条表级约束也提到 assignment_kind
+-- （(assigned_account_id IS NULL) = (assignment_kind IS NULL)，自动名 purchase_orders_check），所以这里只按**确切名字**
+-- purchase_orders_assignment_kind_check 处理，并以同名重建（升级后的库与新库的约束名、定义完全一致）；定义里已有
+-- 'source' 就什么都不做，重复执行不重建、不重新校验全表。旧任务的指定由 python cli.py db_init 在加列的那一次回填
+-- （workflows/db_init：只在这两列第一次加上时做）。
+ALTER TABLE procure.purchase_orders ADD COLUMN IF NOT EXISTS designated_customer_id text;
+ALTER TABLE procure.purchase_orders ADD COLUMN IF NOT EXISTS designated_buyer_name text;
+DO $$
+DECLARE
+    def text;
+BEGIN
+    SELECT pg_get_constraintdef(c.oid) INTO def FROM pg_constraint c
+    WHERE c.conrelid = 'procure.purchase_orders'::regclass AND c.conname = 'purchase_orders_assignment_kind_check';
+    IF def IS NOT NULL AND position('''source''' IN def) > 0 THEN
+        RETURN;
+    END IF;
+    ALTER TABLE procure.purchase_orders DROP CONSTRAINT IF EXISTS purchase_orders_assignment_kind_check;
+    ALTER TABLE procure.purchase_orders ADD CONSTRAINT purchase_orders_assignment_kind_check
+        CHECK (assignment_kind IN ('auto', 'manual', 'source'));
+END $$;

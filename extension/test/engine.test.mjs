@@ -1,6 +1,7 @@
 /** 模拟执行引擎对着内存假服务端（契约 §5，边角路径照 backend/services/execution.py）整条跑：
  *  正常、护栏拦截、提交后结果不明（只登记一次）、上游取消、账号占用、断网中断、
- *  结果重发与租约预算、登记响应丢失后浏览器重发、护栏响应丢失后重发、服务端要求中止的原因码等路径。 */
+ *  结果重发与租约预算、登记响应丢失后浏览器重发、护栏响应丢失后重发、服务端要求中止的原因码、
+ *  护栏 buyer 项拦截（服务端自己中止这一笔并结束批次：不上报结果、不调用结束批次）等路径。 */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -8,7 +9,8 @@ import assert from "node:assert/strict";
 import { PluginClient } from "../build/core/client.js";
 import { BUYER_CHANGED_TEXT } from "../build/core/codes.js";
 import { RunEngine, describeStartError } from "../build/core/engine.js";
-import { DEMO_CID, DEMO_TOKEN, OTHER_CID, createFakeServer } from "./fake-server.mjs";
+import { buildCheckoutFacts, failureResult } from "../build/core/simulate.js";
+import { DEMO_CID, DEMO_TOKEN, END_REASON_ZH, OTHER_CID, createFakeServer } from "./fake-server.mjs";
 
 /** 演示账号登记的买家号 ID：引擎开始批次时带上它（浏览器里是当前页面读到的那个）。 */
 const CID = DEMO_CID;
@@ -37,7 +39,8 @@ function setup({ outcome = "pass", server = {}, engine = {}, wrapFetch = null } 
     page.ident = ident;
     srv.setLogin(ident);
   };
-  const eng = new RunEngine({
+  /** 同一个假服务端、同一页上再起一个引擎（一个引擎只跑一个批次；重新开始批次就是再起一个）。 */
+  const newEngine = () => new RunEngine({
     api,
     outcome,
     now: srv.now,
@@ -53,7 +56,8 @@ function setup({ outcome = "pass", server = {}, engine = {}, wrapFetch = null } 
     readCustomerId: () => (page.ident.signed_in ? page.ident.customer_id : null),
     ...engine,
   });
-  return { srv, eng, logs, views, api, page, switchBuyer };
+  const eng = newEngine();
+  return { srv, eng, logs, views, api, page, switchBuyer, newEngine };
 }
 
 const IDENT = { signed_in: true, customer_id: DEMO_CID, site: "US", page_url: "https://www.amazon.com/gp/css/order-history", conflict: false };
@@ -564,25 +568,280 @@ test("执行中换了买家号（进度 cancel_code IDENTITY_MISMATCH）：这�
   assert.equal(s.status, "finished");
 });
 
-test("执行中换了买家号、服务端还没收到新的上报：护栏的 buyer 项拦下（结算页读到的不是批次的买家号），本批次到此为止，不暂停账号", async () => {
-  // 页面上读到的已经是另一个买家号，但对账后的上报还没到服务端（服务端的登录状态仍是批次的买家号）
-  const ctx = setup({ server: { hooks: { afterProgress: (t, a, state, stage) => { if (stage === "started") ctx.page.ident = { ...IDENT, customer_id: OTHER_CID }; } } } });
-  const { srv, eng, logs } = ctx;
+// ── 护栏 buyer 项拦截（契约 §4 / §5）：服务端按中止类落地，并且自己把批次结束 ──────────────────────
+
+/** 页面上读到的已经是另一个买家号，但对账后的上报还没到服务端（服务端的登录状态仍是批次的买家号）：
+ *  进度照常放行，护栏的 buyer 项在结算事实上把它拦下。只换一次（第一笔开始之后）。 */
+const buyerSwitchedOnPage = (extra = {}) => {
+  let switched = false;
+  const ctx = setup({
+    ...extra,
+    server: {
+      ...(extra.server ?? {}),
+      hooks: { afterProgress: (t, a, state, stage) => { if (stage === "started" && !switched) { switched = true; ctx.page.ident = { ...IDENT, customer_id: OTHER_CID }; } } },
+    },
+  });
+  return ctx;
+};
+const TALLY_ABORTED_1 = "成功 0，失败 0，拦截 0，待核实 0，中止 1";
+const RUN_ENDED_TEXT = "执行批次已结束（结算页登录的买家号不是这个批次的买家号），请重新开始批次";
+
+test("执行中换了买家号、服务端还没收到新的上报：护栏的 buyer 项拦下 —— 服务端中止这一笔（任务回已分配，不进异常、不暂停账号）并结束批次；插件不上报结果、不调用结束批次，以「买家号变了」结束", async () => {
+  const { srv, eng, logs, views } = buyerSwitchedOnPage();
   const s = await eng.run("manual", CID);
   const g = paths(srv, /\/guard$/);
   assert.equal(g.length, 1);
   assert.equal(g[0].body.customer_id, OTHER_CID, "事实里带的是取事实那一刻读到的买家号 ID，不是开始批次时的");
-  assert.equal(srv.state.attempts.get(7).guard.code, "IDENTITY_MISMATCH");
-  assert.match(srv.state.attempts.get(7).guard.reasons[0], /结算页登录的买家号（A9OTHER00000）不是这个批次的买家号（A1DEMO00000）/);
+  // 服务端的落地：尝试中止（不是失败）、任务回已分配（不是异常）、账号不暂停、批次由服务端结束
+  const a = srv.state.attempts.get(7);
+  assert.equal(a.guard.code, "IDENTITY_MISMATCH");
+  assert.deepEqual(a.guard.checks.buyer, { ok: false, expected: DEMO_CID, actual: OTHER_CID });
+  assert.match(a.guard.reasons[0], /^结算页登录的买家号（A9OTHER00000）不是这个批次的买家号（A1DEMO00000）$/);
+  assert.deepEqual([a.status, a.error_code, a.submitted_at, a.blocked_at], ["aborted", "IDENTITY_MISMATCH", null, "guard"]);
+  assert.deepEqual(srv.state.tasks.map((t) => t.status), ["assigned", "assigned"], "任务回已分配，不进异常；第二笔没有动");
+  assert.match(srv.state.tasks[0].status_reason, /不是这个批次的买家号（A1DEMO00000），未提交前中止，任务保留待重新领取$/);
+  assert.equal(srv.state.account.execution_paused, false, "不暂停账号");
+  const run = srv.state.runs.get(9);
+  assert.deepEqual([run.ended, run.end_reason, run.plugin_reason, run.finish_detail], [true, "identity_mismatch", null, null], "批次是服务端结束的，不是插件");
+  assert.deepEqual(run.stats, { claimed: 1, aborted: 1 }, "批次统计记中止，不记拦截");
+  // 插件：这一笔不上报结果、不登记、不再领取、不调用结束批次、不再续租 —— 护栏是它对这个批次的最后一个请求
   assert.equal(paths(srv, /\/submitting$/).length, 0, "没有登记提交");
-  assert.equal(paths(srv, /\/result$/).length, 0, "护栏拦截时服务端已经结束了这一笔，不再上报");
+  assert.equal(paths(srv, /\/result$/).length, 0, "服务端已经结束了这一笔，不再上报");
   assert.equal(paths(srv, /\/next$/).length, 1, "不再领下一笔");
+  assert.equal(paths(srv, /\/finish$/).length, 0, "服务端已经结束了批次，不再调用结束批次");
+  assert.match(srv.calls.at(-1).path, /\/attempts\/7\/guard$/);
+  assert.ok(srv.calls.every((c) => c.path !== "/plugin/v1/runs/9/heartbeat"));
+  // 结论与文案
   assert.equal(s.status, "finished");
   assert.equal(s.reason, "buyer_changed");
-  assert.equal(s.counts.aborted, 1);
+  assert.equal(s.error, null);
+  assert.deepEqual(s.counts, { attempts: 1, succeeded: 0, failed: 0, blocked: 0, unknown: 0, aborted: 1 });
+  assert.equal(s.message, `执行批次 #9 已结束：${BUYER_CHANGED_TEXT}（${TALLY_ABORTED_1}）`, "批次以「买家号变了」那一句结束");
+  assert.deepEqual([views.at(-1).phase, views.at(-1).message, views.at(-1).attempt], ["ended", s.message, null], "面板最后显示的就是这一句");
+  assert.ok(views.some((v) => v.message === `${BUYER_CHANGED_TEXT}。`));
+  assert.ok(logs.some((l) => l.level === "warn" && l.text === `尝试 #7：${BUYER_CHANGED_TEXT}（结算页登录的买家号（A9OTHER00000）不是这个批次的买家号（A1DEMO00000）；服务端已结束本批次）`));
+  assert.ok(!logs.some((l) => l.level === "err"), "不是错误");
+  assert.ok(!logs.some((l) => /结束执行批次失败|执行中断|执行权已失效|异常/.test(l.text)), "不报错、不说成中断，也不说任务转异常");
+});
+
+test("护栏 buyer 项拦下之后：这个批次的每一个接口都回「批次已结束」（409 LEASE_LOST，带结束原因），这一笔再报结果按既有规则，都不会再建尝试；重新开始批次马上可以，再领到同一笔", async () => {
+  const ctx = buyerSwitchedOnPage();
+  const { srv, eng, api, page } = ctx;
+  await eng.run("manual", CID);
+  const facts = buildCheckoutFacts({ attempt_id: 7, asin: "B0DEMO0001", quantity: 1, unit_price: "41.97", price_cap: "78.69", max_delivery_days: 10, expected_card_last4: null, raw: { postal_code: "32960" } }, "pass", srv.now(), DEMO_CID);
+  const later = [
+    ["领取", () => api.next(9)],
+    ["批次心跳", () => api.runHeartbeat(9)],
+    ["结束批次", () => api.finishRun(9, "buyer_changed")],
+    ["进度", () => api.progress(7, "before_submit", {})],
+    ["护栏", () => api.guard(7, facts)],
+    ["提交登记", () => api.submitting(7)],
+    ["等待验证", () => api.verifying(7, "")],
+  ];
+  for (const [name, call] of later) {
+    const r = await call();
+    assert.equal(r.ok, false, name);
+    assert.deepEqual([r.error.kind, r.error.status, r.error.code, r.error.message], ["http", 409, "LEASE_LOST", RUN_ENDED_TEXT], name);
+    assert.deepEqual(r.error.detail, { run_id: 9, end_reason: "identity_mismatch" }, name);
+  }
+  assert.equal(RUN_ENDED_TEXT.includes(END_REASON_ZH.identity_mismatch), true);
+  // 这一笔再报结果：报的正是 IDENTITY_MISMATCH 的失败 → 200 duplicate；别的 → 409 CONFLICT
+  const same = await api.result(7, failureResult("failed", "IDENTITY_MISMATCH", "结算页登录的买家号不是这个批次的买家号"));
+  assert.deepEqual(same.data, { attempt_status: "aborted", order_status: "assigned", duplicate: true });
+  const other = await api.result(7, failureResult("failed", "PRICE_OVER_CAP", "结算总额超过限价"));
+  assert.deepEqual([other.error.status, other.error.code, other.error.message], [409, "CONFLICT", "该采购尝试的结果已登记为「已中止」，与本次上报不一致"]);
+  assert.deepEqual(other.error.detail, { attempt_status: "aborted", reported: "failed" });
+  assert.equal(srv.state.attempts.size, 1, "旧批次里没有再建第二笔尝试");
+  assert.deepEqual([srv.state.attempts.get(7).status, srv.state.tasks[0].status, srv.state.account.execution_paused], ["aborted", "assigned", false], "这些请求什么都没改");
+  // 这个浏览器的心跳：没有未结束的批次了
+  const hb = await api.heartbeat(null);
+  assert.deepEqual([hb.data.device_run, hb.data.account.active_run, hb.data.account.execution_paused], [null, null, false]);
+
+  // 登录回批次的买家号后重新开始：不用等租约到期，新批次再领到同一笔（第 2 次尝试），照常买完
+  page.ident = IDENT;
+  const s2 = await ctx.newEngine().run("manual", CID);
+  assert.deepEqual([s2.status, s2.reason, s2.run_id], ["finished", "completed", 10]);
+  assert.deepEqual(s2.counts, { attempts: 2, succeeded: 2, failed: 0, blocked: 0, unknown: 0, aborted: 0 });
+  const a2 = srv.state.attempts.get(8);
+  assert.deepEqual([a2.task_id, a2.attempt_no, a2.run_id, a2.status], [1, 2, 10, "succeeded"]);
+  assert.deepEqual(srv.state.tasks.map((t) => t.status), ["purchased", "purchased"]);
+  assert.deepEqual(srv.state.runs.get(10).stats, { claimed: 2, succeeded: 2 });
+});
+
+test("定时批次被护栏 buyer 项拦下、由服务端结束：不占这个时间点（只有插件正常结束的才占），同一个时间点可以再开始", async () => {
+  const ctx = buyerSwitchedOnPage();
+  const { srv, page } = ctx;
+  const s = await ctx.eng.run("scheduled", CID, undefined, "14:00");
+  assert.deepEqual([s.status, s.reason, s.trigger], ["finished", "buyer_changed", "scheduled"]);
+  const run = srv.state.runs.get(9);
+  assert.deepEqual([run.trigger, run.scheduled_slot, run.ended, run.end_reason], ["scheduled", "14:00", true, "identity_mismatch"]);
+  page.ident = IDENT;
+  let notice = null;
+  const s2 = await ctx.newEngine().run("scheduled", CID, (n) => { notice = n; }, "14:00");
+  assert.equal(notice.started, true, "不是 SLOT_DONE");
+  assert.deepEqual([s2.status, s2.reason, s2.counts.succeeded], ["finished", "completed", 2]);
+  // 这一次是插件正常结束的：时间点才算执行过
+  let n3 = null;
+  await ctx.newEngine().run("scheduled", CID, (n) => { n3 = n; }, "14:00");
+  assert.deepEqual([n3.started, n3.error.code], [false, "SLOT_DONE"]);
+});
+
+test("护栏 buyer 项拦截的答复丢了、请求被重发（客户端重试，或浏览器在复用的连接上重发）：拿到的是 409 LEASE_LOST（批次已因它结束）—— 同样以「买家号变了」结束，不当成中断", async () => {
+  for (const fault of [{ after: true }, { resend: true }]) {
+    const { srv, eng, logs } = buyerSwitchedOnPage({ server: { faults: [{ match: /\/attempts\/7\/guard$/, times: 1, ...fault }] } });
+    const s = await eng.run("manual", CID);
+    const why = JSON.stringify(fault);
+    assert.equal(paths(srv, /\/attempts\/7\/guard$/).length, 2, why);
+    assert.equal(srv.state.attempts.get(7).guards, 1, `${why}：服务端只判了一次，第二次在批次这一关就回了`);
+    assert.deepEqual([s.status, s.reason], ["finished", "buyer_changed"], why);
+    assert.equal(s.message, `执行批次 #9 已结束：${BUYER_CHANGED_TEXT}（${TALLY_ABORTED_1}）`, why);
+    assert.equal(paths(srv, /\/result$|\/finish$|\/submitting$/).length, 0, why);
+    assert.equal(paths(srv, /\/next$/).length, 1, why);
+    assert.deepEqual([srv.state.attempts.get(7).status, srv.state.tasks[0].status, srv.state.account.execution_paused], ["aborted", "assigned", false], why);
+    assert.ok(logs.some((l) => l.text === `尝试 #7：${BUYER_CHANGED_TEXT}（第一次的响应没有收到，服务端：${RUN_ENDED_TEXT}）`), why);
+    assert.ok(!logs.some((l) => /执行中断|租约到期/.test(l.text)), `${why}：没有在途尝试留给清扫，不说「租约到期后处理」`);
+  }
+});
+
+test("护栏 buyer 项拦截与并发的批次心跳：心跳先拿到 409（批次已结束）也不把批次说成中断，仍以「买家号变了」结束", async () => {
+  let beat = null;
+  const ctx = buyerSwitchedOnPage({
+    engine: { timers: { setInterval: (fn) => { beat = fn; return 0; }, clearInterval: () => {} } },
+    // 护栏的请求到了服务端、答复还在路上时，定时器上的批次心跳发了出去并先回来
+    wrapFetch: (srv) => async (url, init) => {
+      const res = await srv.fetch(url, init);
+      if (/\/guard$/.test(new URL(url).pathname) && beat) {
+        beat();
+        for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+      }
+      return res;
+    },
+  });
+  const { srv, eng, logs } = ctx;
+  const s = await eng.run("manual", CID);
+  assert.equal(paths(srv, /\/runs\/9\/heartbeat$/).length, 1, "心跳确实发了，而且在护栏的答复之前回来");
+  assert.ok(logs.some((l) => l.text.includes(`执行权已失效：${RUN_ENDED_TEXT}`)), "心跳这一路如实记下服务端的原话");
+  assert.deepEqual([s.status, s.reason], ["finished", "buyer_changed"]);
+  assert.equal(s.message, `执行批次 #9 已结束：${BUYER_CHANGED_TEXT}（${TALLY_ABORTED_1}）`);
+  assert.equal(paths(srv, /\/finish$|\/result$/).length, 0);
+  assert.ok(!logs.some((l) => /执行中断/.test(l.text)));
+});
+
+/** 护栏放行之后、登记之前，账号登记的买家号 ID 改成了另一个，浏览器也登录（并上报）了那一个：身份检查过得去，
+ *  但存下的结算事实里是原来的买家号 —— 提交登记前的复核由 buyer 项拦下。 */
+const buyerChangedBeforeSubmit = (extra = {}) => {
+  const ctx = setup({
+    ...extra,
+    server: {
+      ...(extra.server ?? {}),
+      hooks: { afterProgress: (t, a, state, stage) => { if (stage === "before_submit") { state.account.amazon_customer_id = OTHER_CID; ctx.switchBuyer(); } } },
+    },
+  });
+  return ctx;
+};
+
+test("提交前复核时护栏的 buyer 项拦下（409 GUARD_BLOCKED，detail.block_code = IDENTITY_MISMATCH、run_ended）：没有登记提交，服务端已中止这一笔并结束批次；插件不上报结果、不再问进度、不调用结束批次", async () => {
+  let reply = null;
+  const { srv, eng, logs, views } = buyerChangedBeforeSubmit({
+    wrapFetch: (srv) => async (url, init) => {
+      const res = await srv.fetch(url, init);
+      if (/\/submitting$/.test(new URL(url).pathname)) reply = { status: res.status, body: await res.clone().json() };
+      return res;
+    },
+  });
+  const s = await eng.run("manual", CID);
+  // 服务端的答复（真实服务端这里不抛异常、事务照常提交）
+  const reason = "结算页登录的买家号（A1DEMO00000）不是这个批次的买家号（A9OTHER00000）";
+  assert.deepEqual(reply, {
+    status: 409,
+    body: {
+      code: "GUARD_BLOCKED",
+      message: `按最新配置复核护栏未通过：${reason}，不能提交`,
+      detail: { block_code: "IDENTITY_MISMATCH", reasons: [reason], attempt_status: "aborted", order_status: "assigned", run_ended: true, end_reason: "identity_mismatch" },
+    },
+  });
+  const a = srv.state.attempts.get(7);
+  assert.deepEqual([a.status, a.error_code, a.submitted_at, a.submits, a.blocked_at], ["aborted", "IDENTITY_MISMATCH", null, 1, "submitting"], "没有登记提交");
+  assert.deepEqual(srv.state.tasks.map((t) => t.status), ["assigned", "assigned"]);
   assert.equal(srv.state.account.execution_paused, false);
-  assert.ok(logs.some((l) => l.text.includes(BUYER_CHANGED_TEXT)));
-  assert.equal(srv.state.runs.get(9).finish_detail, "buyer_changed");
+  assert.deepEqual([srv.state.runs.get(9).ended, srv.state.runs.get(9).end_reason], [true, "identity_mismatch"]);
+  assert.deepEqual(srv.state.runs.get(9).stats, { claimed: 1, aborted: 1 });
+  // 插件
+  assert.equal(paths(srv, /\/result$/).length, 0, "不上报结果（不报失败，也不报结果不明）");
+  assert.equal(paths(srv, /\/finish$/).length, 0, "不调用结束批次");
+  assert.equal(paths(srv, /\/progress$/).filter((c) => c.body.detail?.submit_rejected).length, 0, "不当成一般的被拒去问进度");
+  assert.equal(paths(srv, /\/next$/).length, 1);
+  assert.match(srv.calls.at(-1).path, /\/attempts\/7\/submitting$/);
+  assert.deepEqual([s.status, s.reason], ["finished", "buyer_changed"]);
+  assert.deepEqual(s.counts, { attempts: 1, succeeded: 0, failed: 0, blocked: 0, unknown: 0, aborted: 1 });
+  assert.equal(s.message, `执行批次 #9 已结束：${BUYER_CHANGED_TEXT}（${TALLY_ABORTED_1}）`);
+  assert.equal(views.at(-1).message, s.message);
+  assert.ok(logs.some((l) => l.text === `尝试 #7：${BUYER_CHANGED_TEXT}（${reason}；服务端已结束本批次）`));
+  assert.ok(!logs.some((l) => l.level === "err" || /结束执行批次失败|执行中断|提交登记被拒绝/.test(l.text)));
+});
+
+test("提交登记的答复丢了、浏览器把 POST 重发，而第一次复核已由 buyer 项拦下：拿到 409 LEASE_LOST（批次已因它结束）—— 没有登记，不报结果不明，同样以「买家号变了」结束", async () => {
+  const { srv, eng, logs } = buyerChangedBeforeSubmit({ server: { faults: [{ match: /\/submitting$/, times: 1, resend: true }] } });
+  const s = await eng.run("manual", CID);
+  const a = srv.state.attempts.get(7);
+  assert.deepEqual([a.status, a.error_code, a.submitted_at, a.submits], ["aborted", "IDENTITY_MISMATCH", null, 2]);
+  assert.equal(resultsOf(srv).length, 0, "没有登记提交，就不是结果待核实");
+  assert.equal(paths(srv, /\/finish$/).length, 0);
+  assert.deepEqual([s.status, s.reason, s.counts.aborted, s.counts.unknown], ["finished", "buyer_changed", 1, 0]);
+  assert.deepEqual([srv.state.tasks[0].status, srv.state.account.execution_paused], ["assigned", false]);
+  assert.ok(logs.some((l) => l.text === `尝试 #7：${BUYER_CHANGED_TEXT}（第一次的响应没有收到，服务端：${RUN_ENDED_TEXT}）`));
+  assert.ok(!logs.some((l) => /执行中断|结果不明/.test(l.text)));
+});
+
+test("护栏 buyer 项拦下时上游已取消：任务按取消处理（不是回已分配），插件这边一样", async () => {
+  // 「读结算信息」那一步的进度放行之后上游才取消；结算事实里带着另一个买家号
+  const { srv, eng } = setup({ server: { tasks: [TASKS()[0]], hooks: { afterProgress: (t, a, state, stage) => { if (stage === "checkout") t.cancelled = true; } } }, engine: { readCustomerId: () => OTHER_CID } });
+  const s = await eng.run("manual", CID);
+  assert.deepEqual([srv.state.attempts.get(7).status, srv.state.tasks[0].status], ["aborted", "cancelled"]);
+  assert.deepEqual([s.status, s.reason, paths(srv, /\/result$|\/finish$/).length], ["finished", "buyer_changed", 0]);
+});
+
+test("批次账号没有登记买家号 ID（登记被清空）时护栏同样由 buyer 项拦下，落地相同", async () => {
+  const { srv, eng } = setup({ server: { tasks: [TASKS()[0]], hooks: { afterProgress: (t, a, state, stage) => { if (stage === "checkout") state.account.amazon_customer_id = null; } } } });
+  const s = await eng.run("manual", CID);
+  const a = srv.state.attempts.get(7);
+  assert.deepEqual([a.guard.code, a.guard.reasons[0], a.status], ["IDENTITY_MISMATCH", "这个批次的账号没有登记买家号 ID，不能放行", "aborted"]);
+  assert.deepEqual(a.guard.checks.buyer, { ok: false, expected: null, actual: DEMO_CID });
+  assert.deepEqual([s.reason, srv.state.runs.get(9).end_reason, srv.state.tasks[0].status], ["buyer_changed", "identity_mismatch", "assigned"]);
+});
+
+test("一般的护栏拦截不受影响：尝试失败、任务转异常、批次继续，批次统计记拦截；结束批次的答复带 ended_at 与 stats", async () => {
+  const { srv, eng, api } = setup({ outcome: "price_over_cap" });
+  const s = await eng.run("manual", CID);
+  assert.deepEqual([s.status, s.reason, s.counts.blocked, s.counts.aborted], ["finished", "completed", 2, 0]);
+  const run = srv.state.runs.get(9);
+  assert.deepEqual([run.ended, run.end_reason, run.plugin_reason, run.finish_detail], [true, "finished", "finished", "completed"]);
+  assert.deepEqual(run.stats, { claimed: 2, blocked: 2 });
+  const a = srv.state.attempts.get(7);
+  assert.deepEqual([a.status, a.error_code, a.guard.checks.price_cap.ok, a.guard.checks.buyer.ok], ["failed", "PRICE_OVER_CAP", false, true]);
+  // 插件结束的批次再问一次：同样是「批次已结束」，结束原因是 finished
+  const again = await api.finishRun(9, "completed");
+  assert.deepEqual([again.error.code, again.error.message, again.error.detail], ["LEASE_LOST", "执行批次已结束（插件结束了批次），请重新开始批次", { run_id: 9, end_reason: "finished" }]);
+  // 结束批次的答复（真实服务端的形状）：结束原因恒为 finished，插件的细分原因不进 end_reason
+  const r2 = await api.startRun("manual", CID);
+  const fin = await api.finishRun(r2.data.run_id, "stopped");
+  assert.deepEqual([Object.keys(fin.data).sort(), fin.data.end_reason, fin.data.stats], [["end_reason", "ended_at", "run_id", "stats"], "finished", {}]);
+  assert.deepEqual([srv.state.runs.get(10).plugin_reason, srv.state.runs.get(10).finish_detail], ["finished", "stopped"]);
+});
+
+test("来源指定的买家号已经不是这个账号（领取时服务端解除分配、跳过）：插件不看分配方式，只把服务端给的原因写进日志，其余任务照常", async () => {
+  const { srv, eng, logs } = setup({ server: { tasks: [{ ...TASKS()[0], off_target: true }, TASKS()[1]] } });
+  const s = await eng.run("manual", CID);
+  assert.deepEqual([s.status, s.reason, s.counts.attempts, s.counts.succeeded], ["finished", "completed", 1, 1]);
+  assert.deepEqual(srv.state.tasks.map((t) => [t.status, t.account_id]), [["queued", null], ["purchased", 3]]);
+  assert.equal(srv.state.tasks[0].status_reason, "来源指定的买家号已不是账号 环境-DEMO，领取时解除分配");
+  assert.ok(logs.some((l) => l.text === "没有可执行的任务了：今天没有可执行的任务"), "第二次领取时已经没有要解除的了");
+  // 只有这一笔的时候，原因里带着解除分配的说明
+  const { eng: eng2, logs: logs2, srv: srv2 } = setup({ server: { tasks: [{ ...TASKS()[0], off_target: true }] } });
+  const s2 = await eng2.run("manual", CID);
+  assert.deepEqual([s2.status, s2.counts.attempts], ["finished", 0]);
+  assert.ok(logs2.some((l) => l.text === "没有可执行的任务了：今天没有可执行的任务（1 笔来源指定的买家号已不是本账号、已解除分配）"));
+  assert.equal(srv2.state.attempts.size, 0, "原账号领不到这笔任务");
 });
 
 test("取事实时这一页没读到买家号 ID：事实里是 null（不拿开始批次时的顶替），服务端按数据不可靠拦截", async () => {

@@ -59,6 +59,14 @@ def _sheet(data):
     return list(openpyxl.load_workbook(io.BytesIO(data))["采购结果"].values)
 
 
+#: 表头 → 列序号（按表头取值，列序调整不影响断言）
+COL = {h: i for i, h in enumerate(exports.EXPORT_HEADERS)}
+
+
+def _cell(row, header):
+    return row[COL[header]]
+
+
 def test_batch_export_contains_results_and_only_card_last4(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     acc = f.make_account(conn, ws, name="环境-DEMO-A")
@@ -69,16 +77,21 @@ def test_batch_export_contains_results_and_only_card_last4(conn, workspace):
     assert list(values[0]) == exports.EXPORT_HEADERS
     rows = {v[0]: v for v in values[1:]}
     assert list(rows) == ["PO-DEMO-X01", "PO-DEMO-X02", "PO-DEMO-X03"]
+    assert exports.EXPORT_HEADERS[:5] == ["平台订单号", "状态", "买家号", "分配账号", "AMZ订单号"]
     x1 = rows["PO-DEMO-X01"]
-    assert x1[1:4] == ("已采购", "环境-DEMO-A", "111-0000000-0000001")
-    assert [Decimal(str(v)) for v in x1[4:8]] == [Decimal("41.97"), Decimal("0"), Decimal("2.52"), Decimal("44.49")]
-    assert x1[8] == "7860" and x1[9] == datetime(2026, 10, 31) and x1[12] == "本系统"
-    assert x1[10] == datetime(2026, 10, 31, 10, 0)                       # 最近更新时间按北京时间
+    assert [_cell(x1, h) for h in ("状态", "买家号", "AMZ订单号")] == ["已采购", "环境-DEMO-A", "111-0000000-0000001"]
+    assert [Decimal(str(_cell(x1, h))) for h in ("税前总额", "运费", "税费", "总额")] == [
+        Decimal("41.97"), Decimal("0"), Decimal("2.52"), Decimal("44.49")]
+    assert _cell(x1, "卡尾号") == "7860" and _cell(x1, "建议采购日期") == datetime(2026, 10, 31)
+    assert _cell(x1, "结果来源") == "本系统"
+    assert _cell(x1, "最近更新时间") == datetime(2026, 10, 31, 10, 0)     # 最近更新时间按北京时间
     x2 = rows["PO-DEMO-X02"]
-    assert x2[3] == "SIM-20261031-2" and x2[12] == "模拟" and x2[8] == "7860"   # 绝不导出完整卡号
+    assert _cell(x2, "AMZ订单号") == "SIM-20261031-2" and _cell(x2, "结果来源") == "模拟"
+    assert _cell(x2, "卡尾号") == "7860"                                  # 绝不导出完整卡号
     assert all("4111" not in str(c) for v in values for c in v if c is not None)
     x3 = rows["PO-DEMO-X03"]
-    assert x3[1] == "待确认" and x3[3] is None and "人审" in x3[11] and x3[12] is None
+    assert _cell(x3, "状态") == "待确认" and _cell(x3, "AMZ订单号") is None and "人审" in _cell(x3, "异常原因")
+    assert _cell(x3, "结果来源") is None and _cell(x3, "买家号") is None and _cell(x3, "分配账号") is None
 
 
 def test_view_export_uses_order_views(conn, workspace):
@@ -89,7 +102,7 @@ def test_view_export_uses_order_views(conn, workspace):
     purchased = _sheet(exports.orders_xlsx(conn, ws, view="purchased"))
     assert [v[0] for v in purchased[1:]] == ["PO-DEMO-Y01"]
     needs = _sheet(exports.orders_xlsx(conn, ws, view="needs_info"))
-    assert [v[0] for v in needs[1:]] == ["PO-DEMO-Y03"] and "ASIN" in needs[1][11]
+    assert [v[0] for v in needs[1:]] == ["PO-DEMO-Y03"] and "ASIN" in _cell(needs[1], "异常原因")
     assert len(_sheet(exports.orders_xlsx(conn, ws))) == 4               # 缺省全部 + 表头
     with pytest.raises(DomainError):
         exports.orders_xlsx(conn, ws, view="bogus")

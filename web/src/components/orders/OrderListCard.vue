@@ -35,8 +35,10 @@ const props = withDefaults(
     bulkReviewTabs?: string[]
     /** 在哪些标签页显示缺失字段 */
     missingTabs?: string[]
+    /** 在哪些标签页不显示账号列、把宽度让给说明（任务都还没分配的页） */
+    wideNoteTabs?: string[]
   }>(),
-  { mode: 'pending', bulkReviewTabs: () => [], missingTabs: () => [] },
+  { mode: 'pending', bulkReviewTabs: () => [], missingTabs: () => [], wideNoteTabs: () => [] },
 )
 const emit = defineEmits<{ changed: [] }>()
 
@@ -203,6 +205,7 @@ defineExpose({ reload: load, currentView })
         :mode="mode"
         :selectable="bulkEnabled"
         :show-missing="missingTabs.includes(tab)"
+        :wide-note="wideNoteTabs.includes(tab)"
         :empty-title="current.emptyTitle || `没有「${current.label}」的任务`"
         :empty-description="current.emptyDescription || ''"
         @open="open"

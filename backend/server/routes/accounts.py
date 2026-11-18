@@ -1,5 +1,5 @@
 """买家账号（契约 §8，形状见 §10「账号」）：列表、新建、详情、修改、暂停 / 恢复执行、归档，以及待登记的买家号
-（插件读到、还没有账号登记的买家号 ID）：列表、忽略、恢复。
+（插件读到的、或来源指定了的、还没有账号登记的买家号 ID）：列表、忽略、恢复。
 
 - 「登记」一个待登记的买家号 = POST /accounts（带 amazon_customer_id）；「填到已有账号」= PATCH /accounts/{id}。
 - 字段的类型与取值由 services/accounts 校验（中文原因、422 VALIDATION）；前端整份回传的只读键（quota_today、
@@ -67,17 +67,22 @@ def list_accounts(include_archived: bool = False, pg: deps.Paging = Depends(deps
 
 @router.post("")
 def create_account(body: AccountBody, ctx: deps.Console = Depends(deps.console)):
-    """输入：账号字段（name 必填）→ 输出：新账号（新建后立即重新分配）。"""
+    """输入：账号字段（name 必填）→ 输出：新账号（新建后立即重新分配，不论采购开关：来源按名称或买家号 ID 指定给它的
+    任务随即落到它上面）。"""
     return respond(accounts.create(ctx.conn, ctx.workspace_id, body.model_dump(exclude_unset=True), ctx.user_id))
 
 
 @router.get("/discovered")
 def list_discovered(include_ignored: bool = False, ctx: deps.Console = Depends(deps.console)):
-    """输入：是否含已忽略的（include_ignored=0|1）→ 输出：{items: [待登记的买家号]}（按最近上报时间倒序）。
+    """输入：是否含已忽略的（include_ignored=0|1）→ 输出：{items: [待登记的买家号]}（按最近上报时间倒序，没有浏览器
+    上报的排在后面）。
 
-    每项 {customer_id, ignored, browsers: [{id, name, online, last_seen_at}], last_reported_at, name_hint}：
-    本工作区未移除的浏览器上报了、还没有被任何未归档账号登记的买家号 ID；name_hint 是来源数据里同一买家号 ID
-    最近出现的买家号（没有为 null）。
+    每项 {customer_id, ignored, browsers: [{id, name, online, last_seen_at}], last_reported_at, name_hint,
+    source_orders}：还没有被任何未归档账号登记的买家号 ID，来自两处的并集——本工作区未移除的浏览器上报的登录买家号，
+    与来源指定（未采购任务上形状合格的买家号 ID）。source_orders = 指定它的未采购任务数（0 = 只来自浏览器）；只来自
+    来源的项 browsers 为空数组、last_reported_at 为 null。name_hint 优先取这些任务最近写的买家号，其次是来源数据里
+    同一买家号 ID 最近出现的买家号（没有为 null）。include_ignored=1 时另外列出忽略名单里的**全部** ID（ignored: true，
+    不要求此刻有浏览器登录着它），供恢复。
     """
     return respond({"items": accounts.discovered(ctx.conn, ctx.workspace_id, include_ignored=include_ignored)})
 
@@ -105,7 +110,8 @@ def get_account(account_id: int, ctx: deps.Console = Depends(deps.console)):
 
 @router.patch("/{account_id}")
 def patch_account(account_id: int, body: AccountBody, ctx: deps.Console = Depends(deps.console)):
-    """输入：账号 id、要改的字段 → 输出：改后的账号（影响分配的字段变化后立即重新分配）。
+    """输入：账号 id、要改的字段 → 输出：改后的账号（影响分配的字段变化后立即重新分配；名称与买家号 ID 也算——
+    来源指定靠它们对应账号）。
 
     修改或清空 amazon_customer_id 时，账号有未结束批次、在途或结果待核实的尝试 → 409 CONFLICT。
     """

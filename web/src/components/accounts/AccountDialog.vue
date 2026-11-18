@@ -1,13 +1,15 @@
 <script setup lang="ts">
 /**
  * 新建 / 编辑买家账号：买家号 ID、金额区间、每日额度、优先级、配送上限（留空继承全局）、执行模式与时间、卡尾号、开关。
- * 带 preset 打开 = 登记一个插件读到的买家号：买家号 ID 已填好（不可改），名称用来源里的名称预填，提交走新建接口。
+ * 带 preset 打开 = 登记一个待登记的买家号（插件读到的或来源指定的）：买家号 ID 已填好（不可改），名称用来源里的名称预填，提交走新建接口。
+ * 账号名称是来源按「买家号」指定时对应账号的依据，名称下面写明改名的影响。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import type { Account, AccountInput, PurchaseMode } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
-import { customerIdProblem, normalizeCustomerId } from '@/utils/accounts'
+import { customerIdProblem, normalizeCustomerId, registerHelpText } from '@/utils/accounts'
+import { ACCOUNT_NAME_HELP } from '@/utils/designation'
 import { blankToNull, hasAtMostTwoDecimals, normalizeMoneyInput, parseAmount } from '@/utils/format'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
 
@@ -16,6 +18,10 @@ export interface AccountPreset {
   customerId: string
   /** 来源数据里这个 ID 用过的「买家号」名称；没有为 null */
   name?: string | null
+  /** 来源指定了这个买家号 ID 的未采购任务数（登记后会按指定重新分配） */
+  sourceOrders?: number | null
+  /** 有没有浏览器登录着这个买家号；不给时按有 */
+  hasBrowser?: boolean
 }
 
 const props = defineProps<{ account: Account | null; preset?: AccountPreset | null; defaultMaxDays: number | null }>()
@@ -42,7 +48,7 @@ const form = reactive({
 })
 
 const editing = computed(() => !!props.account)
-/** 登记一个插件读到的买家号（新建账号，ID 已定） */
+/** 登记一个待登记的买家号（新建账号，ID 已定） */
 const registering = computed(() => !props.account && !!props.preset?.customerId)
 /** 编辑时把已登记的买家号 ID 改成了别的值（或清空） */
 const customerIdChanged = computed(
@@ -169,13 +175,16 @@ async function submit() {
           <el-input v-model="form.amazon_customer_id" class="font-mono" :readonly="registering" placeholder="A 开头，如 A1DEMO00000" aria-label="买家号 ID" />
         </el-form-item>
       </div>
-      <p class="-mt-3 mb-4 text-xs text-gray-500 dark:text-dark-400">
-        <template v-if="registering">买家号 ID 由插件从浏览器登录的亚马逊页面读出。登记后，登录着这个买家号的浏览器就能领取这个账号的任务；请确认名称、金额区间与每日单数。</template>
-        <template v-else>亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。</template>
-        <span v-if="customerIdChanged" class="mt-1 block text-amber-700 dark:text-amber-400">
-          修改买家号 ID 后，这个账号的任务改由登录着新买家号的浏览器执行；账号正在执行或有结果待核实的采购时不能修改。
-        </span>
-      </p>
+      <div class="-mt-3 mb-4 grid gap-x-6 gap-y-1 text-xs text-gray-500 dark:text-dark-400 md:grid-cols-2">
+        <p data-testid="account-name-help">{{ ACCOUNT_NAME_HELP }}</p>
+        <p>
+          <template v-if="registering">{{ registerHelpText(preset) }}</template>
+          <template v-else>亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。</template>
+          <span v-if="customerIdChanged" class="mt-1 block text-amber-700 dark:text-amber-400">
+            修改买家号 ID 后，这个账号的任务改由登录着新买家号的浏览器执行；账号正在执行或有结果待核实的采购时不能修改。
+          </span>
+        </p>
+      </div>
       <div class="grid gap-x-6 md:grid-cols-4">
         <el-form-item label="金额下限（USD）" prop="min_amount">
           <el-input v-model="form.min_amount" placeholder="0.00"><template #prefix>$</template></el-input>

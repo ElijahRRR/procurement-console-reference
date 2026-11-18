@@ -24,6 +24,11 @@
 提交登记前的最后关口（mark_submitting）：除状态、取消、账号、身份（含新鲜度）外，还要求领取后来源没有执行相关
 变化（见「来源基线」一节），并按最新配置对存下的结算事实复核一次护栏（含结算页当场读到的买家号 ID）。
 
+护栏 buyer 项拦截（结算页读到的买家号 ID 不是批次账号登记的 ID，拦截码 IDENTITY_MISMATCH）的落地在护栏判定与
+提交登记复核两处相同（_buyer_blocked）：按中止类处理——尝试 aborted、任务回已分配（随后按派生规则重新校验）、
+不进异常、不暂停账号、不占额度——并在同一事务里把批次结束（end_reason = identity_mismatch），否则只要浏览器上报的
+登录状态没变，同一批次会立刻再领到同一笔。插件之后对这个批次的请求得到「批次已结束」的既有答复（409 LEASE_LOST）。
+
 提交登记是分界线（铁律 9）：
 
 - submitted_at 为空：可以中止（aborted）、可重试（PAGE_LOAD_FAILED 自动重试一次）、可转异常；
@@ -53,7 +58,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from registry import settings
-from services import accounts, clock, devices, events, guard, orders, quota, settings_svc, writeback
+from services import accounts, clock, designation, devices, events, guard, orders, quota, settings_svc, writeback
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import (
     ATTEMPT_INFLIGHT, ERROR_CODES, EXECUTION_FIELDS, PRE_EXECUTION_STATUSES, SIM_PREFIX, UpstreamRecord, money,
@@ -73,18 +78,24 @@ ATTEMPT_STATUS_ZH = {
     "claimed": "已领取", "checking": "结算中", "guard_passed": "护栏已放行", "submitting": "已登记提交",
     "verifying": "等待验证", "succeeded": "成功", "failed": "失败", "unknown": "结果待核实", "aborted": "已中止",
 }
-#: 批次结束原因的中文。现在只会写 finished / lease_expired / simulation_reset；device_revoked 是旧版
-#: 「撤销设备授权」留下的历史行，标签保留给它们显示。
+#: 批次结束原因的中文。现在只会写 finished / lease_expired / simulation_reset / identity_mismatch（护栏 buyer 项
+#: 拦截时服务端结束批次，见 _buyer_blocked）；device_revoked 是旧版「撤销设备授权」留下的历史行，标签保留给它们
+#: 显示（三端同一句：web 的 RUN_END_REASON_LABEL、插件的 codes）。
 END_REASON_ZH = {
-    "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）", "device_revoked": "浏览器授权已撤销",
+    "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）",
+    "identity_mismatch": "结算页登录的买家号不是这个批次的买家号", "device_revoked": "浏览器的授权已撤销（旧版）",
     "simulation_reset": "已清除模拟结果",
 }
+#: 护栏 buyer 项的拦截码，以及它拦下时服务端结束批次所写的 end_reason
+BUYER_BLOCK_CODE = "IDENTITY_MISMATCH"
+BUYER_BLOCK_END_REASON = "identity_mismatch"
 #: 批次心跳 stop=true 的原因（不看身份新鲜度）
 STOP_REASONS = ("account_paused", "account_archived", "identity_mismatch")
 _SLOT_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 __all__ = [
-    "CANCEL_CODES", "HOLD_DEFERRED_KIND", "PAUSE_MARKER_KIND", "STOP_REASONS", "apply_source_drift",
+    "BUYER_BLOCK_CODE", "BUYER_BLOCK_END_REASON", "CANCEL_CODES", "HOLD_DEFERRED_KIND", "PAUSE_MARKER_KIND",
+    "STOP_REASONS", "apply_source_drift",
     "claimable_counts", "drift_updates", "end_run", "execution_gate", "finish_run", "mark_submitting",
     "mark_verifying", "next_attempt", "progress", "report_result", "run_heartbeat", "start_run", "submit_guard",
     "sweep",
@@ -1238,8 +1249,10 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
     或登录状态超过 identity_fresh_s 没有上报 / 当天额度已满（used(账号, 北京今天, 本批次的模拟标记) ≥ 每日上限，
     在途、待核实、成功都占用）/
     账号在别处还有在途尝试时不领取，返回原因。领取条件：已分配给本账号、建议采购日期 ≤ 北京今天、人审通过、
-    未上游取消、无冲突、金额仍在账号区间内；顺序：建议采购日期、下单时间、id；FOR UPDATE SKIP LOCKED。
-    金额已不在区间的任务解除分配回待分配并跳过。
+    未上游取消、无冲突、金额仍在账号区间内、来源指定（如果有，且不是人工改派）解析到的仍是本账号；
+    顺序：建议采购日期、下单时间、id；FOR UPDATE SKIP LOCKED。
+    金额已不在区间、或来源指定的买家号已不是本账号的任务解除分配回待分配并跳过（后者与 orders._assignment_problem
+    共用 designation.off_target：指定变了而分配还没重算时，原账号领不到这笔任务）。
     """
     dev = devices.require_active(conn, device)
     execution_gate(conn, dev["workspace_id"])
@@ -1280,6 +1293,8 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
 
     skipped: list[int] = []
     unassigned = 0
+    redesignated = 0
+    des_ctx: designation.Context | None = None      # 解析来源指定用的账号表：有带指定的候选任务时才读，只读一次
     while True:
         rows = conn.execute(
             f"SELECT o.* FROM procure.purchase_orders o WHERE {_CLAIMABLE_WHERE} "
@@ -1292,6 +1307,15 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
             if orders.derive_status(o) != "assigned":
                 skipped.append(o["id"])
                 continue
+            if designation.has(o) and o["assignment_kind"] != "manual":
+                des_ctx = des_ctx if des_ctx is not None else designation.load_context(conn, ws)
+                if designation.off_target(o, designation.resolve_order(o, des_ctx)):
+                    orders.transition(conn, o, "queued",
+                                      reason=f"来源指定的买家号已不是账号 {acc['name']}，领取时解除分配",
+                                      actor_kind="device", actor_id=dev["id"],
+                                      event_detail={"action": "claim_recheck"})
+                    redesignated += 1
+                    continue
             sub = orders.subtotal_eff(o)
             if not orders.amount_in_range(sub, acc):
                 orders.transition(conn, o, "queued",
@@ -1315,6 +1339,8 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
         extras.append(f"另有 {future} 笔建议采购日期在未来")
     if unassigned:
         extras.append(f"{unassigned} 笔金额已不在区间、已解除分配")
+    if redesignated:
+        extras.append(f"{redesignated} 笔来源指定的买家号已不是本账号、已解除分配")
     if extras:
         reason += "（" + "，".join(extras) + "）"
     return {"attempt": None, "reason": reason}
@@ -1404,12 +1430,57 @@ def _evaluate_guard(conn, facts: dict[str, Any], order: dict[str, Any], acc: dic
     )
 
 
+def _buyer_blocked(conn, dev: dict[str, Any], run: dict[str, Any], att: dict[str, Any], order: dict[str, Any],
+                   verdict: dict[str, Any], *, at: str, cols: dict[str, Any] | None = None
+                   ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """输入：浏览器行、有效的批次（已锁）、未登记提交的在途尝试与它的任务（已锁）、护栏裁决（code = IDENTITY_MISMATCH）、
+    发生处（'guard' = 护栏判定，'submitting' = 提交登记前的复核）、要一并写到尝试上的列 → 输出：(尝试行, 任务行)。
+
+    护栏 buyer 项拦截的落地（两处共用，契约 §4 / §5）。结算页上要下单的不是这个批次的买家号：不是任务的问题，也不是
+    账号的问题，按**中止类**处理——
+
+    - 尝试 → aborted（error_code = IDENTITY_MISMATCH，error_detail 为裁决的原因；未登记提交，不占额度）；
+    - 任务回已分配、保留分配（上游已取消 → cancelled），随后按派生规则重新校验（_release → apply_source_drift：
+      领取后被挡住的来源变化照样落到任务上）；**不进异常、不暂停账号**；
+    - 同一事务里把批次结束（end_reason = identity_mismatch，run.ended 事件带 attempt_id / at / reason）：否则只要
+      浏览器上报的登录状态没变，同一批次会立刻再领到同一笔。
+
+    之后这个批次的领取、批次心跳、结束批次，以及这笔尝试的进度、护栏、提交登记一律 409 LEASE_LOST（_require_active）；
+    这笔尝试再上报结果：报的正是 IDENTITY_MISMATCH 的失败 → 200 duplicate，别的 → 409 CONFLICT（report_result 对已结束
+    尝试的既有规则）。都不会报 500，也不会再建第二笔尝试。
+    事件：attempt.guard_blocked {code, reasons, at}、attempt.aborted {error_code, reason, run_id}、
+    order.status_changed、run.ended。
+    """
+    ws = att["workspace_id"]
+    now = clock.now()
+    code = BUYER_BLOCK_CODE
+    zh = END_REASON_ZH[BUYER_BLOCK_END_REASON]
+    reasons = list(verdict.get("reasons") or [])
+    why = reasons[0] if reasons else zh
+    att = _set_attempt(conn, att, status="aborted", stage="guard" if at == "guard" else "submitting",
+                       error_code=code, error_detail="；".join(reasons)[:1000] or zh, finished_at=now,
+                       heartbeat_at=now, **(cols or {}))
+    order = _release(conn, order, att, f"{why}，未提交前中止，任务保留待重新领取", actor_kind="device",
+                     actor_id=dev["id"])
+    events.record(conn, ws, "attempt", att["id"], "attempt.guard_blocked", actor_kind="device", actor_id=dev["id"],
+                  order_id=order["id"], detail={"code": code, "reasons": reasons, "at": at})
+    events.record(conn, ws, "attempt", att["id"], "attempt.aborted", actor_kind="device", actor_id=dev["id"],
+                  order_id=order["id"], detail={"error_code": code, "reason": why, "run_id": att["run_id"]})
+    _bump(conn, run, "aborted")
+    end_run(conn, run, BUYER_BLOCK_END_REASON, actor_kind="device", actor_id=dev["id"], cause=zh,
+            event_detail={"attempt_id": att["id"], "at": at, "reason": why})
+    return att, order
+
+
 def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> dict[str, Any]:
     """输入：浏览器行、尝试、结算页事实 → 输出：护栏裁决（services/guard.evaluate 的结果）。
 
     事实先经 guard.sanitize_facts 规范化（只留契约 §4 的键、卡号只留后 4 位），判定与入库都用规范化后的事实。
     按任务与账号**当前**的有效值判定。放行 → 尝试 guard_passed；拦截 → 尝试 failed（error_code 为拦截码）、
     任务 exception（原因为拦截码的中文说明；上游已取消则 cancelled），批次可以继续下一笔。
+    例外：buyer 项拦截（拦截码 IDENTITY_MISMATCH，结算页读到的买家号 ID 不是批次账号登记的 ID）按中止类落地并
+    结束批次（见 _buyer_blocked）：尝试 aborted、任务回已分配、不进异常、不暂停账号、批次 end_reason =
+    identity_mismatch；返回的裁决照旧是 {verdict: block, code: IDENTITY_MISMATCH, …}，插件据此停下、不再上报结果。
     已登记提交或已结束的尝试 → CONFLICT。
     """
     dev = devices.require_active(conn, device)
@@ -1435,6 +1506,11 @@ def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> d
                                                     "delivery_days": verdict["delivery_days"]})
         return verdict
     code = verdict["code"]
+    if code == BUYER_BLOCK_CODE:
+        _buyer_blocked(conn, dev, run, att, order, verdict, at="guard",
+                       cols={"guard_input": guard_input, "guard_verdict": verdict,
+                             "delivery_days": verdict["delivery_days"]})
+        return verdict
     zh = ERROR_CODES[code].zh if code in ERROR_CODES else "护栏拦截"
     reason = f"{zh}：{verdict['reasons'][0]}" if verdict["reasons"] else zh
     att = _set_attempt(conn, att, status="failed", stage="guard", guard_input=guard_input, guard_verdict=verdict,
@@ -1459,6 +1535,13 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
     或超过 identity_fresh_s 没有上报（IDENTITY_MISMATCH，detail.login_state / stale）、领取后来源有执行相关变化
     （SOURCE_CHANGED）、按最新配置（账号登记的买家号 ID、任务的有效限价、账号金额区间、有效配送上限、期望卡尾号、
     站点今天）对存下的结算事实复核护栏不再放行（GUARD_BLOCKED，detail 带 block_code / reasons）。
+
+    唯一会改状态的拒绝：复核的拦截码是 IDENTITY_MISMATCH（存下的结算页买家号 ID 已不是批次账号当前登记的 ID）。
+    这时**不抛异常**，按 _buyer_blocked 落地（尝试 aborted、任务回已分配、不暂停账号、批次结束 end_reason =
+    identity_mismatch；复核的裁决存进尝试的 guard_verdict），返回
+    {ok: false, blocked: true, code: 'GUARD_BLOCKED', message, detail: {block_code, reasons, attempt_status: 'aborted',
+    order_status, run_ended: true, end_reason: 'identity_mismatch'}}；调用方照常提交事务，插件路由据此回 409
+    GUARD_BLOCKED（与迟到回执同一个办法：抛异常会把落地一起回滚）。
     """
     dev = devices.require_active(conn, device, lock=True)
     att, run, order = _attempt_for(conn, dev, attempt_id)
@@ -1500,8 +1583,15 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
     if recheck["verdict"] != "pass":
         why = recheck["reasons"][0] if recheck["reasons"] else (
             ERROR_CODES[recheck["code"]].zh if recheck["code"] in ERROR_CODES else "护栏拦截")
-        raise conflict(f"按最新配置复核护栏未通过：{why}，不能提交", code="GUARD_BLOCKED",
-                       block_code=recheck["code"], reasons=recheck["reasons"])
+        message = f"按最新配置复核护栏未通过：{why}，不能提交"
+        if recheck["code"] == BUYER_BLOCK_CODE:
+            att, order = _buyer_blocked(conn, dev, run, att, order, recheck, at="submitting",
+                                        cols={"guard_verdict": recheck})
+            return {"ok": False, "blocked": True, "code": "GUARD_BLOCKED", "message": message,
+                    "detail": {"block_code": recheck["code"], "reasons": recheck["reasons"],
+                               "attempt_status": att["status"], "order_status": order["status"],
+                               "run_ended": True, "end_reason": BUYER_BLOCK_END_REASON}}
+        raise conflict(message, code="GUARD_BLOCKED", block_code=recheck["code"], reasons=recheck["reasons"])
     now = clock.now()
     _set_attempt(conn, att, status="submitting", submitted_at=now, stage="submitting", heartbeat_at=now)
     events.record(conn, att["workspace_id"], "attempt", att["id"], "attempt.submitting", actor_kind="device",
@@ -1924,7 +2014,7 @@ def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finishe
     dev = devices.require_active(conn, device)
     run = _run_for(conn, dev, run_id)
     _require_active(run)
-    # end_reason 是封闭取值（finished / lease_expired / simulation_reset）；插件给的短码
+    # end_reason 是封闭取值（finished / lease_expired / simulation_reset / identity_mismatch）；插件给的短码
     # 记在 run.ended 事件的 plugin_reason 里
     end_run(conn, run, "finished", actor_kind="device", actor_id=dev["id"], cause="插件结束了执行批次",
             event_detail={"plugin_reason": _text(reason, 64) or "finished", "plugin_detail": _plugin_detail(detail)})

@@ -367,6 +367,35 @@ def used_columns(field_map: dict[str, Any]) -> list[str]:
     return out
 
 
+#: 来源指定买家号用到的两个系统字段
+BUYER_FIELD_KEYS = ("external_buyer_account", "external_buyer_customer_id")
+
+
+def missing_buyer_columns(field_map: dict[str, Any], field_types: dict[str, int]) -> list[str]:
+    """输入：field_map、来源表的 {列名: 字段类型} → 输出：字段对应给「买家号」「买家号 ID」配了、而来源表里已经找不到的
+    列名（按对应顺序、去重）；都在、或这两个字段没配列 → []。
+
+    非空 = 这次读取读不到来源指定（列被改名或删除）：调用方按「没读到不等于清空」处理（SourceRef.buyer_readable=False），
+    不能把它当成来源清空了指定。是否读得到统一看 buyer_columns_readable（两个字段都没配列也算读不到，但不报问题）。
+    """
+    out: list[str] = []
+    for key in BUYER_FIELD_KEYS:
+        for col in _candidates(field_map.get(key)):
+            if col not in field_types and col not in out:
+                out.append(col)
+    return out
+
+
+def buyer_columns_readable(field_map: dict[str, Any], field_types: dict[str, int]) -> bool:
+    """输入：field_map、来源表的 {列名: 字段类型} → 输出：这次读取是否读得到来源指定。
+
+    读得到 = 「买家号」「买家号 ID」至少有一个配了列，而且配的列在来源表里都找得到。两个字段都没配列（连接本来就不读
+    买家号，或所有者后来取消了对应）同样算读不到：没读到不等于清空，之前写下的指定不能因为取消对应就被整批清掉。
+    """
+    mapped = any(_candidates(field_map.get(key)) for key in BUYER_FIELD_KEYS)
+    return mapped and not missing_buyer_columns(field_map, field_types)
+
+
 def record_to_values(fields: dict[str, Any], field_map: dict[str, Any],
                      field_types: dict[str, int] | None = None) -> dict[str, Any]:
     """输入：一条记录的 fields、field_map、{列名: 字段类型} → 输出：{系统字段: Python 值}。

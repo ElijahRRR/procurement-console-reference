@@ -1,7 +1,8 @@
 /** 后台（真正的 build/background/service-worker.js）对着假 chrome 环境与内存假服务端跑：
  *  自动登记（令牌由插件生成、单飞、退避、401 后同令牌重新登记并重试一次）、特权消息的来源检查、
  *  改服务端地址换新令牌、心跳新形状的缓存与快心跳、开始执行前的对账与上报、对账的基准、
- *  执行页面刷新 / 关闭 / 不再答复时接管批次、结果回执的保存与补交、定时（按买家号 ID 分键、带时间点、各返回码）。 */
+ *  执行页面刷新 / 关闭 / 不再答复时接管批次、护栏 buyer 项拦下后服务端自己结束批次时后台的收尾、
+ *  结果回执的保存与补交、定时（按买家号 ID 分键、带时间点、各返回码）。 */
 
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
@@ -1176,6 +1177,93 @@ test("执行中的标签页被关掉：立即通知服务端结束批次", async
   await env.removeTab(3);
   assert.equal(srv.state.runs.get(start.data.run_id).finish_detail, "tab_closed");
   assert.ok(env.logs().some((t) => /执行中的标签页已关闭：批次 #9 中断/.test(t)));
+});
+
+// ── 护栏 buyer 项拦下：服务端中止这一笔并自己结束批次（契约 §4 / §5）────────────────────
+
+/** 像引擎那样经后台走到护栏，结算事实里带着另一个买家号（这一页此刻读到的；对账后的上报还没到服务端）。 */
+async function driveToBuyerBlock(env, tabId) {
+  await env.fromTab(tabId, { type: "pc.lease", busy: true });
+  const start = await startRun(env, tabId);
+  assert.equal(start.ok, true, JSON.stringify(start));
+  const runId = start.data.run_id;
+  await env.fromTab(tabId, { type: "pc.runView", view: view(runId), active: true });
+  const n = await env.fromTab(tabId, { type: "pc.api", op: "next", args: [runId] });
+  const a = parseAttempt(n.data.attempt.raw ?? n.data.attempt);
+  await env.fromTab(tabId, { type: "pc.api", op: "progress", args: [a.attempt_id, "started", {}] });
+  const facts = buildCheckoutFacts(a, "pass", Date.parse("2026-11-05T06:00:00Z"), OTHER);
+  const g = await env.fromTab(tabId, { type: "pc.api", op: "guard", args: [a.attempt_id, facts] });
+  assert.deepEqual([g.ok, g.data.verdict, g.data.code], [true, "block", "IDENTITY_MISMATCH"]);
+  return { runId, attempt: a };
+}
+
+test("护栏的 buyer 项拦下：服务端已中止这一笔并结束批次 —— 引擎只说一声「结束了」，后台清掉本地的批次，不发结束批次、不留回执、不再续租；马上可以重新开始，再领到同一笔", async () => {
+  const { srv, env } = await boot();
+  let ping = { running: true, run_id: 9 };
+  env.setTabHandler(3, (m) => (m.type === "pc.ping" ? ping : { ok: true }));
+  const { runId } = await driveToBuyerBlock(env, 3);
+  const run = srv.state.runs.get(runId);
+  assert.deepEqual([run.ended, run.end_reason], [true, "identity_mismatch"], "批次是服务端结束的");
+  assert.deepEqual([srv.state.attempts.get(7).status, srv.state.tasks[0].status, srv.state.account.execution_paused], ["aborted", "assigned", false]);
+
+  // 引擎到此为止：不上报结果、不调用结束批次，放开标签页租约，把「已结束」的状态交给后台
+  ping = { running: false, run_id: null };
+  await env.fromTab(3, { type: "pc.leaseRelease" });
+  await env.fromTab(3, { type: "pc.runView", view: { ...view(runId), phase: "ended", message: "执行批次 #9 已结束：浏览器登录的买家号变了，这一笔在提交前中止（成功 0，失败 0，拦截 0，待核实 0，中止 1）" }, active: false });
+  await env.settle();
+  assert.equal(await get(env.session, "pc.activeRun"), undefined, "后台不再认这个批次");
+  assert.equal(await get(env.session, "pc.tabLease"), undefined);
+  assert.deepEqual(Object.keys((await get(env.local, "pc.receipts")) ?? {}), [], "这一笔没有上报过结果，也就没有回执要补交");
+  assert.equal(paths(srv, /\/finish$|\/result$/).length, 0);
+  const sent = srv.calls.length;
+  await env.fireAlarm("pc.runBeat");
+  await env.fireAlarm("pc.receipts");
+  assert.equal(srv.calls.length, sent, "批次闹钟、回执闹钟再响也不发请求");
+  let st = await state(env);
+  assert.equal(st.active_run, null);
+  assert.equal(startGate(st).ok, true, "「开始执行」马上可点");
+  assert.ok(!env.logs().some((t) => /失败|中断|执行权已失效/.test(t)), "后台这一侧没有报错的日志");
+
+  // 重新开始：不用等租约到期（不是「上一个批次还没有结束」），新批次再领到同一笔
+  const again = await startRun(env, 3);
+  assert.equal(again.ok, true, JSON.stringify(again));
+  assert.notEqual(again.data.run_id, runId);
+  const n2 = await env.fromTab(3, { type: "pc.api", op: "next", args: [again.data.run_id] });
+  assert.deepEqual([n2.data.attempt.upstream_order_no, n2.data.attempt.raw.attempt_no], ["PO-DEMO-0001", 2], "同一笔任务的第 2 次尝试");
+  assert.deepEqual([srv.state.attempts.get(8).task_id, srv.state.attempts.get(8).attempt_no], [1, 2]);
+  assert.deepEqual(Object.keys(n2.data.attempt.raw).filter((k) => /assign|designat/i.test(k)), [], "下发的载荷里没有分配方式：插件不需要知道任务是来源指定还是自动分配");
+  st = await state(env);
+  assert.equal(st.active_run.run_id, again.data.run_id);
+});
+
+test("护栏的 buyer 项拦下之后、引擎还没说结束时批次闹钟先响：兜底心跳拿到 409（批次已结束）→ 本地清掉、请页面停下、只写一行；之后任何一路再调结束批次、领取都原样拿到同一答复，后台不重试、不再续租", async () => {
+  const { srv, env } = await boot();
+  env.setTabHandler(3, (m) => (m.type === "pc.ping" ? { running: true, run_id: 9 } : { ok: true }));
+  const { runId } = await driveToBuyerBlock(env, 3);
+  const ended = "执行批次已结束（结算页登录的买家号不是这个批次的买家号），请重新开始批次";
+
+  await env.fireAlarm("pc.runBeat");
+  assert.equal(paths(srv, /\/runs\/9\/heartbeat$/).length, 1);
+  assert.equal(await get(env.session, "pc.activeRun"), undefined, "本地不再认这个批次");
+  assert.equal((await get(env.local, "pc.runView")).active, false);
+  assert.ok(env.sentToTabs.some((x) => x.msg.type === "pc.stopRun" && x.msg.reason === `执行权已失效：${ended}`));
+  assert.equal(env.logs().filter((t) => t.includes(ended)).length, 1, "只写一行");
+
+  // 旧版引擎（护栏拦下后还会调结束批次）、或晚到的任何一路请求：原样拿到「批次已结束」，带着结束原因
+  for (const [op, args] of [["finishRun", [runId, "buyer_changed"]], ["next", [runId]], ["runHeartbeat", [runId]], ["submitting", [7]]]) {
+    const r = await env.fromTab(3, { type: "pc.api", op, args });
+    assert.deepEqual([r.ok, r.error.status, r.error.code, r.error.message], [false, 409, "LEASE_LOST", ended], op);
+    assert.deepEqual(r.error.detail, { run_id: runId, end_reason: "identity_mismatch" }, op);
+  }
+  assert.equal(paths(srv, /\/finish$/).length, 1, "明确的拒绝不重试");
+  assert.equal(srv.state.attempts.size, 1, "没有再建尝试");
+  assert.equal(srv.state.runs.get(runId).finish_detail, null, "结束批次没有生效：批次早就由服务端结束了");
+  const beats = paths(srv, /\/runs\/9\/heartbeat$/).length;
+  await env.fireAlarm("pc.runBeat");
+  await env.fireAlarm("pc.runBeat");
+  assert.equal(paths(srv, /\/runs\/9\/heartbeat$/).length, beats, "闹钟不再替它续租");
+  assert.deepEqual([srv.state.tasks[0].status, srv.state.account.execution_paused], ["assigned", false]);
+  assert.equal((await startRun(env, 3)).ok, true, "重新开始马上可以");
 });
 
 test("插件更新（storage.session 清空）后留下的旧「正在执行」：onInstalled 清掉", async () => {

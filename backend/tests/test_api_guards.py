@@ -1,5 +1,6 @@
-"""HTTP 入口的闸：/plugin 入口闸（本机对端、本机 Host、不接受网页 Origin、扩展 ID 名单、POST 必须是 JSON）、
-登录失败限速、浏览器登记数量上限、请求体大小（含分块上传）、Host 与 Origin 检查（防 DNS 重绑定）。全部数据虚构。"""
+"""HTTP 入口的闸：/plugin 入口闸（本机对端、不带代理转发头、本机 Host、不接受网页 Origin、扩展 ID 名单、POST 必须是
+JSON）、旧版配对接口的占位、登录失败限速、浏览器登记数量上限、请求体大小（含分块上传）、Host 与 Origin 检查
+（防 DNS 重绑定）。全部数据虚构。"""
 
 from __future__ import annotations
 
@@ -172,6 +173,81 @@ def test_plugin_gate_accepts_loopback_peers(owner, api, peer):
     assert reg["created"] is True
 
 
+@pytest.mark.parametrize("header, value", [
+    ("X-Forwarded-For", "203.0.113.7"), ("x-forwarded-for", "127.0.0.1"), ("X-FORWARDED-FOR", "203.0.113.7, 10.0.0.1"),
+    ("Forwarded", "for=203.0.113.7;proto=https;host=console.demo.example"), ("X-Real-IP", "203.0.113.7"),
+    ("x-real-ip", "::1"), ("Via", "1.1 proxy.demo.example"), ("via", "HTTP/1.1 demo-proxy"),
+])
+def test_plugin_gate_refuses_requests_forwarded_by_a_proxy(owner, api, header, value):
+    """② 带代理转发头（X-Forwarded-For / Forwarded / X-Real-IP / Via 任一个，不看值、不分大小写）→ 403：本机的反向
+    代理把远端请求转过来时对端与 Host 都是本机，靠这些头认出来。每一个 /plugin 接口都一样，有没有令牌都一样，
+    什么都没写进库；控制台接口不受这道闸影响。"""
+    dev = register_device(plugin_client(api), create_account(owner))
+    before = _devices()
+    c = plugin_client(api)
+    for path in _plugin_posts(api):
+        _forbidden(c.post(path, json=_register_body(), headers={header: value, **bearer(dev["token"])}),
+                   limits.PLUGIN_PROXIED_MESSAGE)
+    _forbidden(c.post("/plugin/v1/register", json=_register_body(), headers={header: value}),
+               limits.PLUGIN_PROXIED_MESSAGE)
+    _forbidden(c.get("/plugin/v1/no-such-thing", headers={header: value}), limits.PLUGIN_PROXIED_MESSAGE)
+    _forbidden(c.options("/plugin/v1/heartbeat", headers={header: value}), limits.PLUGIN_PROXIED_MESSAGE)
+    assert limits.PLUGIN_PROXIED_MESSAGE == "插件接口不接受经过代理转发的请求"
+    assert _devices() == before
+    assert ok(owner.get("/api/v1/auth/me", headers={header: value}))["workspace"]["name"] == OWNER["workspace_name"]
+    assert ok(c.get("/healthz", headers={header: value})) == {"ok": True}
+    # 不带这些头照常（别的 X- 头不算）
+    assert ok(c.post("/plugin/v1/register", json=_register_body(),
+                     headers={"X-Request-Id": "demo-1", "X-Forwarded-Host-Demo": "x"}))["created"] is True
+
+
+def test_plugin_gate_treats_an_empty_proxy_header_as_present():
+    """纯函数：头在就拒绝，值是空的也一样（不解析值，没有「可信代理」名单）。"""
+    def scope(**headers):
+        hs = {"host": "127.0.0.1:8790", "content-type": "application/json", **headers}
+        return {"type": "http", "method": "POST", "path": "/plugin/v1/heartbeat", "client": ("127.0.0.1", 1),
+                "headers": [(k.encode(), v.encode()) for k, v in hs.items()]}
+
+    gate = limits.PluginGateMiddleware(app=None)
+    assert gate.refusal(scope()) is None
+    assert limits.PROXY_HEADERS == (b"x-forwarded-for", b"forwarded", b"x-real-ip", b"via")
+    for name in ("x-forwarded-for", "Forwarded", "X-Real-Ip", "VIA"):
+        assert gate.refusal(scope(**{name: ""})) == limits.PLUGIN_PROXIED_MESSAGE, name
+        assert gate.refusal(scope(**{name: "unknown"})) == limits.PLUGIN_PROXIED_MESSAGE, name
+    for name in ("x-forwarded-proto", "x-forwarded-host", "forwarded-for", "x-via"):
+        assert gate.refusal(scope(**{name: "demo"})) is None, name
+
+
+def test_pair_placeholder_tells_old_plugins_to_update_and_does_nothing_else(owner, api):
+    """旧版插件（0.1.0）还在调的 POST /plugin/v1/pair：只剩一个占位，恒回 409 PLUGIN_OUTDATED「插件版本过旧，请更新
+    插件」——不要令牌、不解析请求体、不碰数据库，没有恢复任何配对逻辑；照样先过入口闸；不出现在接口文档里。"""
+    c = plugin_client(api)
+    before = _devices()
+    for kw in ({"json": {"code": "ZZZZZZZZ", "device_name": "Mac-DEMO", "browser": "chrome", "ext_version": "0.1.0"}},
+               {"json": {}}, {"json": [1, 2]}, {"content": b"{not json"}, {}):
+        out = err(c.post("/plugin/v1/pair", **kw), 409, "PLUGIN_OUTDATED")
+        assert out["message"] == "插件版本过旧，请更新插件" and out["detail"] == {"min_ext_version": "0.2.0"}
+    out = err(c.post("/plugin/v1/pair", json={}, headers=bearer(device_token())), 409, "PLUGIN_OUTDATED")
+    assert out["message"] == "插件版本过旧，请更新插件"
+    with tx() as conn:
+        assert _devices() == before and f.count(conn, "events") == 0
+    # 仍过入口闸：非本机对端、经代理转发、网页来源、不是 JSON → 403，轮不到占位
+    _forbidden(remote_client(api, headers=JSON).post("/plugin/v1/pair", json={}), limits.PLUGIN_REMOTE_MESSAGE)
+    _forbidden(c.post("/plugin/v1/pair", json={}, headers={"X-Forwarded-For": "203.0.113.7"}),
+               limits.PLUGIN_PROXIED_MESSAGE)
+    _forbidden(c.post("/plugin/v1/pair", json={}, headers={"origin": "http://evil.example"}),
+               limits.PLUGIN_WEB_ORIGIN_MESSAGE)
+    _forbidden(local_client(api).post("/plugin/v1/pair", content=b"code=ZZZZZZZZ",
+                                      headers={"content-type": "application/x-www-form-urlencoded"}),
+               limits.PLUGIN_JSON_MESSAGE)
+    # 只有 POST；不在接口文档里，也没有别的配对 / 绑定接口回来
+    assert c.get("/plugin/v1/pair").status_code in (404, 405)
+    paths = set(ok(owner.get("/api/v1/openapi.json"))["paths"])
+    assert not any("pair" in p for p in paths)
+    assert "/plugin/v1/pair" in {getattr(r, "path", "") for r in api.routes}
+    assert owner.post("/api/v1/devices/pairing-codes").status_code in (404, 405)
+
+
 def test_plugin_gate_requires_a_local_host_header_regardless_of_allowed_hosts(clean_db, tmp_path, monkeypatch):
     """② Host 必须是本机名：PC_ALLOWED_HOSTS 与测试放行的主机名只对控制台有效，对 /plugin 无效。"""
     from server.app import TEST_CLIENT_HOST, create_app
@@ -290,7 +366,7 @@ def test_plugin_gate_runs_before_auth_body_parsing_and_rate_limits(api):
 
 
 def test_plugin_gate_refusal_reasons_in_order():
-    """纯函数：按「对端 → Host → Origin → 扩展 ID → Content-Type」的顺序给出第一个不满足的原因。"""
+    """纯函数：按「对端 → 代理转发头 → Host → Origin → 扩展 ID → Content-Type」的顺序给出第一个不满足的原因。"""
     def scope(method="POST", client=("127.0.0.1", 1), **headers):
         hs = {"host": "127.0.0.1:8790", "content-type": "application/json", **headers}
         return {"type": "http", "method": method, "path": "/plugin/v1/register", "client": client,
@@ -302,6 +378,10 @@ def test_plugin_gate_refusal_reasons_in_order():
     assert gate.refusal(scope(client=None)) == limits.PLUGIN_REMOTE_MESSAGE
     assert gate.refusal(scope(client=("192.0.2.10", 1), host="evil.example", origin="http://evil.example",
                               **{"content-type": None})) == limits.PLUGIN_REMOTE_MESSAGE
+    assert gate.refusal(scope(client=("192.0.2.10", 1), **{"x-forwarded-for": "127.0.0.1"})) == \
+        limits.PLUGIN_REMOTE_MESSAGE                                   # 转发头说它来自本机也不信：只看套接字对端
+    assert gate.refusal(scope(host="evil.example", origin="http://evil.example", via="1.1 demo-proxy",
+                              **{"content-type": None})) == limits.PLUGIN_PROXIED_MESSAGE
     assert gate.refusal(scope(host="evil.example", origin="http://evil.example",
                               **{"content-type": None})) == limits.PLUGIN_HOST_MESSAGE
     assert gate.refusal(scope(host=None)) == limits.PLUGIN_HOST_MESSAGE

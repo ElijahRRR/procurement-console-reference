@@ -25,7 +25,7 @@ export const SERVER_CODE_LABEL: Record<string, string> = {
   DEVICE_BUSY: "这个浏览器上一个批次还没有结束",
   ATTEMPT_IN_FLIGHT: "本批次还有一笔未结束的尝试",
   // 开始批次时：没有登录、标签页读数不一致、页面上的买家号与最近上报的不同、太久没有上报；
-  // 执行中（进度、提交登记、护栏的 buyer 项）：浏览器登录的买家号变了。中止类，不暂停账号。
+  // 执行中（进度、提交登记、护栏的 buyer 项）：浏览器登录的买家号变了。中止类：任务回已分配，不进异常、不暂停账号。
   IDENTITY_MISMATCH: "浏览器登录的买家号对不上（没有登录、标签页读数不一致、买家号变了，或登录状态太久没有上报）",
   ACCOUNT_NOT_REGISTERED: "这个买家号还没有登记：请在控制台「账号」页登记后再开始",
   ACCOUNT_PAUSED: "账号已暂停执行，请在控制台恢复后再试",
@@ -136,7 +136,8 @@ export const ACCOUNT_LEVEL_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** 执行中浏览器登录的买家号变了（进度的 cancel_code、护栏 buyer 项的拦截码都是 IDENTITY_MISMATCH）时，
- *  面板与日志上的那一句（规格 §5 状态文案表）。 */
+ *  面板与日志上的那一句（规格 §5 状态文案表）。服务端都按中止类处理：这一笔没有登记提交，任务回已分配、
+ *  不进异常、不暂停账号；护栏 buyer 项拦下的那一种，服务端还会把批次一并结束（重新开始批次后再领）。 */
 export const BUYER_CHANGED_TEXT = "浏览器登录的买家号变了，这一笔在提交前中止";
 
 /** 输入：进度返回的 cancel_code（服务端没给为 null）→ 输出：插件要上报的中止码；null = 不用上报
@@ -167,14 +168,18 @@ export const STAGE_LABEL: Record<string, string> = {
 };
 
 /** 批次心跳 `stop_reason` 的中文名（服务端 execution._stop_reason 的三个值：account_paused /
- *  account_archived / identity_mismatch），外加批次结束原因（device_revoked 只出现在历史批次里）。 */
+ *  account_archived / identity_mismatch），外加批次结束原因（服务端 execution.END_REASON_ZH 的键）。
+ *  identity_mismatch 两处都有：作停止原因是「这个浏览器上报的登录状态不是批次的买家号」，作结束原因是护栏 buyer 项
+ *  拦下、服务端把批次结束（服务端的原话「结算页登录的买家号不是这个批次的买家号」随 409 LEASE_LOST 的 message 给出）。
+ *  device_revoked 只出现在历史批次里（旧版「撤销浏览器授权」留下的），三端同一句：服务端 END_REASON_ZH、
+ *  控制台 RUN_END_REASON_LABEL、这里。 */
 export const STOP_REASON_LABEL: Record<string, string> = {
   account_paused: "账号已被暂停执行",
   account_archived: "账号已归档",
   identity_mismatch: "浏览器登录的买家号变了（或已退出登录、标签页读数不一致）",
   lease_expired: "执行租约已过期",
   simulation_reset: "模拟结果已在控制台清除",
-  device_revoked: "这个浏览器已在控制台移除（旧版本的记录）",
+  device_revoked: "浏览器的授权已撤销（旧版）",
 };
 
 /** 输入：停止原因码 → 输出：中文说明。 */

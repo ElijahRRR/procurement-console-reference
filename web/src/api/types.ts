@@ -66,7 +66,8 @@ export type ReviewSource = (typeof REVIEW_SOURCES)[number]
 export const SOURCE_KINDS = ['feishu', 'file'] as const
 export type SourceKind = (typeof SOURCE_KINDS)[number]
 
-export const ASSIGNMENT_KINDS = ['auto', 'manual'] as const
+/** 分配方式：auto 自动分配 / manual 人工改派（固定）/ source 来源指定（飞书或上传的表格里写了买家号） */
+export const ASSIGNMENT_KINDS = ['auto', 'manual', 'source'] as const
 export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number]
 
 export const SUGGESTED_DATE_BASES = ['source', 'computed'] as const
@@ -103,7 +104,7 @@ export type SyncTrigger = (typeof SYNC_TRIGGERS)[number]
 export const RUN_TRIGGERS = ['manual', 'scheduled'] as const
 export type RunTrigger = (typeof RUN_TRIGGERS)[number]
 
-export const RUN_END_REASONS = ['finished', 'lease_expired', 'simulation_reset'] as const
+export const RUN_END_REASONS = ['finished', 'lease_expired', 'simulation_reset', 'identity_mismatch'] as const
 export type RunEndReason = (typeof RUN_END_REASONS)[number]
 /** 现在不再产生、但历史批次上还留着的结束原因（标签保留，旧记录还要显示） */
 export const LEGACY_RUN_END_REASONS = ['device_revoked'] as const
@@ -277,6 +278,17 @@ export interface LatestAttempt {
   finished_at: Timestamp | null
 }
 
+/**
+ * 来源指定的买家号（任务行与详情的 designated_buyer；两列都空时整项为 null）：来源行没有可信的 AMZ 订单号、
+ * 又填了「买家号 ID」或「买家号」时，这一行指定了采购账号。account 是此刻解析到的未归档账号（解析不出为 null；
+ * 旧服务端不给这个键）。
+ */
+export interface DesignatedBuyer {
+  customer_id: string | null
+  name: string | null
+  account?: Ref | null
+}
+
 export interface OrderRow {
   id: number
   upstream_order_no: string
@@ -306,6 +318,8 @@ export interface OrderRow {
   assigned_account: Ref | null
   assignment_kind: AssignmentKind | null
   assignment_note: string | null
+  /** 来源指定的买家号；没有指定为 null（旧服务端不给这个键，按没有指定处理） */
+  designated_buyer?: DesignatedBuyer | null
   primary_source_kind: SourceKind
   source_kinds: SourceKind[]
   latest_attempt: LatestAttempt | null
@@ -519,9 +533,14 @@ export interface AllocationSummary {
   bj_date: DateStr
   at: Timestamp
   trigger: AllocationTrigger | string
-  stats: { considered: number; assigned: number; coverage: number; fill: number; unassigned: number }
+  /**
+   * assigned = coverage + fill + designated。designated 是按来源指定分出的笔数；升级前存下的分配记录没有这个键，
+   * 显示时按 0 处理。
+   */
+  stats: { considered: number; assigned: number; coverage: number; fill: number; designated?: number; unassigned: number }
   uncovered: { account_id: number; name: string; date: DateStr; reason: string }[]
-  unassigned: { order_id: number; upstream_order_no: string; reason: string }[]
+  /** designated = 这一笔是来源指定了买家号而没分出去的（不会自动分给别的账号） */
+  unassigned: { order_id: number; upstream_order_no: string; reason: string; designated?: boolean }[]
 }
 
 // ── 概览 ──────────────────────────────────────────────────────────────────────
@@ -536,7 +555,7 @@ export interface Overview {
   accounts: { total: number; enabled: number; paused: number }
   /** 装了插件的浏览器（只算没有移除的） */
   devices: { total: number; online: number }
-  /** 插件读到、还没登记也没忽略的买家号个数 */
+  /** 还没登记也没忽略的买家号个数：插件读到的与来源指定的合在一起算 */
   discovered_buyers?: number
   recent_exceptions: OrderRow[]
   last_allocation: AllocationSummary | null
@@ -618,8 +637,10 @@ export interface AccountInput {
 }
 
 /**
- * 插件读到、还没登记到任何账号的买家号（GET /accounts/discovered 的一项）：按买家号 ID 聚合，
- * browsers 是当前登录着它的浏览器，name_hint 是来源数据里这个 ID 最近用过的「买家号」名称（查不到为 null）。
+ * 还没登记到任何账号的买家号（GET /accounts/discovered 的一项）：插件在浏览器里读到的，加上来源指定给未采购任务、
+ * 还没有账号登记的买家号 ID；按买家号 ID 聚合。browsers 是当前登录着它的浏览器（只来自来源的项为空，
+ * last_reported_at 为 null），name_hint 是来源数据里这个 ID 最近用过的「买家号」名称（查不到为 null）。
+ * include_ignored 时带上忽略名单里的全部 ID（不要求此刻有浏览器登录着）。
  */
 export interface DiscoveredBuyer {
   customer_id: string
@@ -627,6 +648,8 @@ export interface DiscoveredBuyer {
   browsers: BrowserRef[]
   last_reported_at: Timestamp | null
   name_hint: string | null
+  /** 来源指定了这个买家号 ID 的未采购任务数；0 = 只来自浏览器（旧服务端不给这个键，按 0 处理） */
+  source_orders?: number
 }
 
 /** 浏览器当前的登录状态：state 含解析结果；stale = 太久没有上报（执行前要重新上报） */
@@ -825,12 +848,16 @@ export interface SyncRun {
   error: string | null
 }
 
-/** 读取中有问题的记录样本（跳过、无效、待核实） */
+/**
+ * 读取中有问题的记录样本（跳过、无效、待核实）。scope = 'connection' 的一条说的是整个连接而不是某条记录
+ * （如「来源表里找不到买家号列…，本次没有更新指定」）：record_id 为 null，不计入 skipped 等统计。
+ */
 export interface SyncProblem {
-  record_id: string
+  record_id: string | null
   upstream_order_no: string | null
   verdict: FeishuVerdict
   reason: string | null
+  scope?: 'connection' | string | null
 }
 
 /** POST /feishu/connections/{id}/sync 的结果（services/feishu_intake.run_connection） */

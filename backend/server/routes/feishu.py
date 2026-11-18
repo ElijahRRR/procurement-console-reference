@@ -142,6 +142,10 @@ def disable_connection(connection_id: int, ctx: deps.Console = Depends(deps.cons
 def sync_connection(connection_id: int, ctx: deps.Console = Depends(deps.console)):
     """输入：连接 id → 输出：本次读取的统计 {read, new, update, …, run_id, problems, allocation}。
 
+    problems 逐条是 {record_id, upstream_order_no, verdict, reason}。连接给「买家号」「买家号 ID」配了列、而来源表里
+    找不到其中某一列时，problems 的第一条是整条连接的提示 {record_id: null, upstream_order_no: "买家号列",
+    verdict: "skipped", reason: "来源表里找不到买家号列「…」，本次没有更新指定", scope: "connection"}（不计入 skipped）：
+    这次读取不改任何任务的来源指定——没读到不等于清空。
     读飞书失败时服务层已把失败的读取记录写进本事务：先提交它再返回错误（否则失败历史随回滚丢失）。
     """
     try:

@@ -27,7 +27,7 @@ npm test          # 编译纯函数、协议客户端与后台 → Node 单测�
 npm run pack      # 构建并打包 → extension/release/采购助手-<版本>.zip（AdsPower 上传用）
 ```
 
-`npm test` 覆盖：令牌生成与登记的退避规则、共享单飞闸；协议客户端（登记不带令牌头、心跳与身份上报的新形状、开始批次带买家号 ID 与时间点、错误映射、ACCOUNT_BUSY / DEVICE_BUSY 详情、只对「没说上话」与幂等接口的 5xx 重试、提交登记绝不自动重试、HTTP 200 也校验形状）；身份解析器对着夹具（`test/fixtures/`，虚构数据，含往标题、搜索框、商品标题里植入 `customerId` 的两张）；多标签页对账（基准是进行中批次的买家号 ID，上报带 conflict）；状态文案逐行对照规格的状态文案表；「开始执行」各步的对照表；执行时间换算与按买家号 ID 分键的当天记录；模拟执行引擎对着内存假服务端（`test/fake-server.mjs`，按规格与开发契约实现，边角路径照 `backend/services/` 的答复）的各条路径；错误码表的顺序与中文说明；清单权限与源码里不读 Cookie、不上传页面 HTML 的检查；以及**真正的后台模块**对着假 chrome 环境（`test/fake-chrome.mjs`）跑：装好自动登记、退避与重试、401 后用同一个令牌重新登记并把原请求再发一次、特权消息的来源检查、改服务端地址换新令牌、快心跳的条件、开始执行前的对账与上报、执行页面刷新 / 关闭 / 不再答复时接管批次、回执补交的时机、定时触发的各种答复。
+`npm test` 覆盖：令牌生成与登记的退避规则、共享单飞闸；协议客户端（登记不带令牌头、心跳与身份上报的新形状、开始批次带买家号 ID 与时间点、错误映射、ACCOUNT_BUSY / DEVICE_BUSY 详情、只对「没说上话」与幂等接口的 5xx 重试、提交登记绝不自动重试、HTTP 200 也校验形状）；身份解析器对着夹具（`test/fixtures/`，虚构数据，含往标题、搜索框、商品标题里植入 `customerId` 的两张）；多标签页对账（基准是进行中批次的买家号 ID，上报带 conflict）；状态文案逐行对照规格的状态文案表；「开始执行」各步的对照表；执行时间换算与按买家号 ID 分键的当天记录；模拟执行引擎对着内存假服务端（`test/fake-server.mjs`，按规格与开发契约实现，边角路径照 `backend/services/` 的答复）的各条路径，含护栏 buyer 项拦下后服务端自己结束批次的那一条（不上报结果、不调用结束批次，之后的请求都得到「批次已结束」）；错误码表的顺序与中文说明；清单权限与源码里不读 Cookie、不上传页面 HTML 的检查；以及**真正的后台模块**对着假 chrome 环境（`test/fake-chrome.mjs`）跑：装好自动登记、退避与重试、401 后用同一个令牌重新登记并把原请求再发一次、特权消息的来源检查、改服务端地址换新令牌、快心跳的条件、开始执行前的对账与上报、执行页面刷新 / 关闭 / 不再答复时接管批次、批次被服务端结束后的收尾、回执补交的时机、定时触发的各种答复。
 
 ## 安装到本机 Chrome
 
@@ -111,7 +111,7 @@ npm run pack      # 构建并打包 → extension/release/采购助手-<版本>.
 |开始执行失败：这个浏览器上一个批次还没有结束。|同一个浏览器同时只有一个未结束的批次（409 `DEVICE_BUSY`），页面刷新或异常退出留下的批次在租约到期后自动释放；后台在替上一个批次补交回执时也是这一句（这时不发请求）|
 |开始执行失败：这个买家号还没有登记……|403 `ACCOUNT_NOT_REGISTERED`|
 |开始执行失败：浏览器没有登录亚马逊 / 标签页显示的买家号不一致 / 页面上的买家号与插件最近上报的不一致 / 插件超过 10 分钟没有上报登录状态|403 `IDENTITY_MISMATCH`，按服务端的原话|
-|浏览器登录的买家号变了，这一笔在提交前中止。|执行中途换了买家号。任务回到已分配，**不暂停账号**|
+|浏览器登录的买家号变了，这一笔在提交前中止。|执行中途换了买家号。这一笔没有登记提交，任务回到已分配（不进「异常」），**不暂停账号**，不占额度。服务端从这个浏览器上报的登录状态里发现的（进度返回 `IDENTITY_MISMATCH`）：插件上报中止，之后领不到任务，照常结束批次。护栏从结算事实里发现的（结算页读到的买家号不是这个批次的）：服务端自己把批次结束，面板最后一行是「执行批次 #N 已结束：浏览器登录的买家号变了，这一笔在提交前中止（……）」。登录回原来的买家号后重新开始执行，会再领到这一笔|
 
 「今天可执行 0 笔」时开始按钮不禁用（数字可能是一分钟前的），点了以服务端的答复为准；没有任何已分配任务时写「还没有任务分给这个买家号，可在控制台「待采购」里查看原因」。
 
@@ -151,9 +151,9 @@ npm run pack      # 构建并打包 → extension/release/采购助手-<版本>.
 **不产生真实订单。** 插件不打开、不点击、不修改任何亚马逊页面；只有「读结算页」这一步是按任务数据推出来的，服务端的护栏、提交登记、结果处理、额度与状态机全部走真实代码路径。服务端本阶段也拒绝非模拟批次。按开发契约 §5 一步一步走：
 
 1. 当前页重读身份，交后台对账（其余亚马逊标签页也各自重读）；各标签页显示的买家号不一致时不开始。否则先 `POST /identity` 上报，再 `POST /runs {customer_id: 当前页读到的买家号 ID, trigger, simulated: true}` 开始批次（定时触发时另带 `slot`）。服务端按买家号 ID 找账号。本地还有没结束的批次（含后台替它补交回执的那段时间）时不发请求。
-2. 循环 `POST /runs/{id}/next` 领取，直到没有任务（`attempt: null`）。候选任务只是暂时被别的操作（导入、同步、分配）锁着时，服务端回 `attempt: null` 且带 `retry_after_s`：插件等这么久（夹在 1 – 30 秒之间）再领，最多再领 6 次，等待期间照常续租，不结束批次；6 次之后仍被占用就以 `completed` 结束本批次。
+2. 循环 `POST /runs/{id}/next` 领取，直到没有任务（`attempt: null`）。候选任务只是暂时被别的操作（导入、同步、分配）锁着时，服务端回 `attempt: null` 且带 `retry_after_s`：插件等这么久（夹在 1 – 30 秒之间）再领，最多再领 6 次，等待期间照常续租，不结束批次；6 次之后仍被占用就以 `completed` 结束本批次。任务是来源（飞书表格或上传的表格）指定给这个账号的、人工改派的还是自动分配的，插件不看也不需要知道：领谁的任务由服务端按登录的买家号决定。来源指定的买家号已经不是这个账号而分配还没重算时，服务端在领取这一步解除分配、跳过那一笔，插件只把服务端给的原因（「N 笔来源指定的买家号已不是本账号、已解除分配」）写进日志。
 3. 每一笔：进度（开始、读结算信息）→ 护栏（模拟的结算事实，带着取事实那一刻页面上读到的买家号 ID）→ 上报一次新鲜的身份（`POST /plugin/v1/identity`）→ 登记前最后一次进度确认 → 提交登记（只认 HTTP 200，绝不自动重试）→ 上报结果。
-4. `POST /runs/{id}/finish {reason: "finished", detail}` 结束批次（`detail` 是插件的细分原因：completed、stopped、attempt_cap、result_unknown、submit_rejected……，服务端记进批次结束事件的 `plugin_detail`）。期间按服务端给的租约有效期续租：每 min(35 秒, 有效期 / 3) 一次，每一步之前到点就补一次。
+4. `POST /runs/{id}/finish {reason: "finished", detail}` 结束批次（`detail` 是插件的细分原因：completed、stopped、attempt_cap、result_unknown、submit_rejected……，服务端记进批次结束事件的 `plugin_detail`）。护栏的 buyer 项拦下时服务端自己结束批次，插件不调用这一步（见下）。期间按服务端给的租约有效期续租：每 min(35 秒, 有效期 / 3) 一次，每一步之前到点就补一次。
 
 进度返回 `continue=false` 时插件不走护栏与登记，按服务端给的机读原因 `cancel_code` 上报中止，继续下一笔：
 
@@ -167,9 +167,17 @@ npm run pack      # 构建并打包 → extension/release/采购助手-<版本>.
 
 服务端没给 `cancel_code`（旧版本服务端）时只报它认得的 `ABORTED_UPSTREAM_CANCELLED`。日志与 `error_detail` 里写服务端的中文原话。
 
-护栏的 buyer 项把「谁在下单」钉在下单那一页：事实里的买家号 ID 没读到 → 按数据不可靠拦截（`DATA_UNRELIABLE`）；不是这个批次账号登记的 ID → 拦截（`IDENTITY_MISMATCH`），插件写「浏览器登录的买家号变了，这一笔在提交前中止」并结束本批次，不暂停账号。
+护栏拦截时这一笔已经由服务端结束，插件按拦截码决定下一步。一般的拦截码（超限价、配送超时、数据不可靠……）：尝试失败、任务「异常」，插件照常上报同一份失败（服务端认出重复），计拦截，继续下一笔。
 
-提交登记被拒（409）时：服务端说已登记（`detail.attempt_status` 为 submitting / verifying，浏览器在连接断开后重发了同一个 POST）→ 上报 `unknown` 并结束批次；按最新配置复核护栏不过（`GUARD_BLOCKED`）→ 按 `detail.block_code` 上报失败（没给时报 `GUARD_BLOCKED`），计拦截，继续下一笔；其他（上游已取消、账号暂停、买家号变了或登录状态过期、来源有变化 `SOURCE_CHANGED`……）→ 再问一次进度，按上表的 `cancel_code` 上报中止；进度仍说继续才报 `SUBMIT_REJECTED`。
+护栏的 buyer 项把「谁在下单」钉在下单那一页：事实里的买家号 ID 没读到 → 按数据不可靠拦截（`DATA_UNRELIABLE`，一般的拦截）；不是这个批次账号登记的 ID → 拦截（`IDENTITY_MISMATCH`）。后一种不是任务的问题，也不是账号的问题，服务端按中止类落地：
+
+- 尝试记为中止（未登记提交，不占额度），任务回到已分配、保留分配（上游已取消则取消）；**不进「异常」、不暂停账号**。
+- **服务端在同一个事务里把批次结束**（结束原因 `identity_mismatch`）：否则只要浏览器上报的登录状态没变，同一批次会马上再领到同一笔。
+- 插件写「浏览器登录的买家号变了，这一笔在提交前中止」，**不上报这一笔的结果、不再领取、也不调用结束批次**：服务端都做完了，这个批次之后的领取、批次心跳、结束批次，以及这一笔的进度、护栏、提交登记，一律得到 409 `LEASE_LOST`「执行批次已结束（结算页登录的买家号不是这个批次的买家号），请重新开始批次」（`detail {run_id, end_reason: "identity_mismatch"}`）。本批次以「执行批次 #N 已结束：浏览器登录的买家号变了，这一笔在提交前中止（成功 …，中止 1）」结束，不算中断。
+- 重新开始批次马上可以（不用等租约到期），新批次会再领到这一笔。
+- 护栏的答复丢了、请求被重发（客户端在没说上话时原样再发，或浏览器在复用的连接上重发）时，拿到的就是上面那个 409：插件同样以「买家号变了」结束，不当成中断。
+
+提交登记被拒（409）时：服务端说已登记（`detail.attempt_status` 为 submitting / verifying，浏览器在连接断开后重发了同一个 POST）→ 上报 `unknown` 并结束批次；按最新配置复核护栏不过（`GUARD_BLOCKED`）→ 按 `detail.block_code` 上报失败（没给时报 `GUARD_BLOCKED`），计拦截，继续下一笔；复核是被 buyer 项拦下的（`detail.block_code = IDENTITY_MISMATCH`，并且 `detail.run_ended = true`、`detail.attempt_status = aborted`：存下的结算页买家号 ID 已不是批次账号当前登记的 ID）→ 没有登记提交，服务端已经中止这一笔并结束了批次，插件和护栏判定处一样不上报结果、不调用结束批次，以「买家号变了」结束（登记的答复丢了、浏览器重发时拿到的是 409 `LEASE_LOST`、`detail.end_reason = identity_mismatch`，同样处理，不报 `unknown`）；其他（上游已取消、账号暂停、买家号变了或登录状态过期、来源有变化 `SOURCE_CHANGED`……）→ 再问一次进度，按上表的 `cancel_code` 上报中止；进度仍说继续才报 `SUBMIT_REJECTED`。
 
 模拟的结算事实：小计 = 采购单价 × 数量（按整数分计算），运费 0，税费 0，总额 = 小计，送达日期 = 洛杉矶今天 + min(3, 配送上限)，邮编取任务的，卡尾号取尝试载荷里的期望卡尾号（未设置则为空），币种 USD，配送方 amazon，买家号 ID 取当前页面的读数（读不到为空，不拿别的值顶替）。成功时单号为 `SIM-<北京日期 YYYYMMDD>-<尝试 ID>`（尝试 ID 是服务端的 attempt_id，不是「第 N 次尝试」的序号）。模拟结果不写回飞书，可在控制台「清除模拟结果」。
 
@@ -201,7 +209,7 @@ npm run pack      # 构建并打包 → extension/release/采购助手-<版本>.
 - **结果一定送到。** 后台在发出结果之前先存回执；引擎遇到没说上话或 5xx，在租约预算内按退避重发**同一份**结果（服务端按重复上报认出来），期间照常续租；结果没送到之前绝不结束批次（结束会把已登记的尝试判成结果待核实）。引擎放弃之后后台接管：续租、补交（第一次立即补交，之后按退避），送达后结束批次；租约预算用完、或接管满 10 分钟（与引擎重发结果的上限相同，例如续租成功而结果接口一直 5xx）还送不到就放手：不再续租、不替它结束批次，由服务端在租约到期后清扫在途尝试，回执保留、之后继续补交，最多 24 小时。补交的时机：插件后台启动时、每次心跳成功时（不等退避），以及 30 秒一次的回执闹钟（按退避）。服务端的答复：200（含同一份重复上报的 `duplicate: true`）→ 送达；尝试已是「结果待核实」、或已由控制台核实（已下单 / 未下单）而这份不同 → 409 `CONFLICT`、`detail.late_receipt_recorded=true`（回执已记下，供人工核实）→ 也算送达；其他 4xx（含别的 409）→ 服务端明确不收，不再发；5xx、没说上话 → 留着。服务端暂时不认识这个浏览器（401）时回执留着：后台重新登记后再发。提交登记永远不进回执、永远不补发。有回执没送到时不能改服务端地址。
 - **三层互斥。** 本页单飞闸（重复点击、手动与定时同时触发只开一个）→ 本浏览器标签页租约（多个亚马逊标签页只有一个去申请批次）→ 服务端执行批次（跨电脑、跨浏览器的全局权威）。
 - **HTTP 200 不等于业务成功。** 每个接口都校验响应形状；护栏只有 `verdict === "pass"` 才算放行；提交登记只认 HTTP 200。
-- **只对「没说上话」重试，而且只对可以重复的请求。** 开始批次、领取、护栏、提交登记不自动重试（登记这个浏览器是幂等的，再试的节奏由后台按退避决定）；结果、进度、批次心跳、结束批次在服务端 5xx（事务已回滚）或插件后台没有响应时也原样再发。提交登记的响应没拿到时，插件停止并停止续租，交给服务端清扫（已登记 → 结果待核实，账号暂停），绝不再登记或点击第二次；浏览器在连接断开后把同一个 POST 重发、服务端回「该尝试已登记提交」（409，`attempt_status=submitting`）时，插件明白这就是「已登记、没点击」，上报 `unknown` 并结束批次，不当成「被拒」。护栏拦截的响应丢了、重发得到「尝试已结束（失败）」时按拦截计，继续下一笔。
+- **只对「没说上话」重试，而且只对可以重复的请求。** 开始批次、领取、提交登记不自动重试（登记这个浏览器是幂等的，再试的节奏由后台按退避决定）；护栏在后台到服务端这一段没说上话（连不上、超时）时原样再发（同一份事实的重新裁决），服务端 5xx 或插件后台没有响应时不再发；结果、进度、批次心跳、结束批次在服务端 5xx（事务已回滚）或插件后台没有响应时也原样再发。提交登记的响应没拿到时，插件停止并停止续租，交给服务端清扫（已登记 → 结果待核实，账号暂停），绝不再登记或点击第二次；浏览器在连接断开后把同一个 POST 重发、服务端回「该尝试已登记提交」（409，`attempt_status=submitting`）时，插件明白这就是「已登记、没点击」，上报 `unknown` 并结束批次，不当成「被拒」。护栏拦截的响应丢了、重发得到「尝试已结束（失败）」时按拦截计，继续下一笔；buyer 项拦截的响应丢了、重发得到「批次已结束」（409 `LEASE_LOST`，`detail.end_reason = identity_mismatch`）时按「买家号变了」结束本批次。
 - **所有等待都有界。** 每个请求 15 秒超时；后台消息有上界；单批次最多领取 200 笔。
 - **NULL 不是 0。** 读不到的金额、天数保持空值，交给服务端按「数据不可靠」拦截。
 
@@ -237,7 +245,9 @@ extension/
 - 心跳 `POST /heartbeat {ext_version, identity?}` 与身份上报 `POST /identity {signed_in, customer_id, site, page_url, conflict, ext_version}` 返回同一形状：`{device: {id, name}, login: {state, customer_id, at, stale}, account, device_run, server_time, bj_date, simulation_only}`。`login.state` 取 `unknown / signed_out / no_id / conflict / unregistered / ignored / ready`，认不出的按 `unknown`；`account` 只在 `ready` 时有；没有 `device.id` 或 `login` 的答复按「不是约定的形状」处理（旧版服务端）。
 - `POST /runs {customer_id, trigger, slot?, simulated: true}` → `{run_id, lease_ttl_s, lease_expires_at, account: {id, name}}`，插件按 `lease_ttl_s` 定续租节奏；早期的 `{id}`、`{run: {id}}` 也认。`slot` 只在 `trigger = "scheduled"` 时带。
 - 开始批次的拒绝：409 `DEVICE_BUSY`（`detail {run_id, account_name, since, lease_expires_at}`）、409 `ACCOUNT_BUSY`（`detail {holder_device_id, holder_device_name, since}`）、409 `SLOT_DONE`、403 `IDENTITY_MISMATCH`（`detail {login_state, identity_at, stale}`）、403 `ACCOUNT_NOT_REGISTERED`、403 `ACCOUNT_PAUSED`、403 `REAL_PURCHASE_DISABLED`、422（定时的时间点不对）。
-- `POST /runs/{id}/finish` 的 `reason` 恒为契约缺省的 `finished`，插件的细分原因放在 `detail`（completed、stopped、attempt_cap、result_unknown、submit_rejected、buyer_changed……）。
+- `POST /runs/{id}/finish` 的 `reason` 恒为契约缺省的 `finished`，插件的细分原因放在 `detail`（completed、stopped、attempt_cap、result_unknown、submit_rejected……）；返回 `{run_id, ended_at, end_reason, stats}`，插件不读它的内容。
+- 批次的结束原因（服务端的 `end_reason`）是封闭取值：`finished`（插件结束）、`lease_expired`、`simulation_reset`、`identity_mismatch`（护栏 buyer 项拦下、服务端自己结束，插件不调用 `/finish`），历史批次里还有 `device_revoked`（「浏览器的授权已撤销（旧版）」，与服务端、控制台同一句）。批次失效后的请求一律 409 `LEASE_LOST`：已结束的是「执行批次已结束（<结束原因>），请重新开始批次」、`detail {run_id, end_reason}`，租约过期的是 `detail {run_id, lease_expires_at}`。
+- 护栏的返回 `{verdict, code, reasons, checks, delivery_days, total_for_cap, fulfillment}`：插件只看 `verdict`、`code`、`reasons`。`code = IDENTITY_MISMATCH` 时 200 的形状不变（没有额外的键），「批次已由服务端结束」是这个拦截码的约定；提交登记复核处的 409 `GUARD_BLOCKED` 则在 `detail` 里写明 `{block_code, reasons, attempt_status: "aborted", order_status, run_ended: true, end_reason: "identity_mismatch"}`。
 - 进度返回 `{continue, cancel_reason, cancel_code}`（契约 §5 第 7 步）：`cancel_code` 在 continue=true 时为 null，否则取 `UPSTREAM_CANCELLED` / `ACCOUNT_ARCHIVED` / `ACCOUNT_PAUSED` / `IDENTITY_MISMATCH` / `IDENTITY_STALE` / `SOURCE_HOLD` / `SOURCE_CHANGED` / `ATTEMPT_FINISHED`（上报规则见上表）。
 - 批次心跳的 `stop_reason` 取 `account_paused` / `account_archived` / `identity_mismatch`。
 - 护栏事实（契约 §4）多一项 `customer_id`。
@@ -245,7 +255,7 @@ extension/
 - 几分钟前读的、这一轮哪个标签页都没读到的身份结论不再当成「刚读到」上报（服务端看到的「最近上报」得是真的）；有分歧的结论例外，它只会让服务端拒绝。
 - 登记的 429 `RATE_LIMITED` 读 `detail.retry_after_s`，没有时读 `Retry-After` 响应头，再没有按 60 秒。
 - 错误码表（`core/codes.ts` 的 `SERVER_CODE_LABEL`）与开发契约 §8、控制台的 `API_ERROR_CODES` 同序，测试钉住。`IDENTITY_MISMATCH` 是中止类，不是账号级。
-- 插件上报的尝试失败码：`OUT_OF_STOCK`、`PAGE_LOAD_FAILED`、`CAPTCHA_ENCOUNTERED`、`ABORTED_UPSTREAM_CANCELLED`、`ABORTED_BY_SERVER`（只在服务端给了 `cancel_code` 时；服务端按中止类处理）、护栏拦截码（原样；护栏没给拦截码时 `GUARD_BLOCKED`；提交前复核护栏不过时取 `detail.block_code`；护栏以 `IDENTITY_MISMATCH` 拦截时服务端已经结束了这一笔，插件不再上报），以及少见的 `SUBMIT_REJECTED`（登记被拒且不是上游取消、也不是复核护栏不过）、`PLUGIN_SIMULATION_ONLY`（服务端下发了非模拟尝试，插件拒绝执行；账号级，服务端暂停账号，本批次结束）。
+- 插件上报的尝试失败码：`OUT_OF_STOCK`、`PAGE_LOAD_FAILED`、`CAPTCHA_ENCOUNTERED`、`ABORTED_UPSTREAM_CANCELLED`、`ABORTED_BY_SERVER`（只在服务端给了 `cancel_code` 时；服务端按中止类处理）、护栏拦截码（原样；护栏没给拦截码时 `GUARD_BLOCKED`；提交前复核护栏不过时取 `detail.block_code`；护栏或提交前的复核以 `IDENTITY_MISMATCH` 拦截时服务端已经中止了这一笔并结束了批次，插件不再上报，也不结束批次），以及少见的 `SUBMIT_REJECTED`（登记被拒且不是上游取消、也不是复核护栏不过）、`PLUGIN_SIMULATION_ONLY`（服务端下发了非模拟尝试，插件拒绝执行；账号级，服务端暂停账号，本批次结束）。
 - 批次心跳的 `stop=true` 在当前这一笔结束后生效（模拟的一笔在毫秒级完成）。真实驱动接入时需要在每一步之间检查。
 
 ## 还没有实机核实的浏览器行为

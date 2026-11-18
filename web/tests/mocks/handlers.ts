@@ -57,10 +57,44 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
   fx.overview.feishu_configured = feishuConfigured
 
   const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/
-  /** 输入：无 → 输出：无。按「账号上登记的 ID」「已忽略的 ID」重算每个浏览器的登录状态、账号的所在浏览器、待登记列表与概览计数 */
+  /** 忽略名单：不要求此刻有浏览器登录着（include_ignored=1 时全部列出，否则无处恢复） */
+  const ignoredIds = new Set(fx.discovered.filter((x) => x.ignored).map((x) => x.customer_id))
+  /** 已经有采购结果或不再采购的状态：这些任务上来源指定的买家号 ID 不并入待登记列表 */
+  const DONE: OrderStatus[] = ['purchased', 'closed', 'cancelled']
+  /**
+   * 输入：无 → 输出：无。同服务端「登记后任务立刻分给它」的最小模拟：来源指定了买家号 ID、停在待分配的任务，
+   * 这个 ID 已登记到账号上时，账号接得了就分给它（分配方式「来源指定」），接不了就写明原因；列表行与详情一起改。
+   */
+  function assignDesignated(): void {
+    for (const d of Object.values(fx.details)) {
+      const id = d.designated_buyer?.customer_id
+      if (d.status !== 'queued' || !id) continue
+      const a = fx.accounts.find((x) => x.amazon_customer_id === id)
+      if (!a) continue
+      const ref = { id: a.id, name: a.name }
+      const sub = d.subtotal_eff === null ? null : Number(d.subtotal_eff)
+      const fits = sub !== null && sub >= Number(a.min_amount ?? 0) && (a.max_amount === null || sub <= Number(a.max_amount))
+      const patch: Partial<OrderRow> = !a.purchase_enabled
+        ? { status_reason: `来源指定的账号 ${a.name} 已关闭采购开关，不接收新分配；打开开关后会自动分配` }
+        : !fits
+          ? { status_reason: `金额不在来源指定的账号 ${a.name} 的区间内；调整账号的金额区间，或改派到其他账号` }
+          : { status: 'assigned', status_reason: null, assigned_account: ref, assignment_kind: 'source', assignment_note: `按来源的买家号 ID ${id}` }
+      const next: Partial<OrderRow> = { ...patch, designated_buyer: { customer_id: id, name: d.designated_buyer?.name ?? null, account: ref } }
+      Object.assign(d, next)
+      if (patch.status === 'assigned') d.allowed_actions = ['assign', 'unassign', 'override', 'cancel']
+      const row = fx.orders.find((o) => o.id === d.id)
+      if (row) Object.assign(row, next)
+    }
+    const count = (st: OrderStatus) => fx.orders.filter((o) => o.status === st).length
+    fx.overview.counts = { ...fx.overview.counts, queued: count('queued'), assigned: count('assigned') }
+  }
+  /**
+   * 输入：无 → 输出：无。按「账号上登记的 ID」「忽略名单」重算每个浏览器的登录状态、账号的所在浏览器、待登记列表与概览计数。
+   * 待登记列表 = 浏览器上报的未登记 ID ∪ 未采购任务上来源指定的、形状合格、没有账号登记的买家号 ID（契约 §8）；
+   * 每项带 source_orders（指定它的未采购任务数）；忽略名单里的 ID 全部列出（带 ignored）。
+   */
   function syncBuyers(): void {
     const registered = new Map(fx.accounts.filter((a) => a.amazon_customer_id).map((a) => [a.amazon_customer_id as string, a]))
-    const ignoredIds = new Set(fx.discovered.filter((x) => x.ignored).map((x) => x.customer_id))
     for (const d of fx.devices) {
       const id = d.login.customer_id
       if (!id || !['ready', 'unregistered', 'ignored'].includes(d.login.state)) continue
@@ -72,17 +106,31 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
     const ref = (d: (typeof shown)[number]) => ({ id: d.id, name: d.name, online: d.online, last_seen_at: d.last_seen_at })
     for (const a of fx.accounts) a.browsers = a.amazon_customer_id ? shown.filter((d) => d.login.customer_id === a.amazon_customer_id).map(ref) : []
     const hints = new Map(fx.discovered.map((x) => [x.customer_id, x.name_hint]))
-    const open = [...new Set(shown.map((d) => d.login.customer_id).filter((id): id is string => !!id && !registered.has(id)))]
-    fx.discovered = open.map((id) => {
+    // 来源指定的买家号 ID：只算未采购的任务、形状合格的 ID
+    const bySource = new Map<string, OrderRow[]>()
+    for (const o of Object.values(fx.details)) {
+      const id = o.designated_buyer?.customer_id
+      if (!id || DONE.includes(o.status) || !CUSTOMER_ID_RE.test(id)) continue
+      bySource.set(id, [...(bySource.get(id) ?? []), o])
+    }
+    const reported = shown.map((d) => d.login.customer_id).filter((id): id is string => !!id)
+    const open = [...new Set([...reported, ...bySource.keys(), ...ignoredIds])].filter((id) => !registered.has(id))
+    const items = open.map((id) => {
       const on = shown.filter((d) => d.login.customer_id === id)
+      const tasks = bySource.get(id) ?? []
       return {
         customer_id: id,
         ignored: ignoredIds.has(id),
         browsers: on.map(ref),
         last_reported_at: on.map((d) => d.login.at).filter((t): t is string => !!t).sort().at(-1) ?? null,
-        name_hint: hints.get(id) ?? null,
+        // 名称优先取这些任务上来源写的「买家号」
+        name_hint: tasks.map((o) => o.designated_buyer?.name).find((n) => !!n) ?? hints.get(id) ?? null,
+        source_orders: tasks.length,
       }
     })
+    // 最近上报的在前；没有浏览器上报过的（只来自来源，或只在忽略名单里）排在后面
+    const at = (x: (typeof items)[number]) => x.last_reported_at ?? ''
+    fx.discovered = items.sort((x, y) => at(y).localeCompare(at(x)) || y.source_orders - x.source_orders || x.customer_id.localeCompare(y.customer_id))
     fx.overview.devices = { total: shown.length, online: shown.filter((d) => d.online).length }
     fx.overview.discovered_buyers = fx.discovered.filter((x) => !x.ignored).length
   }
@@ -166,9 +214,11 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         const a = fx.accounts.find((x) => x.id === b.account_id)
         if (!a) return err(422, 'VALIDATION', '目标账号不存在')
         if (!a.purchase_enabled) return err(409, 'CONFLICT', '目标账号的采购开关已关闭')
-        Object.assign(d, { status: 'assigned', assigned_account: { id: a.id, name: a.name }, assignment_kind: 'manual', assignment_note: '人工改派' })
+        // 人工改派优先于来源指定：分配方式变成 manual，任务上的指定（designated_buyer）原样保留
+        Object.assign(d, { status: 'assigned', status_reason: null, assigned_account: { id: a.id, name: a.name }, assignment_kind: 'manual', assignment_note: '人工改派' })
       } else if (action === 'unassign') {
-        Object.assign(d, { status: 'queued', assigned_account: null, assignment_kind: null, assignment_note: null })
+        // 解除分配不清指定：下一次分配会再按来源指定分给那个账号
+        Object.assign(d, { status: 'queued', status_reason: '人工解除分配', assigned_account: null, assignment_kind: null, assignment_note: null })
       } else if (action === 'cancel') {
         Object.assign(d, { status: 'cancelled', status_reason: `人工取消：${String(b.note ?? '')}`, allowed_actions: ['uncancel'] })
       } else if (action === 'review') {
@@ -221,6 +271,8 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         updated_at: now.toISOString(),
       }
       fx.accounts.push(created)
+      // 新建账号后立刻重新分配：来源指定给这个买家号 ID 的任务分给它
+      assignDesignated()
       syncBuyers()
       return ok(created)
     }
@@ -231,8 +283,10 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
     if ((r = /^\/accounts\/discovered\/(ignore|unignore)$/.exec(path)) && m === 'POST') {
       const id = String(b.customer_id ?? '')
       if (!CUSTOMER_ID_RE.test(id)) return err(422, 'VALIDATION', '买家号 ID 以 A 开头，后面至少 8 位大写字母或数字', { field: 'customer_id' })
-      const item = fx.discovered.find((x) => x.customer_id === id)
-      if (item) item.ignored = r[1] === 'ignore'
+      // 忽略名单与此刻有没有浏览器登录着无关
+      const ignoring = r[1] === 'ignore'
+      if (ignoring) ignoredIds.add(id)
+      if (!ignoring && ignoredIds.has(id)) ignoredIds.delete(id)
       syncBuyers()
       return ok({ ok: true })
     }
@@ -247,6 +301,8 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
           if (a.active_run || (a.open_result_unknown ?? 0) > 0) return err(409, 'CONFLICT', '账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID')
         }
         Object.assign(a, b)
+        // 改买家号 ID 也触发重新分配（契约 §3.2）
+        assignDesignated()
         syncBuyers()
       }
       return ok(a)

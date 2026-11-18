@@ -58,6 +58,6 @@ cd extension && npm run build && npm test
 
 ## 测试
 
-- 后端：pytest，真实 PostgreSQL；`tests/conftest.py` 每个会话建临时库，每个测试前清空。每个服务模块都要有测试，v2 方案 §4 的验收条目必须有对应用例。
+- 后端：pytest，真实 PostgreSQL；`tests/conftest.py` 每个会话建临时库，每个测试前清空。每个服务模块都要有测试，v2 方案 §4、§7.5 的验收条目必须有对应用例。
 - 前端：`vue-tsc --noEmit` + `vite build` 必须通过；纯函数用 vitest。
 - 插件：TypeScript 编译 + Node 单测（纯函数与协议客户端）。

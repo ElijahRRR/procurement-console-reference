@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
- * 待登记的买家号：插件在浏览器里读到、还没登记到任何账号的买家号 ID（GET /accounts/discovered）。
+ * 待登记的买家号：还没登记到任何账号的买家号 ID（GET /accounts/discovered）——插件在浏览器里读到的，
+ * 加上来源指定给未采购任务、还没有账号登记的（这种没有浏览器登录着，写明「来源指定了 N 笔任务」）。
  * 有条目才显示；页面可见时每 10 秒自动刷新。每行三个动作：
  * 「登记」（交给上层打开账号对话框，ID 与名称已填）、「填到已有账号」（选一个还没登记 ID 的账号，确认后 PATCH）、「忽略」。
- * 底部「已忽略 N 个」可展开，每行「恢复」。
+ * 底部「已忽略 N 个」可展开：列出忽略名单里的全部 ID（不要求此刻有浏览器登录着），每行「恢复」。
  */
 import { computed, onMounted, ref } from 'vue'
 import type { Account, DiscoveredBuyer } from '@/api/types'
@@ -11,7 +12,16 @@ import * as accountsApi from '@/api/accounts'
 import AppIcon from '@/components/AppIcon.vue'
 import StatusDot from '@/components/StatusDot.vue'
 import { useVisiblePolling } from '@/composables/useVisiblePolling'
-import { IGNORE_CONFIRM_TEXT, fillConfirmText, fillTargets, splitDiscovered, suggestedFillTarget } from '@/utils/accounts'
+import {
+  IGNORE_CONFIRM_TEXT,
+  NO_BROWSER_TEXT,
+  fillConfirmText,
+  fillTargets,
+  registeredEffectText,
+  sourceOrdersText,
+  splitDiscovered,
+  suggestedFillTarget,
+} from '@/utils/accounts'
 import { copyText } from '@/utils/clipboard'
 import { failureText, formatDateTime, formatNumber, formatRelative } from '@/utils/format'
 import { confirmAction, notifyFailure, notifySuccess, toast } from '@/utils/feedback'
@@ -75,7 +85,7 @@ async function fill(item: DiscoveredBuyer, accountId: unknown) {
   busy.value = `fill-${item.customer_id}`
   try {
     await accountsApi.updateAccount(target.id, { amazon_customer_id: item.customer_id })
-    notifySuccess(`已把买家号 ID 登记到「${target.name}」`, '登录着这个买家号的浏览器现在可以领取它的任务。')
+    notifySuccess(`已把买家号 ID 登记到「${target.name}」`, registeredEffectText(item))
     emit('changed')
     await load()
   } catch (e) {
@@ -128,7 +138,7 @@ async function restore(item: DiscoveredBuyer) {
             <h3 class="text-base font-semibold text-gray-900 dark:text-white">待登记的买家号</h3>
             <el-tag size="small" type="warning" disable-transitions>{{ formatNumber(pending.length) }} 个</el-tag>
           </div>
-          <p class="text-xs font-normal text-gray-500 dark:text-dark-400">插件在浏览器里读到了这些买家号。登记后才会分到任务；这里每 10 秒自动刷新。</p>
+          <p class="text-xs font-normal text-gray-500 dark:text-dark-400">插件在浏览器里读到、或来源指定了这些买家号。登记后才会分到任务；这里每 10 秒自动刷新。</p>
         </div>
       </template>
 
@@ -141,6 +151,7 @@ async function restore(item: DiscoveredBuyer) {
                 <el-button text size="small" aria-label="复制买家号 ID" @click="copy(item.customer_id)"><AppIcon name="copy" size="sm" /></el-button>
               </el-tooltip>
             </div>
+            <p v-if="sourceOrdersText(item)" class="mt-1 text-xs font-medium text-gray-700 dark:text-gray-300" data-testid="source-orders">{{ sourceOrdersText(item) }}</p>
             <p v-if="suggestedOf(item)" class="mt-1 text-xs text-amber-700 dark:text-amber-400">
               来源里这个买家号叫「{{ item.name_hint }}」，已有同名账号还没登记买家号 ID，可以直接填到它上面。
             </p>
@@ -150,7 +161,7 @@ async function restore(item: DiscoveredBuyer) {
             <div class="text-xs text-gray-500 dark:text-dark-400">所在浏览器</div>
             <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1">
               <StatusDot v-for="b in item.browsers" :key="b.id" :color="b.online ? 'green' : 'gray'" :label="b.online ? b.name : `${b.name}（离线）`" />
-              <span v-if="!item.browsers.length" class="text-sm text-gray-400 dark:text-dark-500">—</span>
+              <span v-if="!item.browsers.length" class="text-sm text-gray-500 dark:text-dark-400">{{ NO_BROWSER_TEXT }}</span>
             </div>
           </div>
           <div class="basis-28">
@@ -194,7 +205,9 @@ async function restore(item: DiscoveredBuyer) {
             <div class="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
               <span class="code pc-code-wrap select-all">{{ item.customer_id }}</span>
               <StatusDot v-for="b in item.browsers" :key="b.id" :color="b.online ? 'green' : 'gray'" :label="b.online ? b.name : `${b.name}（离线）`" />
-              <span class="whitespace-nowrap text-xs text-gray-500 dark:text-dark-400" :title="formatDateTime(item.last_reported_at)">最近上报 {{ formatRelative(item.last_reported_at) }}</span>
+              <span v-if="item.last_reported_at" class="whitespace-nowrap text-xs text-gray-500 dark:text-dark-400" :title="formatDateTime(item.last_reported_at)">最近上报 {{ formatRelative(item.last_reported_at) }}</span>
+              <span v-else-if="!item.browsers.length" class="text-xs text-gray-500 dark:text-dark-400">{{ NO_BROWSER_TEXT }}</span>
+              <span v-if="sourceOrdersText(item)" class="whitespace-nowrap text-xs text-gray-500 dark:text-dark-400">{{ sourceOrdersText(item) }}</span>
             </div>
             <el-button size="small" :loading="busy === `restore-${item.customer_id}`" @click="restore(item)">恢复</el-button>
           </li>

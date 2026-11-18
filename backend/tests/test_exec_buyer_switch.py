@@ -3,7 +3,9 @@
 - 执行中途换了买家号（或退出登录、读数不一致、太久没上报）：未登记提交的那一笔在进度 / 提交登记处被拦下并中止，
   任务回已分配、不暂停账号、不占额度；已登记提交的照常收结果。
 - 结果上报、结束批次、迟到回执不做身份检查（回执不丢）。
-- 护栏的 buyer 项把「谁在下单」钉在结算页：结算页读到的买家号 ID 必须是批次账号登记的那个。
+- 护栏的 buyer 项把「谁在下单」钉在结算页：结算页读到的买家号 ID 必须是批次账号登记的那个。它拦下时（护栏判定处、
+  提交登记复核处）按中止类落地：尝试 aborted（IDENTITY_MISMATCH）、任务回已分配、不进异常、不暂停账号，批次同时被
+  服务端结束（end_reason = identity_mismatch）——同一批次不会再领到同一笔（方案 v2 修订二验收第 10 条）。
 - 提交登记、开始批次先锁浏览器行，和并发的身份上报串行。
 全部数据虚构。"""
 
@@ -15,7 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from registry import db
-from services import accounts, clock, devices, execution, quota
+from services import accounts, clock, devices, execution, orders, quota
 from services.errors import DomainError
 from tests import factories as f
 from tests import factories_exec as fx
@@ -198,22 +200,182 @@ def test_baseline_is_the_account_current_customer_id(conn, workspace):
 # ── 护栏 buyer 项 ─────────────────────────────────────────────────────────────
 
 
+def _events(conn, entity: str, entity_id: int, kind: str) -> list[dict]:
+    return [r["detail"] for r in conn.execute(
+        "SELECT detail FROM procure.events WHERE entity = %s AND entity_id = %s AND kind = %s ORDER BY id",
+        (entity, entity_id, kind)).fetchall()]
+
+
+def _assert_run_is_over(conn, e, aid: int) -> None:
+    """批次被服务端结束之后，插件对它的每一种请求都得到「批次已结束」的既有答复（409 LEASE_LOST），不报 500、
+    不改任何东西、不会再建第二笔尝试。"""
+    ended = "执行批次已结束（结算页登录的买家号不是这个批次的买家号），请重新开始批次"
+    for call in (lambda: execution.next_attempt(conn, e["dev"], e["run_id"]),
+                 lambda: execution.run_heartbeat(conn, e["dev"], e["run_id"]),
+                 lambda: execution.finish_run(conn, e["dev"], e["run_id"]),
+                 lambda: execution.finish_run(conn, e["dev"], e["run_id"], "buyer_changed", "DEMO"),
+                 lambda: execution.progress(conn, e["dev"], aid, stage="before_submit"),
+                 lambda: execution.submit_guard(conn, e["dev"], aid, fx.facts_for(conn, e["order"])),
+                 lambda: execution.mark_submitting(conn, e["dev"], aid),
+                 lambda: execution.mark_verifying(conn, e["dev"], aid, "DEMO")):
+        err = _err(call)
+        assert (err.code, err.http_status, err.message) == ("LEASE_LOST", 409, ended)
+        assert err.detail == {"run_id": e["run_id"], "end_reason": "identity_mismatch"}
+    # 这笔尝试再报结果：报的正是 IDENTITY_MISMATCH 的失败 → 原样返回（duplicate）；别的 → CONFLICT
+    dup = execution.report_result(conn, e["dev"], aid, fx.failure_payload("IDENTITY_MISMATCH", "DEMO"))
+    assert dup == {"attempt_status": "aborted", "order_status": "assigned", "duplicate": True}
+    for payload in (fx.failure_payload("ABORTED_BY_SERVER", "DEMO"), fx.failure_payload("GUARD_BLOCKED", "DEMO"),
+                    fx.success_payload(e["a"]), fx.failure_payload(None, "DEMO", outcome="unknown")):
+        err = _err(execution.report_result, conn, e["dev"], aid, payload)
+        assert err.code == "CONFLICT" and err.http_status == 409 and "已中止" in err.message
+    assert f.count(conn, "purchase_attempts", "purchase_order_id = %s", (e["order"]["id"],)) == 1
+    run = fx.run_row(conn, e["run_id"])
+    assert run["end_reason"] == "identity_mismatch" and run["stats"] == {"claimed": 1, "aborted": 1}
+    assert len(_events(conn, "run", e["run_id"], "run.ended")) == 1                  # 只结束一次
+
+
+def _assert_aborted_not_exception(conn, e, aid: int, reason: str) -> dict:
+    """尝试中止（IDENTITY_MISMATCH）、任务回已分配并留在原账号、不进异常、不暂停账号、不占额度。"""
+    att = fx.attempt_row(conn, aid)
+    assert (att["status"], att["error_code"], att["submitted_at"]) == ("aborted", "IDENTITY_MISMATCH", None)
+    assert att["error_detail"] == reason and att["finished_at"] == NOW
+    o = fx.order_row(conn, e["order"]["id"])
+    assert (o["status"], o["assigned_account_id"], o["current_attempt_id"]) == ("assigned", e["acc"]["id"], None)
+    assert o["assignment_kind"] == "auto" and o["status_reason"] == f"{reason}，未提交前中止，任务保留待重新领取"
+    assert o["page_load_retries"] == 0 and o["needs_attention"] is False
+    assert not _paused(conn, e) and f.count(conn, "events", "kind = %s", (execution.PAUSE_MARKER_KIND,)) == 0
+    assert f.count(conn, "events", "kind = 'account.paused'") == 0
+    assert quota.used(conn, e["acc"]["id"], TODAY, True) == 0
+    status_events = _events(conn, "order", e["order"]["id"], "order.status_changed")
+    assert [(d["from"], d["to"]) for d in status_events][-1] == ("executing", "assigned")
+    assert not any(d["to"] == "exception" for d in status_events)
+    return att
+
+
 def test_guard_blocks_when_checkout_page_shows_another_buyer(conn, workspace):
-    """浏览器上报的登录状态没变，但结算页当场读到的是另一个买家号：护栏拦截，这一单不会被提交。"""
+    """验收第 10 条（护栏判定处）：浏览器上报的登录状态没变，但结算页当场读到的是另一个买家号——这一笔提交前中止、
+    任务回已分配、批次结束，不进异常、不暂停账号；插件拿到的裁决照旧是 block / IDENTITY_MISMATCH。"""
     e = _claimed(conn, workspace)
     aid, cid = e["a"]["attempt_id"], e["acc"]["amazon_customer_id"]
     execution.progress(conn, e["dev"], aid, stage="checkout")
     v = execution.submit_guard(conn, e["dev"], aid, fx.facts_for(conn, e["order"], customer_id=OTHER))
     assert v["verdict"] == "block" and v["code"] == "IDENTITY_MISMATCH"
     assert v["checks"]["buyer"] == {"ok": False, "expected": cid, "actual": OTHER}
-    assert v["reasons"] == [f"结算页登录的买家号（{OTHER}）不是这个批次的买家号（{cid}）"]
-    att = fx.attempt_row(conn, aid)
-    assert att["status"] == "failed" and att["error_code"] == "IDENTITY_MISMATCH" and att["submitted_at"] is None
-    assert att["guard_input"]["customer_id"] == OTHER
+    reason = f"结算页登录的买家号（{OTHER}）不是这个批次的买家号（{cid}）"
+    assert v["reasons"] == [reason]
+    assert set(v) == {"verdict", "code", "reasons", "checks", "delivery_days", "total_for_cap", "fulfillment"}
+    att = _assert_aborted_not_exception(conn, e, aid, reason)
+    assert att["stage"] == "guard" and att["guard_input"]["customer_id"] == OTHER
+    assert att["guard_verdict"]["code"] == "IDENTITY_MISMATCH" and att["delivery_days"] == 3
+    # 事件：护栏拦截、尝试中止、批次结束（同一个事务里）
+    assert _events(conn, "attempt", aid, "attempt.guard_blocked") == [
+        {"code": "IDENTITY_MISMATCH", "reasons": [reason], "at": "guard"}]
+    assert _events(conn, "attempt", aid, "attempt.aborted") == [
+        {"error_code": "IDENTITY_MISMATCH", "reason": reason, "run_id": e["run_id"]}]
+    assert _events(conn, "attempt", aid, "attempt.failed") == []
+    assert _events(conn, "run", e["run_id"], "run.ended") == [
+        {"end_reason": "identity_mismatch", "account_id": e["acc"]["id"], "device_id": e["dev"]["id"], "aborted": 0,
+         "unknown": 0, "attempt_id": aid, "at": "guard", "reason": reason}]
+    run = fx.run_row(conn, e["run_id"])
+    assert run["ended_at"] == NOW and run["end_reason"] == "identity_mismatch"
+    _assert_run_is_over(conn, e, aid)
+
+
+def test_buyer_block_does_not_loop_and_a_new_run_can_pick_the_task_up_again(conn, workspace):
+    """不循环：拦下之后同一个批次领不到任何东西（批次已结束）；重新开始的批次才会再领到这一笔，结算页读数对了就照常
+    买完。任务与账号都没有留下需要人工处理的状态。"""
+    e = _claimed(conn, workspace)
+    aid = e["a"]["attempt_id"]
+    other_order = fx.assigned_order(conn, e["ws"], e["acc"])                      # 同一账号上还有别的可领任务
+    execution.submit_guard(conn, e["dev"], aid, fx.facts_for(conn, e["order"], customer_id=OTHER))
+    for _ in range(3):
+        assert _err(execution.next_attempt, conn, e["dev"], e["run_id"]).code == "LEASE_LOST"
+    assert f.count(conn, "purchase_attempts") == 1
+    assert fx.order_row(conn, other_order["id"])["status"] == "assigned"
+    # 浏览器的批次已经放开：马上能开新批次（不会 DEVICE_BUSY / ACCOUNT_BUSY），按顺序再领到同一笔
+    run2 = fx.start(conn, e["dev"])
+    assert run2 != e["run_id"]
+    b = fx.claim(conn, e["dev"], run2)
+    assert (b["order_id"], b["attempt_no"], b["kind"]) == (e["order"]["id"], 2, "auto")
+    assert fx.complete_success(conn, e["dev"], b) == {"attempt_status": "succeeded", "order_status": "purchased"}
+    assert fx.claim(conn, e["dev"], run2)["order_id"] == other_order["id"]
+    assert not _paused(conn, e)
+
+
+def test_buyer_block_at_guard_for_an_upstream_cancelled_task_cancels_it(conn, workspace):
+    """中止类的既有规则照旧：上游在执行期间取消了的任务，中止后直接转已取消（不回已分配）；批次同样结束。"""
+    e = _claimed(conn, workspace)
+    aid = e["a"]["attempt_id"]
+    conn.execute("UPDATE procure.purchase_orders SET upstream_cancelled = true, upstream_cancel_note = '已取消' "
+                 "WHERE id = %s", (e["order"]["id"],))
+    v = execution.submit_guard(conn, e["dev"], aid, fx.facts_for(conn, e["order"], customer_id=OTHER))
+    assert v["code"] == "IDENTITY_MISMATCH"
     o = fx.order_row(conn, e["order"]["id"])
-    assert o["status"] == "exception" and "结算页登录的买家号" in o["status_reason"]
-    assert not _paused(conn, e) and quota.used(conn, e["acc"]["id"], TODAY, True) == 0
-    assert _err(execution.mark_submitting, conn, e["dev"], aid).code == "CONFLICT"
+    assert o["status"] == "cancelled" and o["assigned_account_id"] is None
+    assert fx.attempt_row(conn, aid)["status"] == "aborted" and not _paused(conn, e)
+    assert fx.run_row(conn, e["run_id"])["end_reason"] == "identity_mismatch"
+
+
+def test_buyer_block_rederives_the_task_when_the_source_changed_after_claim(conn, workspace):
+    """任务回已分配后按派生规则重新校验：领取后来源改了执行相关字段，中止时照样落到任务上（转待核实），
+    不会带着过时的内容留在已分配。"""
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws, name="环境-DEMO-A")
+    dev = fx.logged_in_device(conn, workspace, account=acc, name="Mac-DEMO")
+    src = f.feishu_source(conn, ws, "recDEMOBUYER1")
+    order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no="PO-DEMO-BUYER-1")
+    run_id = fx.start(conn, dev)
+    a = fx.claim(conn, dev, run_id)
+    changed = f.make_record(upstream_order_no="PO-DEMO-BUYER-1", quantity=3)
+    orders.ingest(conn, ws, changed, src)                                         # 采购开始后：只记在来源关联上
+    assert fx.order_row(conn, order["id"])["quantity"] == 1
+    v = execution.submit_guard(conn, dev, a["attempt_id"], fx.facts_for(conn, order, customer_id=OTHER))
+    assert v["code"] == "IDENTITY_MISMATCH"
+    o = fx.order_row(conn, order["id"])
+    assert o["status"] == "conflict" and o["needs_attention"] is True and "数量" in o["status_reason"]
+    assert o["assigned_account_id"] is None
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert (att["status"], att["error_code"]) == ("aborted", "IDENTITY_MISMATCH")
+    assert fx.run_row(conn, run_id)["end_reason"] == "identity_mismatch"
+    assert not fx.account_row(conn, acc["id"])["execution_paused"]
+
+
+def test_buyer_block_ending_a_scheduled_run_leaves_the_slot_free_for_another_browser(conn, workspace):
+    """定时批次被 buyer 项拦截结束：和租约过期一样不占这个时间点（只有 finished 才占），登录着正确买家号的另一个
+    浏览器今天还能为同一个时间点开批次，把放下的那一笔做完。"""
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws, name="环境-DEMO-定时", purchase_mode="scheduled", schedule_times=["09:30"])
+    dev = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-1")
+    order = fx.assigned_order(conn, ws, acc)
+    run_id = fx.start(conn, dev, trigger="scheduled", slot="09:30")
+    a = fx.claim(conn, dev, run_id)
+    execution.submit_guard(conn, dev, a["attempt_id"], fx.facts_for(conn, order, customer_id=OTHER))
+    run = fx.run_row(conn, run_id)
+    assert (run["end_reason"], run["scheduled_slot"]) == ("identity_mismatch", "09:30")
+    pc = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-2")
+    again = fx.start(conn, pc, trigger="scheduled", slot="09:30")
+    b = fx.claim(conn, pc, again)
+    assert b["order_id"] == order["id"] and b["attempt_no"] == 2
+    assert fx.complete_success(conn, pc, b)["order_status"] == "purchased"
+    execution.finish_run(conn, pc, again)
+    assert _err(fx.start_run, conn, dev, trigger="scheduled", slot="09:30").code == "SLOT_DONE"
+
+
+def test_run_end_reason_labels_cover_the_new_and_the_legacy_reason(conn, workspace):
+    """批次结束原因的中文：identity_mismatch 是护栏 buyer 项拦截时服务端写的；device_revoked 只剩历史行，标签三端
+    统一为「浏览器的授权已撤销（旧版）」。两种批次之后的请求都得到带这句话的 LEASE_LOST。"""
+    assert execution.END_REASON_ZH == {
+        "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）",
+        "identity_mismatch": "结算页登录的买家号不是这个批次的买家号", "device_revoked": "浏览器的授权已撤销（旧版）",
+        "simulation_reset": "已清除模拟结果"}
+    assert (execution.BUYER_BLOCK_CODE, execution.BUYER_BLOCK_END_REASON) == ("IDENTITY_MISMATCH", "identity_mismatch")
+    assert execution.BUYER_BLOCK_END_REASON in execution.STOP_REASONS             # 与批次心跳的停止原因同一个词
+    e = _claimed(conn, workspace)
+    conn.execute("UPDATE procure.execution_runs SET ended_at = %s, end_reason = 'device_revoked' WHERE id = %s",
+                 (NOW, e["run_id"]))                                              # 旧版留下的历史行
+    err = _err(execution.run_heartbeat, conn, e["dev"], e["run_id"])
+    assert err.code == "LEASE_LOST" and err.message == "执行批次已结束（浏览器的授权已撤销（旧版）），请重新开始批次"
+    assert err.detail == {"run_id": e["run_id"], "end_reason": "device_revoked"}
 
 
 @pytest.mark.parametrize("cid", [None, "", "not-an-id", 12345])
@@ -237,9 +399,55 @@ def test_guard_passes_with_matching_checkout_buyer_and_recheck_uses_current_acco
     # 提交登记时按账号当前登记的 ID 复核存下的事实：账号的 ID 与浏览器的登录一起被换掉（身份检查过了）也拦得住
     conn.execute("UPDATE procure.buyer_accounts SET amazon_customer_id = %s WHERE id = %s", (OTHER, e["acc"]["id"]))
     devices.report_identity(conn, e["dev"], fx.identity(OTHER))
-    err = _err(execution.mark_submitting, conn, e["dev"], aid)
-    assert err.code == "GUARD_BLOCKED" and err.detail["block_code"] == "IDENTITY_MISMATCH"
+    out = execution.mark_submitting(conn, e["dev"], aid)
+    assert out["ok"] is False and out["blocked"] is True and out["code"] == "GUARD_BLOCKED"
+    assert out["detail"]["block_code"] == "IDENTITY_MISMATCH"
     assert fx.attempt_row(conn, aid)["submitted_at"] is None
+
+
+def test_submitting_recheck_buyer_block_aborts_the_attempt_and_ends_the_run(conn, workspace):
+    """验收第 10 条（提交登记复核处）：护栏放行之后、登记之前，存下的结算页买家号 ID 已不是批次账号当前登记的 ID——
+    不登记提交（插件不会点击下单），落地与护栏判定处相同：尝试中止、任务回已分配、不暂停账号、批次结束。服务层不抛
+    异常（否则落地会被一起回滚），返回带 blocked 标记的结果，由插件路由转成 409 GUARD_BLOCKED。"""
+    e = _claimed(conn, workspace)
+    aid, cid = e["a"]["attempt_id"], e["acc"]["amazon_customer_id"]
+    fx.to_guard_passed(conn, e["dev"], e["a"])
+    conn.execute("UPDATE procure.buyer_accounts SET amazon_customer_id = %s WHERE id = %s", (OTHER, e["acc"]["id"]))
+    devices.report_identity(conn, e["dev"], fx.identity(OTHER))
+    reason = f"结算页登录的买家号（{cid}）不是这个批次的买家号（{OTHER}）"
+    out = execution.mark_submitting(conn, e["dev"], aid)
+    assert out == {
+        "ok": False, "blocked": True, "code": "GUARD_BLOCKED",
+        "message": f"按最新配置复核护栏未通过：{reason}，不能提交",
+        "detail": {"block_code": "IDENTITY_MISMATCH", "reasons": [reason], "attempt_status": "aborted",
+                   "order_status": "assigned", "run_ended": True, "end_reason": "identity_mismatch"}}
+    assert "submitted_at" not in out
+    att = _assert_aborted_not_exception(conn, e, aid, reason)
+    assert att["stage"] == "submitting" and att["guard_input"]["customer_id"] == cid       # 事实原样保留
+    assert att["guard_verdict"]["verdict"] == "block" and att["guard_verdict"]["code"] == "IDENTITY_MISMATCH"
+    assert _events(conn, "attempt", aid, "attempt.submitting") == []
+    assert _events(conn, "attempt", aid, "attempt.guard_blocked") == [
+        {"code": "IDENTITY_MISMATCH", "reasons": [reason], "at": "submitting"}]
+    assert _events(conn, "attempt", aid, "attempt.aborted") == [
+        {"error_code": "IDENTITY_MISMATCH", "reason": reason, "run_id": e["run_id"]}]
+    ended = _events(conn, "run", e["run_id"], "run.ended")
+    assert len(ended) == 1 and ended[0]["end_reason"] == "identity_mismatch"
+    assert (ended[0]["attempt_id"], ended[0]["at"], ended[0]["reason"]) == (aid, "submitting", reason)
+    _assert_run_is_over(conn, e, aid)
+
+
+def test_submitting_recheck_other_guard_codes_still_refuse_without_changing_anything(conn, workspace):
+    """复核时别的拦截码（这里是金额区间）照旧：409 GUARD_BLOCKED、什么都不改、批次继续；只有 buyer 项结束批次。"""
+    e = _claimed(conn, workspace)
+    aid = e["a"]["attempt_id"]
+    fx.to_guard_passed(conn, e["dev"], e["a"])
+    conn.execute("UPDATE procure.buyer_accounts SET min_amount = 90 WHERE id = %s", (e["acc"]["id"],))
+    err = _err(execution.mark_submitting, conn, e["dev"], aid)
+    assert err.code == "GUARD_BLOCKED" and err.http_status == 409
+    assert err.detail["block_code"] == "SUBTOTAL_OUT_OF_RANGE" and set(err.detail) == {"block_code", "reasons"}
+    assert fx.attempt_row(conn, aid)["status"] == "guard_passed"
+    assert fx.run_row(conn, e["run_id"])["ended_at"] is None
+    assert execution.run_heartbeat(conn, e["dev"], e["run_id"])["stop"] is False
 
 
 # ── 浏览器行的锁：提交登记 / 开始批次与身份上报串行 ───────────────────────────

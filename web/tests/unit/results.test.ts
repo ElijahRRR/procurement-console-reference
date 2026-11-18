@@ -56,6 +56,25 @@ describe('立即同步（POST /feishu/connections/{id}/sync 的 {read, new, …,
     expect(s.message).toBe('读取 12 · 新单 2 · 更新 1 · 无变化 8 · 跳过 3 · 无效 4')
     expect(s.warnings).toEqual(['PO-DEMO-1：跳过，采购方不是本系统接的采购方', '记录 recB：无效，缺少平台订单号', '另有 5 条，见「读取记录」'])
   })
+  it('来源表里找不到买家号列（说整个连接的问题）：排在最前面、只写原因，不算进记录条数', () => {
+    const missing = { record_id: null, upstream_order_no: '买家号列', verdict: 'skipped' as const, reason: '来源表里找不到买家号列「买家号id」，本次没有更新指定', scope: 'connection' }
+    // 只有这一条：统计里没有跳过的记录，也不出现「另有 n 条」
+    const only = syncSummary('订单中心', { ...base, skipped: 0, allocation: null, problems: [missing] })
+    expect(only.message).toBe('读取 12 · 新单 2 · 更新 1 · 无变化 8')
+    expect(only.warnings).toEqual(['来源表里找不到买家号列「买家号id」，本次没有更新指定'])
+    // 与记录样本一起：记录样本照常列出，剩余条数只按记录算
+    const mixed = syncSummary('订单中心', {
+      ...base,
+      skipped: 2,
+      allocation: null,
+      problems: [missing, { record_id: 'recA', upstream_order_no: 'PO-DEMO-1', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
+    })
+    expect(mixed.warnings).toEqual(['来源表里找不到买家号列「买家号id」，本次没有更新指定', 'PO-DEMO-1：跳过，采购方不是本系统接的采购方', '另有 1 条，见「读取记录」'])
+  })
+  it('分配摘要带来源指定的笔数时，提示里的分出数已经含它', () => {
+    const s = syncSummary('订单中心', { ...base, allocation: { ...alloc, stats: { considered: 6, assigned: 5, coverage: 2, fill: 2, designated: 1, unassigned: 1 } } })
+    expect(s.message).toBe('读取 12 · 新单 2 · 更新 1 · 无变化 8 · 跳过 1；随后分配：分出 5 笔，未分出 1 笔')
+  })
 })
 
 describe('写回验收（{ok, mismatches, written, restored, restore_error, error, connection}）', () => {

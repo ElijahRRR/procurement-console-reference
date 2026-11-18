@@ -9,7 +9,7 @@ from tests.api_helpers import (IMPORT_HEADERS, api, bearer, create_account, err,
 
 DEVICE_KEYS = {"id", "name", "ext_version", "online", "last_seen_at", "created_at", "hidden_at", "login", "account",
                "active_run"}
-DISCOVERED_KEYS = {"customer_id", "ignored", "browsers", "last_reported_at", "name_hint"}
+DISCOVERED_KEYS = {"customer_id", "ignored", "browsers", "last_reported_at", "name_hint", "source_orders"}
 
 
 def test_accounts_crud_pause_resume_and_quota_today(owner):
@@ -168,6 +168,7 @@ def test_discovered_buyers_register_fill_ignore_and_restore(owner, api):
     assert set(by_id) == {"A1DEMO777777", "A1DEMO888888"}
     seven = by_id["A1DEMO777777"]
     assert seven["ignored"] is False and seven["name_hint"] is None and seven["last_reported_at"]
+    assert seven["source_orders"] == 0 and by_id["A1DEMO888888"]["source_orders"] == 0     # 只来自浏览器
     assert sorted(b["id"] for b in seven["browsers"]) == sorted([d1["device_id"], d2["device_id"]])
     assert all(set(b) == {"id", "name", "online", "last_seen_at"} and b["online"] for b in seven["browsers"])
     assert [b["id"] for b in by_id["A1DEMO888888"]["browsers"]] == [d3["device_id"]]
@@ -251,13 +252,23 @@ def test_new_console_routes_need_a_session_and_the_csrf_header(owner, api):
 
 
 def test_discovered_name_hint_comes_from_imported_source_data(owner, api):
-    """来源数据里同一「买家号 ID」对应的「买家号」→ 待登记项的 name_hint（给「登记」对话框预填账号名）。"""
-    headers = [*IMPORT_HEADERS, "买家号", "买家号ID"]
-    rows = [import_row("PO-DEMO-N0001", **{"买家号": "环境-DEMO-来源名", "买家号ID": "A1DEMO555555"})]
+    """来源数据里同一「买家号 ID」对应的「买家号」→ 待登记项的 name_hint（给「登记」对话框预填账号名）。
+    两种来历都算：历史采购的行（带 AMZ 订单号，这两列只是「谁买的」，不是指定）与来源指定的行。"""
+    headers = [*IMPORT_HEADERS, "买家号", "买家号ID", "AMZ订单号"]
+    rows = [import_row("PO-DEMO-N0001", **{"买家号": "环境-DEMO-来源名", "买家号ID": "A1DEMO555555"}),
+            import_row("PO-DEMO-N0002", **{"买家号": "环境-DEMO-历史名", "买家号ID": "A1DEMO444444",
+                                           "AMZ订单号": "111-1234567-1234567"})]
     import_orders(owner, data=xlsx_bytes(rows, headers=headers))
-    register_device(plugin_client(api), customer_id="A1DEMO555555")
+    # 来源指定的那个不用等浏览器登录就在待登记里；历史采购的那个只是记录，不算指定
     items = ok(owner.get("/api/v1/accounts/discovered"))["items"]
-    assert [(i["customer_id"], i["name_hint"]) for i in items] == [("A1DEMO555555", "环境-DEMO-来源名")]
+    assert [(i["customer_id"], i["name_hint"], i["source_orders"], i["browsers"], i["last_reported_at"])
+            for i in items] == [("A1DEMO555555", "环境-DEMO-来源名", 1, [], None)]
+    plugin = plugin_client(api)
+    register_device(plugin, customer_id="A1DEMO555555")
+    register_device(plugin, customer_id="A1DEMO444444")
+    by_id = {i["customer_id"]: i for i in ok(owner.get("/api/v1/accounts/discovered"))["items"]}
+    assert {cid: (i["name_hint"], i["source_orders"], len(i["browsers"])) for cid, i in by_id.items()} == {
+        "A1DEMO555555": ("环境-DEMO-来源名", 1, 1), "A1DEMO444444": ("环境-DEMO-历史名", 0, 1)}
 
 
 def test_changing_customer_id_is_refused_while_the_account_is_executing(owner, api):
@@ -310,7 +321,8 @@ def test_allocation_run_last_and_overview(owner):
     import_orders(owner, [import_row("PO-DEMO-L0025", 采购单价=25), import_row("PO-DEMO-L0045", 采购单价=45, 限价=60)])
     run = ok(owner.post("/api/v1/allocation/run"))
     assert run["trigger"] == "manual" and run["bj_date"] == "2026-10-31"
-    assert set(run["stats"]) >= {"considered", "assigned", "coverage", "fill", "unassigned"}
+    assert set(run["stats"]) == {"considered", "assigned", "coverage", "fill", "designated", "unassigned"}
+    assert run["stats"]["designated"] == 0 and run["stats"]["assigned"] == 2
     assert ok(owner.get("/api/v1/allocation/last"))["id"] == run["id"]
 
     rows = {r["upstream_order_no"]: r for r in ok(owner.get("/api/v1/orders", params={"view": "today"}))["rows"]}

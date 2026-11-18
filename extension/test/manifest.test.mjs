@@ -1,5 +1,6 @@
 /** 清单：权限最小（不申请 cookies、tabs），主机权限只有亚马逊美国站与本机服务端；版本与说明；
- *  源码里不读 Cookie、不上传页面 HTML；界面文案里不出现「配对」「绑定」「设备」。 */
+ *  源码里不读 Cookie、不上传页面 HTML；界面文案里不出现「配对」「绑定」「设备」；
+ *  插件不看任务的分配方式（来源指定还是自动分配由服务端决定）。 */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -55,6 +56,12 @@ test("源码里不读 Cookie、不上传页面 HTML、不申请额外权限的�
   const parse = files.find(([n]) => n === "dom/parse.ts")[1];
   assert.doesNotMatch(parse, /outerHTML|innerHTML/, "买家号 ID 只从内联脚本的文本里读，不在整页 HTML 上跑正则");
   assert.match(parse, /script:not\(\[src\]\)/);
+});
+
+test("插件不看任务的分配方式：源码里没有 assignment_kind、designated、designation —— 来源指定还是自动分配由服务端决定，插件只领登录的买家号对应账号的任务", () => {
+  const files = sources();
+  assert.ok(files.length > 20);
+  for (const [name, text] of files) assert.doesNotMatch(text, /assignment_kind|designat/i, name);
 });
 
 test("界面与日志的文案里不出现「配对」「绑定」「设备」，不用感叹号（代码注释不算）", () => {

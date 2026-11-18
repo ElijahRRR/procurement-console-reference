@@ -4,10 +4,14 @@
   开头的请求按顺序检查，不过就 403 FORBIDDEN、不进后面的任何一层：
   1. 对端地址（scope["client"][0]）必须是回环（127.0.0.1、::1、::ffff:127.0.0.1）。能访问本机端口的程序被视为
      所有者自己；跨机器部署需要另加接入密钥，当前版本不支持。
-  2. Host 头必须是本机名（127.0.0.1 / localhost / ::1）——**不**看 settings.host 与 PC_ALLOWED_HOSTS。
-  3. Origin 头存在且是网页来源（http / https，或不透明来源 `null`）→ 拒绝。配置了 settings.plugin_extension_ids
+  2. 请求不得带代理转发头（X-Forwarded-For、Forwarded、X-Real-IP、Via 任一个，不看值）。本机的反向代理把远端请求
+     转过来时，对端与 Host 在服务端看来都是本机，第 1、3 步拦不住；代理通常会带上这些头，带了就拒绝。插件直接从
+     扩展 service worker 连本机端口，从不带它们。（代理可以不带这些头，所以这只是多一道闸，不是保证：本机的反向
+     代理仍然不要转发 /plugin 路径。）
+  3. Host 头必须是本机名（127.0.0.1 / localhost / ::1）——**不**看 settings.host 与 PC_ALLOWED_HOSTS。
+  4. Origin 头存在且是网页来源（http / https，或不透明来源 `null`）→ 拒绝。配置了 settings.plugin_extension_ids
      （PC_PLUGIN_EXTENSION_IDS）时，Origin 还必须是 `chrome-extension://<名单里的 ID>`，没带 Origin 也拒绝。
-  4. POST 必须带 `Content-Type: application/json`（允许 `; charset=…`）。网页要带这个头就得先发预检，而本服务的
+  5. POST 必须带 `Content-Type: application/json`（允许 `; charset=…`）。网页要带这个头就得先发预检，而本服务的
      OPTIONS 不给 CORS 头，所以网页的表单或 no-cors 请求进不来（包括不需要令牌的 /plugin/v1/register）。
 - **HostOriginMiddleware**（防 DNS 重绑定）：Host 头必须是本机地址（127.0.0.1、localhost、::1）、settings.host
   或 settings.allowed_hosts（PC_ALLOWED_HOSTS，逗号分隔）里的名字，否则 403 FORBIDDEN——包括没有登录要求的
@@ -41,6 +45,9 @@ PLUGIN_PATH_PREFIX = "/plugin/"
 LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 EXTENSION_ORIGIN_SCHEME = "chrome-extension"
 PLUGIN_REMOTE_MESSAGE = "插件接口只接受本机请求：跨机器部署需要接入密钥，当前版本不支持"
+#: 代理转发头（小写）：带了任何一个，就说明这次请求是经代理转来的
+PROXY_HEADERS: tuple[bytes, ...] = (b"x-forwarded-for", b"forwarded", b"x-real-ip", b"via")
+PLUGIN_PROXIED_MESSAGE = "插件接口不接受经过代理转发的请求"
 PLUGIN_HOST_MESSAGE = "插件接口只接受发往本机地址（127.0.0.1 或 localhost）的请求：请在插件设置里把服务端地址改成本机地址"
 PLUGIN_WEB_ORIGIN_MESSAGE = "插件接口不接受网页来源的请求"
 PLUGIN_EXTENSION_MESSAGE = "插件接口只接受名单里的扩展：这个扩展的 ID 不在 PC_PLUGIN_EXTENSION_IDS 里"
@@ -89,8 +96,14 @@ def _is_json(content_type: str | None) -> bool:
     return content_type is not None and content_type.split(";", 1)[0].strip().lower() == "application/json"
 
 
+def _has_header(scope: dict[str, Any], names: tuple[bytes, ...]) -> bool:
+    """输入：ASGI scope、请求头名（小写）→ 输出：请求是否带了其中任何一个（不看值，空值也算）。"""
+    return any(k.lower() in names for k, _ in scope.get("headers") or [])
+
+
 class PluginGateMiddleware:
-    """/plugin 入口闸：本机对端、本机 Host、不接受网页 Origin、可选的扩展 ID 名单、POST 必须是 JSON（见模块说明）。
+    """/plugin 入口闸：本机对端、不带代理转发头、本机 Host、不接受网页 Origin、可选的扩展 ID 名单、POST 必须是 JSON
+    （见模块说明）。
 
     extension_ids：允许的扩展 ID（不分大小写）；空 = 不按扩展 ID 限制，只拒绝网页来源。
     """
@@ -105,6 +118,8 @@ class PluginGateMiddleware:
         peer = client[0] if client else None
         if not isinstance(peer, str) or peer.strip().lower() not in LOOPBACK_PEERS:
             return PLUGIN_REMOTE_MESSAGE
+        if _has_header(scope, PROXY_HEADERS):
+            return PLUGIN_PROXIED_MESSAGE
         host = _header(scope, b"host")
         if host is None or _host_name(host) not in LOCAL_HOSTS:
             return PLUGIN_HOST_MESSAGE

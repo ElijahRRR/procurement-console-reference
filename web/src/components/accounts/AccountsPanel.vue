@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 账号页签：顶部「待登记的买家号」（插件读到、还没登记的买家号 ID），下面是买家账号列表：买家号 ID、金额区间、
+ * 账号页签：顶部「待登记的买家号」（插件读到的或来源指定的、还没登记的买家号 ID），下面是买家账号列表：买家号 ID、金额区间、
  * 今日额度（已用 / 计划 / 上限）、优先级、配送上限（继承标记）、采购与同步开关（行内确认）、暂停 / 恢复执行（与采购开关分开呈现）、
  * 执行模式与时间、所在浏览器（当前登录着这个买家号的浏览器）、当前执行批次。
  */
@@ -69,13 +69,17 @@ function openEdit(a: Account) {
   preset.value = null
   dialogOpen.value = true
 }
-/** 输入：要登记的买家号 ID、来源里的名称 → 输出：无（打开账号对话框，ID 与名称已填；提交走新建接口） */
-function openRegister(customerId: string, nameHint: string | null = null) {
+/**
+ * 输入：要登记的买家号 ID、来源里的名称、这个买家号从哪里来（来源指定了几笔任务、有没有浏览器登录着）
+ * → 输出：无（打开账号对话框，ID 与名称已填；提交走新建接口）
+ */
+function openRegister(customerId: string, nameHint: string | null = null, source: Pick<AccountPreset, 'sourceOrders' | 'hasBrowser'> = {}) {
   editing.value = null
-  preset.value = { customerId, name: nameHint }
+  preset.value = { customerId, name: nameHint, ...source }
   dialogOpen.value = true
 }
-const registerDiscovered = (item: DiscoveredBuyer) => openRegister(item.customer_id, item.name_hint)
+const registerDiscovered = (item: DiscoveredBuyer) =>
+  openRegister(item.customer_id, item.name_hint, { sourceOrders: item.source_orders ?? 0, hasBrowser: !!item.browsers?.length })
 
 /** 输入：无 → 输出：无（重新读账号与待登记的买家号） */
 async function reloadAll() {

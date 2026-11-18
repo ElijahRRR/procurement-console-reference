@@ -6,8 +6,9 @@
   框架层 404 / 405 → NOT_FOUND / METHOD_NOT_ALLOWED；其他异常 → 500 INTERNAL「服务器内部错误」（记日志，不把堆栈给客户端）。
 - 防跨站：/api/ 下的写请求必须带 `X-Requested-With: pc-console`，否则 403 FORBIDDEN（/plugin 不检查这个头，
   它有自己的入口闸）。
-- /plugin 入口闸（server/limits.PluginGateMiddleware，最外层）：只接受本机对端、本机 Host、非网页来源
-  （配置了 PC_PLUGIN_EXTENSION_IDS 时只接受名单里的扩展）、POST 必须是 JSON，否则 403 FORBIDDEN。
+- /plugin 入口闸（server/limits.PluginGateMiddleware，最外层）：只接受本机对端、不带代理转发头（X-Forwarded-For /
+  Forwarded / X-Real-IP / Via）、本机 Host、非网页来源（配置了 PC_PLUGIN_EXTENSION_IDS 时只接受名单里的扩展）、
+  POST 必须是 JSON，否则 403 FORBIDDEN。
 - 防 DNS 重绑定（server/limits.HostOriginMiddleware）：Host 只接受本机地址、settings.host 与 PC_ALLOWED_HOSTS；
   /api 写请求带 Origin 时也要在名单里，否则 403 FORBIDDEN。
 - 请求体大小（server/limits.BodyLimitMiddleware，在认证之前）：POST /api/v1/imports 不超过 10 MB 加 multipart 余量，

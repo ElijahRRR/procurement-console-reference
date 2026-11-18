@@ -107,10 +107,14 @@ def test_file_only_workspace_upload_preview_commit_export(conn, workspace):
     wb = openpyxl.load_workbook(io.BytesIO(exports.orders_xlsx(conn, ws, batch_id=up["batch_id"])))
     ws_x = wb["采购结果"]
     values = list(ws_x.values)
-    assert values[0][:4] == ("平台订单号", "状态", "买家号", "AMZ订单号")
+    assert values[0][:5] == ("平台订单号", "状态", "买家号", "分配账号", "AMZ订单号")
+    col = {h: i for i, h in enumerate(values[0])}
     assert [v[0] for v in values[1:]] == ["PO-DEMO-0001", "PO-DEMO-0002", "PO-DEMO-0003", "PO-DEMO-0004"]
-    assert values[4][1] == "已采购" and values[4][3] == "111-0000000-0000004" and values[4][12] == "来源已有单号"
-    assert values[1][1] == "已分配" and values[1][2] == "环境-DEMO-A"
+    assert values[4][col["状态"]] == "已采购" and values[4][col["AMZ订单号"]] == "111-0000000-0000004"
+    assert values[4][col["结果来源"]] == "来源已有单号"
+    # 自动分配、还没采购的任务：「买家号」留空（不是来源指定），已分配的账号在「分配账号」一列
+    assert values[1][col["状态"]] == "已分配" and values[1][col["买家号"]] is None
+    assert values[1][col["分配账号"]] == "环境-DEMO-A"
 
 
 def test_commit_is_refused_twice_and_lifecycle_rules(conn, workspace):

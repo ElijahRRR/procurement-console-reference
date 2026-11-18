@@ -165,6 +165,41 @@ const scenes: Scene[] = [
     },
   },
   {
+    // 待分配：来源指定了买家号而分不出去的任务，说明列写明原因
+    name: 'orders-unassigned',
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=unassigned`)
+      await page.waitForSelector('.el-table__row')
+    },
+  },
+  {
+    // 来源指定了 环境-DEMO-01、人工改派到 环境-DEMO-02 的任务：「分配」区多一行「来源指定的买家号」，带「已人工改派到」
+    name: 'order-drawer-designated',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=today&q=SKU26`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('[data-testid="designated-buyer"]')
+    },
+  },
+  {
+    // 来源指定的买家号还没登记的任务：改派对话框在原说明前说明改派与来源指定的关系
+    name: 'order-drawer-designated-assign',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=unassigned`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row', { hasText: '还没有登记为账号' }).first().click()
+      await page.waitForSelector('[data-testid="designated-buyer"]')
+      await page.getByRole('button', { name: '改派账号' }).click()
+      await page.waitForSelector('[data-testid="assign-designation-note"]')
+    },
+  },
+  {
     name: 'order-drawer',
     fullPage: false,
     run: async (page) => {
@@ -376,6 +411,7 @@ const scenes: Scene[] = [
     [
       ['phone-overview', '/', '.stat-card'],
       ['phone-orders', '/orders?view=today', '.el-table__row'],
+      ['phone-orders-unassigned', '/orders?view=unassigned', '.el-table__row'],
       ['phone-exceptions', '/exceptions?view=needs_attention', '.el-table__row'],
       ['phone-records', '/records?view=purchased', '.el-table__row'],
       ['phone-sources-feishu', '/sources?tab=feishu', '.el-card'],

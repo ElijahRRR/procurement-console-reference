@@ -284,8 +284,8 @@ def test_discovered_lists_unregistered_ids_grouped_newest_first(conn, workspace)
     items = accounts.discovered(conn, e["ws"])
     assert [i["customer_id"] for i in items] == ["A2TEST0000X", "A2TEST0000Y", "A1DEMO00009"]
     x = items[0]
-    assert set(x) == {"customer_id", "ignored", "browsers", "last_reported_at", "name_hint"}
-    assert x["ignored"] is False and x["name_hint"] is None
+    assert set(x) == {"customer_id", "ignored", "browsers", "last_reported_at", "name_hint", "source_orders"}
+    assert x["ignored"] is False and x["name_hint"] is None and x["source_orders"] == 0     # 只来自浏览器
     assert x["last_reported_at"] == (NOW - timedelta(minutes=1)).isoformat()              # 两台里最近的一次
     assert x["browsers"] == [
         {"id": e["x1"]["id"], "name": "浏览器-X1", "online": False,

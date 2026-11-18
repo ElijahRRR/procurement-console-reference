@@ -1,9 +1,12 @@
 """结果导出（契约 §7「导出」、v1 §6.2）：按批次或按视图导出采购结果 xlsx。不要求连接飞书。
 
-列：平台订单号、状态、买家号、AMZ订单号、税前总额、运费、税费、总额、卡尾号、建议采购日期、最近更新时间、异常原因，
-另加「结果来源」（本系统 / 模拟 / 来源已有单号），避免把模拟单号误当真实采购。
+列：平台订单号、状态、买家号、分配账号、AMZ订单号、税前总额、运费、税费、总额、卡尾号、建议采购日期、最近更新时间、
+异常原因，另加「结果来源」（本系统 / 模拟 / 来源已有单号），避免把模拟单号误当真实采购。
 
-- 结果取任务的成功尝试（purchased_attempt_id）；还没采购成功的任务只有状态与原因，买家号显示已分配的账号。
+- 结果取任务的成功尝试（purchased_attempt_id）；还没采购成功的任务只有状态与原因。
+- 「买家号」：有采购结果 → 采购用的账号；没有 → **来源指定的买家号**（任务没有指定、或只指定了买家号 ID 则留空）。
+  「分配账号」= 任务当前分配到的账号名。两列分开，是为了导出文件改一改再上传时，不会把系统自动分配的结果读成来源指定
+  （「分配账号」这个表头不会被 file_mapping 自动识别成买家号列）。
 - 卡号只导出尾号（库里本来就只存后 4 位；这里再按数字截一次，绝不导出完整卡号）。
 - 金额以数字写入（Excel 可求和）；时刻按北京时间写出。
 - 按批次：该批次各行关联的任务（按行号，去重）；批次不存在或属于别的工作区 → NOT_FOUND；未提交 → VALIDATION。
@@ -19,13 +22,13 @@ from services import orders, sheet_io
 from services.errors import not_found, validation
 from services.models import ORDER_STATUS_ZH
 
-EXPORT_HEADERS = ["平台订单号", "状态", "买家号", "AMZ订单号", "税前总额", "运费", "税费", "总额", "卡尾号",
+EXPORT_HEADERS = ["平台订单号", "状态", "买家号", "分配账号", "AMZ订单号", "税前总额", "运费", "税费", "总额", "卡尾号",
                   "建议采购日期", "最近更新时间", "异常原因", "结果来源"]
 _PAGE = 200
 
 _EXPORT_SQL = """
 SELECT o.id, o.upstream_order_no, o.status, o.status_reason, o.needs_attention, o.attention_note,
-       o.suggested_purchase_date, o.updated_at, o.external_amz_order_no,
+       o.suggested_purchase_date, o.updated_at, o.external_amz_order_no, o.designated_buyer_name,
        pa.id AS pa_id, pa.kind AS pa_kind, pa.simulated AS pa_simulated, pa.amazon_order_no, pa.total_before_tax,
        pa.shipping, pa.tax, pa.total, pa.card_last4, pa.buyer_account_name,
        pba.name AS purchase_account_name, aba.name AS assigned_account_name
@@ -61,9 +64,10 @@ def _reason(r: dict[str, Any]) -> str | None:
 
 def _row(r: dict[str, Any]) -> list[Any]:
     has_result = r["pa_id"] is not None
-    buyer = (r["purchase_account_name"] or r["buyer_account_name"]) if has_result else r["assigned_account_name"]
+    # 没有采购结果时「买家号」只写来源指定的买家号：写已分配的账号的话，文件改一改再上传，自动分配就成了来源指定
+    buyer = (r["purchase_account_name"] or r["buyer_account_name"]) if has_result else r["designated_buyer_name"]
     return [
-        r["upstream_order_no"], ORDER_STATUS_ZH.get(r["status"], r["status"]), buyer,
+        r["upstream_order_no"], ORDER_STATUS_ZH.get(r["status"], r["status"]), buyer, r["assigned_account_name"],
         r["amazon_order_no"] if has_result else r["external_amz_order_no"],
         r["total_before_tax"] if has_result else None, r["shipping"] if has_result else None,
         r["tax"] if has_result else None, r["total"] if has_result else None,

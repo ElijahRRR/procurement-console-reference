@@ -15,6 +15,9 @@
 - 美国邮编：数字单元格的 3–4 位数补前导 0（并记问题）；文本不足 5 位只记问题（由 orders 判为资料待补齐）；
 - AMZ 订单号：明显的占位写法（「—」「无」「N/A」等）当作没有并记问题；其他不符合「3-7-7 位数字」格式的文本原样保留，
   由 orders 判为待核实（不当作可信单号）。
+- 买家号 / 买家号 ID（来源指定买家号，见 services/designation）：占位写法同样当作没写并记问题；行没有可信 AMZ 订单号时，
+  表格错误值**原样留在字段里**并记问题（它是一个解析不了的指定，任务留在待分配，不会被当成留空而自动分配），
+  买家号 ID 形状不对也记问题（预览里能看到）；行带可信 AMZ 订单号时这两列只是历史采购记录，错误值照旧按没读到处理。
 
 本模块不碰数据库，也不计算建议采购日期（由 services/orders 按「下单北京日期 + 6 − 配送天数」补算）。
 """
@@ -27,7 +30,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from services import clock
-from services.models import UpstreamRecord, money, money_cap
+from services.models import CUSTOMER_ID_RE, UpstreamRecord, money, money_cap
 
 # ── 系统字段清单 ──────────────────────────────────────────────────────────────
 # kind：text 文本 / int 整数 / money 美元金额 / datetime 时刻 / date 日期 / enum 来源取值原文（供准入规则匹配）
@@ -97,6 +100,8 @@ AMAZON_ORDER_NO_RE = re.compile(r"^\d{3}-\d{7}-\d{7}$")
 #: 明显表示「没有单号」的占位写法（比较前去空白、转小写）
 _AMZ_PLACEHOLDERS = frozenset({"-", "--", "---", "—", "——", "–", "－", "/", "无", "没有", "空", "暂无", "n/a", "na",
                                "none", "null", "nil", "0", "#"})
+#: 来源指定买家号的两个字段 → 问题文案里的叫法
+_BUYER_LABELS = {"external_buyer_account": "买家号", "external_buyer_customer_id": "买家号 ID"}
 #: Excel / WPS 的错误值（公式出错时单元格的缓存值）
 EXCEL_ERRORS = frozenset({"#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!", "#GETTING_DATA",
                           "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#BUSY!", "#UNKNOWN!", "#N/A!"})
@@ -270,6 +275,8 @@ def normalize(values: dict[str, Any], admission: dict[str, Any] | None = None) -
         raw = values.get(key)
         if key == "upstream_order_no":
             out[key], key_problem = _order_no(raw)
+        elif key in _BUYER_LABELS:
+            out[key] = _to_text(raw)            # 占位写法、表格错误值在 _check_buyer_fields 里处理（要先知道有没有可信单号）
         elif kind in ("text", "enum"):
             out[key] = _text_field(raw, label, issues)
             if kind == "enum":
@@ -298,6 +305,7 @@ def normalize(values: dict[str, Any], admission: dict[str, Any] | None = None) -
     if out["state"] and len(out["state"]) == 2:
         out["state"] = out["state"].upper()
     out["external_amz_order_no"] = _check_amazon_no(out["external_amz_order_no"], issues)
+    _check_buyer_fields(out, issues)
 
     review_vals = enums.get("review_value") or []
     if any(v in adm["rejected_values"] for v in review_vals):
@@ -571,6 +579,49 @@ def _check_amazon_no(text: str | None, issues: list[str]) -> str | None:
     if not AMAZON_ORDER_NO_RE.match(s):
         issues.append(f"AMZ订单号「{_show(s)}」格式不对（应为 3-7-7 位数字），需人工核实")
     return s
+
+
+def is_placeholder(v: Any) -> bool:
+    """输入：单元格文本 → 输出：是不是明显表示「没有」的占位写法（「—」「无」「N/A」「0」「/」等；比较前去空白、转小写）。
+    AMZ 订单号与买家号两列共用这一份清单。"""
+    return isinstance(v, str) and v.strip().lower() in _AMZ_PLACEHOLDERS
+
+
+def is_error_value(v: Any) -> bool:
+    """输入：单元格文本 → 输出：是不是表格错误值（#N/A、#REF! 等）。"""
+    return isinstance(v, str) and v.strip().upper() in EXCEL_ERRORS
+
+
+def _check_buyer_fields(out: dict[str, Any], issues: list[str]) -> None:
+    """买家号 / 买家号 ID 两列（就地改 out 并记问题）：
+
+    - 占位写法（「—」「无」…）→ 当作没写；
+    - 表格错误值：行没有可信 AMZ 订单号 → **原样保留**（一个解析不了的指定，任务留在待分配）；有可信单号（这两列只是
+      历史采购记录）→ 照旧按没读到处理；
+    - 行没有可信 AMZ 订单号、买家号 ID 清洗后（NFKC、去空白、转大写）不是 A 开头的 9 位以上字母数字 → 只记问题
+      （值原样保留，由分配给出原因）。
+    """
+    trusted = amazon_order_no_ok(out.get("external_amz_order_no"))
+    for key, label in _BUYER_LABELS.items():
+        text = out.get(key)
+        if text is None:
+            continue
+        if is_placeholder(text):
+            issues.append(f"{label}「{_show(text)}」不是买家号，按没有指定处理")
+            out[key] = None
+        elif is_error_value(text):
+            what = f"{label}{' ' if label.endswith('ID') else ''}是表格错误值 {text}"
+            if trusted:
+                issues.append(f"{what}，按没读到处理")
+                out[key] = None
+            else:
+                issues.append(f"{what}，读不出指定的买家号")
+        elif key == "external_buyer_customer_id" and not trusted:
+            from services import designation      # 延迟导入：designation 在模块级导入本模块
+
+            cid = designation.clean_customer_id(text)
+            if cid is None or not CUSTOMER_ID_RE.match(cid):
+                issues.append(f"买家号 ID「{_show(text)}」格式不对，这笔任务会停在待分配")
 
 
 def _order_no(raw: Any) -> tuple[str | None, str | None]:

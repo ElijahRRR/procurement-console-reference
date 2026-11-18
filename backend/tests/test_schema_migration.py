@@ -1,5 +1,6 @@
 """建表脚本的升级路径（契约 §1）：在合并前的旧结构（tests/data/schema_v1.sql）上执行当前的 refdata/schema.sql，
 旧绑定回填成账号的买家号 ID、浏览器行换成新形状、配对码表删除、批次补上北京日期；脚本在旧库、新库上都能重复执行。
+来源指定买家号：任务多两列、assignment_kind 多一个取值（按确切名字换 CHECK），db_init 在加列的那一次回填旧任务的指定。
 另测 serve 启动前的库结构检查（workflows/db_init.schema_problem）。
 
 每个用例用自己的临时库（conftest.temp_database），不碰会话共用的测试库。全部数据虚构。"""
@@ -341,6 +342,7 @@ def test_schema_problem_on_empty_old_and_current_databases(scratch_db):
     "ALTER TABLE procure.devices DROP COLUMN hidden_at",
     "ALTER TABLE procure.execution_runs DROP COLUMN scheduled_slot",
     "DROP TABLE procure.ignored_buyer_ids",
+    "ALTER TABLE procure.purchase_orders DROP COLUMN designated_customer_id",
     "ALTER TABLE procure.devices ADD COLUMN bound_account_id bigint",
     "ALTER TABLE procure.buyer_accounts ADD COLUMN default_device_id bigint",
     "CREATE TABLE procure.device_pairings (code_hash text PRIMARY KEY)",
@@ -352,6 +354,241 @@ def test_schema_problem_spots_each_marker_of_an_old_structure(scratch_db, ddl):
     assert db_init.schema_problem(scratch_db) == db_init.SCHEMA_OUTDATED_MESSAGE
     run_schema(scratch_db)                                      # db_init 之后恢复成当前结构
     assert db_init.schema_problem(scratch_db) is None
+
+
+# ── 来源指定买家号：两列、CHECK 换成三个取值、旧任务回填 ──────────────────────────────
+
+KIND_CHECK = "purchase_orders_assignment_kind_check"
+PAIR_CHECK = "purchase_orders_check"          # (assigned_account_id IS NULL) = (assignment_kind IS NULL)
+
+
+def _order_checks(conn) -> dict:
+    rows = conn.execute(
+        "SELECT c.conname, c.oid::bigint AS oid, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
+        "WHERE c.conrelid = 'procure.purchase_orders'::regclass AND c.contype = 'c'").fetchall()
+    return {r["conname"]: r for r in rows}
+
+
+def _insert_order(conn, ws, no, **cols):
+    cols = {"workspace_id": ws, "upstream_order_no": no, "status": "queued", "primary_source_kind": "feishu", **cols}
+    names = list(cols)
+    return conn.execute(
+        f"INSERT INTO procure.purchase_orders ({', '.join(names)}) VALUES ({', '.join(['%s'] * len(names))}) "
+        "RETURNING id", list(cols.values())).fetchone()["id"]
+
+
+def test_upgrade_widens_the_assignment_kind_check_by_its_exact_name(old_db):
+    """陷阱：表上有两条 CHECK 都提到 assignment_kind。升级只换列级那一条（同名重建），「有账号必有分配方式」的表级
+    约束还在；重复执行不重建约束。"""
+    dsn, ids = old_db
+    with db.pg_conn(dsn) as conn:
+        before = _order_checks(conn)
+        assert "source" not in before[KIND_CHECK]["def"] and PAIR_CHECK in before
+        with pytest.raises(Exception):                                # 旧库写不进 source
+            with conn.transaction():
+                _insert_order(conn, ids["ws"], "PO-DEMO-OLD", status="assigned", assigned_account_id=ids["a_has"],
+                              assignment_kind="source")
+    run_schema(dsn)
+    with db.pg_conn(dsn) as conn:
+        checks = _order_checks(conn)
+        assert "'source'" in checks[KIND_CHECK]["def"] and "'auto'" in checks[KIND_CHECK]["def"]
+        assert checks[PAIR_CHECK]["def"] == before[PAIR_CHECK]["def"]
+        assert checks[PAIR_CHECK]["oid"] == before[PAIR_CHECK]["oid"]              # 表级约束没被动过
+        cols = {(c[0], c[1]) for c in _columns(conn)}
+        assert {("purchase_orders", "designated_customer_id"), ("purchase_orders", "designated_buyer_name")} <= cols
+        oid = _insert_order(conn, ids["ws"], "PO-DEMO-SRC", status="assigned", assigned_account_id=ids["a_has"],
+                            assignment_kind="source", designated_customer_id="not-checked-here")   # 两列不加形状约束
+        assert oid
+        for bad in (dict(assigned_account_id=ids["a_has"], assignment_kind="bogus"),
+                    dict(assigned_account_id=ids["a_has"], assignment_kind=None),       # 有账号无分配方式
+                    dict(assigned_account_id=None, assignment_kind="source")):          # 有分配方式无账号
+            with pytest.raises(Exception):
+                with conn.transaction():
+                    _insert_order(conn, ids["ws"], "PO-DEMO-BAD", status="assigned", **bad)
+    run_schema(dsn)
+    with db.pg_conn(dsn) as conn:
+        again = _order_checks(conn)
+        assert again[KIND_CHECK]["oid"] == checks[KIND_CHECK]["oid"]               # 已含 source：不重建、不重新校验
+        assert len(again) == len(checks)                                           # 没有多出 _check1 之类的约束
+
+
+def test_current_shape_database_with_the_old_two_value_check_is_upgraded_too(scratch_db):
+    """列已是新形状、只有 CHECK 还是旧的两个取值（只执行了一半的升级）→ 同样换成三个取值，结构与新库一致。"""
+    run_schema(scratch_db)
+    with db.pg_conn(scratch_db) as conn:
+        fresh = (_columns(conn), _indexes(conn), _constraints(conn))
+    with db.pg_conn(scratch_db, autocommit=True) as conn:
+        conn.execute(f"ALTER TABLE procure.purchase_orders DROP CONSTRAINT {KIND_CHECK}")
+        conn.execute(f"ALTER TABLE procure.purchase_orders ADD CONSTRAINT {KIND_CHECK} "
+                     "CHECK (assignment_kind IN ('auto', 'manual'))")
+    run_schema(scratch_db)
+    with db.pg_conn(scratch_db) as conn:
+        assert (_columns(conn), _indexes(conn), _constraints(conn)) == fresh
+    with db.pg_conn(scratch_db, autocommit=True) as conn:                          # 约束整条丢了也补得回来
+        conn.execute(f"ALTER TABLE procure.purchase_orders DROP CONSTRAINT {KIND_CHECK}")
+    run_schema(scratch_db)
+    with db.pg_conn(scratch_db) as conn:
+        assert _constraints(conn) == fresh[2]
+
+
+def _seed_v1_orders(conn, ids) -> dict:
+    """往旧结构里加带来源关联的任务（旧版已经把买家号两列存进了 order_sources.normalized）→ {场景: 任务 id}。"""
+    ws, ws2 = ids["ws"], ids["ws2"]
+    out: dict = {}
+
+    def one(sql, params=()):
+        return conn.execute(sql, params).fetchone()["id"]
+
+    def connection(workspace, n):
+        return one("INSERT INTO procure.feishu_connections (workspace_id, name, link, app_token, source_table_id, "
+                   "result_table_id) VALUES (%s, %s, %s, %s, 'tblDEMO0000001', 'tblDEMO0000001') RETURNING id",
+                   (workspace, f"DEMO 订单中心 {n}", "https://demo.example.invalid/base/bascnDEMO", f"bascnDEMO{n:06d}"))
+
+    def batch(workspace, n):
+        return one("INSERT INTO procure.import_batches (workspace_id, filename, file_sha256, file_bytes, status) "
+                   "VALUES (%s, %s, %s, ''::bytea, 'committed') RETURNING id",
+                   (workspace, f"demo-{n}.xlsx", f"demo-sha-{n}"))
+
+    conn_a, conn_b = connection(ws, 1), connection(ws2, 2)
+    batches = [batch(ws, n) for n in (1, 2, 3)]
+    seq = iter(range(1, 1000))
+
+    def link(order_id, kind, *, buyer=None, cid=None, amz=None, seen_min=0, workspace=ws, feishu_conn=conn_a,
+             batch_id=None):
+        n = next(seq)
+        normalized = {"upstream_order_no": f"PO-DEMO-{order_id}", "external_buyer_account": buyer,
+                      "external_buyer_customer_id": cid, "external_amz_order_no": amz, "review": "approved",
+                      "upstream_cancelled": False, "issues": []}
+        seen = NOW - timedelta(minutes=seen_min)
+        conn.execute(
+            "INSERT INTO procure.order_sources (workspace_id, purchase_order_id, kind, feishu_connection_id, "
+            "feishu_record_id, import_batch_id, import_row_no, snapshot, normalized, fingerprint, first_seen_at, "
+            "last_seen_at) VALUES (%s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, %s, 'demo-fp', %s, %s)",
+            (workspace, order_id, kind, feishu_conn if kind == "feishu" else None,
+             f"recDEMO{n:04d}" if kind == "feishu" else None, batch_id if kind == "file" else None,
+             n if kind == "file" else None, Jsonb(normalized), seen, seen))
+
+    def order(key, kind="feishu", workspace=ws, **cols):
+        out[key] = _insert_order(conn, workspace, f"PO-DEMO-M-{key}", primary_source_kind=kind, **cols)
+        return out[key]
+
+    # ① 飞书为主：ID（小写、带空白）+ 名称 → 清洗后回填
+    link(order("feishu_both"), "feishu", buyer=" 环境-DEMO-甲 ", cid=" a1demo00021 ")
+    # ② 文件为主：旧批次写了买家号，新批次没写 → 取「表态且非空」里最新的那条（旧批次）
+    o = order("file_blank_newer", kind="file")
+    link(o, "file", buyer="环境-DEMO-乙", seen_min=60, batch_id=batches[0])
+    link(o, "file", seen_min=5, batch_id=batches[1])
+    # ③ 文件为主：两个批次都写了 → 最新的；同一时刻取 id 大的
+    o = order("file_latest", kind="file")
+    link(o, "file", buyer="环境-DEMO-旧写法", seen_min=60, batch_id=batches[0])
+    link(o, "file", buyer="环境-DEMO-新写法", seen_min=5, batch_id=batches[1])
+    o = order("file_same_time", kind="file")
+    link(o, "file", buyer="环境-DEMO-先", seen_min=5, batch_id=batches[0])
+    link(o, "file", buyer="环境-DEMO-后", seen_min=5, batch_id=batches[1])
+    # ④ 带可信 AMZ 订单号的行不表态；格式不对的单号不算可信
+    link(order("credible_no"), "feishu", buyer="环境-DEMO-丙", cid="A1DEMO00023", amz="111-0000000-0000023")
+    link(order("malformed_no", status="conflict"), "feishu", buyer="环境-DEMO-丁", amz="重拍")
+    # ⑤ 占位写法按没写；两列都空
+    link(order("placeholder"), "feishu", buyer="—", cid="无")
+    link(order("blank"), "feishu")
+    # ⑥ 只有另一种来源写了买家号（飞书为主、文件写了）→ 不回填
+    o = order("other_kind_only")
+    link(o, "feishu")
+    link(o, "file", buyer="环境-DEMO-戊", batch_id=batches[2])
+    # ⑦ 已采购 / 已关闭 / 已取消的不回填；采购中、异常、待确认的照样回填
+    for st in ("purchased", "closed", "cancelled"):
+        link(order(f"done_{st}", status=st), "feishu", cid="A1DEMO00024")
+    for st in ("executing", "exception", "pending_review", "repurchase_pending"):
+        link(order(f"open_{st}", status=st), "feishu", cid="A1DEMO00025")
+    # ⑧ 已经自动分给别的账号：回填指定，但不动分配（回填不触发分配）
+    link(order("assigned_elsewhere", status="assigned", assigned_account_id=ids["a_has"], assignment_kind="auto"),
+         "feishu", buyer="环境-DEMO-回填")
+    # ⑨ 另一个工作区
+    link(order("other_ws", workspace=ws2), "feishu", cid="A1DEMO00026", workspace=ws2, feishu_conn=conn_b)
+    return out
+
+
+def _designations(conn) -> dict:
+    return {r["id"]: (r["designated_customer_id"], r["designated_buyer_name"]) for r in conn.execute(
+        "SELECT id, designated_customer_id, designated_buyer_name FROM procure.purchase_orders").fetchall()}
+
+
+def test_db_init_backfills_designations_once(old_db, capsys):
+    """验收 修订二 第 7 条：旧库升级后，来源里早已填好买家号的未采购任务带上指定；重复升级不改数据。"""
+    dsn, ids = old_db
+    with db.pg_conn(dsn) as conn:
+        o = _seed_v1_orders(conn, ids)
+    out = db_init.run(dsn=dsn)
+    expected = {
+        "feishu_both": ("A1DEMO00021", "环境-DEMO-甲"),
+        "file_blank_newer": (None, "环境-DEMO-乙"),
+        "file_latest": (None, "环境-DEMO-新写法"),
+        "file_same_time": (None, "环境-DEMO-后"),
+        "malformed_no": (None, "环境-DEMO-丁"),
+        "open_executing": ("A1DEMO00025", None), "open_exception": ("A1DEMO00025", None),
+        "open_pending_review": ("A1DEMO00025", None), "open_repurchase_pending": ("A1DEMO00025", None),
+        "assigned_elsewhere": (None, "环境-DEMO-回填"),
+        "other_ws": ("A1DEMO00026", None),
+    }
+    assert out["ok"] is True and out["designations_backfilled"] == len(expected)
+    assert "启动服务后请点一次「重新分配」" in capsys.readouterr().err
+    with db.pg_conn(dsn) as conn:
+        got = _designations(conn)
+        assert {k: got[o[k]] for k in o} == {k: expected.get(k, (None, None)) for k in o}
+        ev = {r["order_id"]: r for r in conn.execute(
+            "SELECT * FROM procure.events WHERE kind = 'order.designation_changed' ORDER BY id").fetchall()}
+        assert set(ev) == {o[k] for k in expected}
+        e = ev[o["feishu_both"]]
+        assert (e["entity"], e["entity_id"]) == ("order", o["feishu_both"])
+        assert (e["actor_kind"], e["actor_id"]) == ("system", None)
+        assert e["workspace_id"] == ids["ws"]
+        assert e["detail"] == {"source": "upgrade", "changes": {"designated_customer_id": [None, "A1DEMO00021"],
+                                                               "designated_buyer_name": [None, "环境-DEMO-甲"]}}
+        assert ev[o["file_latest"]]["detail"]["changes"] == {"designated_buyer_name": [None, "环境-DEMO-新写法"]}
+        assert ev[o["other_ws"]]["workspace_id"] == ids["ws2"]
+        # 回填不触发分配，也不动已有的分配与更新时间
+        row = conn.execute("SELECT * FROM procure.purchase_orders WHERE id = %s", (o["assigned_elsewhere"],)).fetchone()
+        assert (row["status"], row["assigned_account_id"], row["assignment_kind"]) == ("assigned", ids["a_has"], "auto")
+        assert conn.execute("SELECT count(*) AS n FROM procure.allocation_runs").fetchone()["n"] == 0
+        # 升级之后来源又清空了指定（或所有者处理过）：重复 db_init 不得把它填回去
+        conn.execute("UPDATE procure.purchase_orders SET designated_customer_id = NULL, designated_buyer_name = NULL "
+                     "WHERE id = %s", (o["feishu_both"],))
+        events = conn.execute("SELECT count(*) AS n FROM procure.events").fetchone()["n"]
+    again = db_init.run(dsn=dsn)
+    assert again["designations_backfilled"] == 0
+    with db.pg_conn(dsn) as conn:
+        after = _designations(conn)
+        assert after[o["feishu_both"]] == (None, None)
+        assert {k: after[o[k]] for k in o if k != "feishu_both"} == {
+            k: expected.get(k, (None, None)) for k in o if k != "feishu_both"}
+        assert conn.execute("SELECT count(*) AS n FROM procure.events").fetchone()["n"] == events
+    capsys.readouterr()
+
+
+def test_db_init_on_a_fresh_or_current_database_backfills_nothing(scratch_db, capsys):
+    """新库（列是建表时就有的）与已是当前结构的库：db_init 不回填、不记事件。"""
+    first = db_init.run(dsn=scratch_db)
+    assert first["designations_backfilled"] == 0
+    with db.pg_conn(scratch_db) as conn:
+        ws = conn.execute("INSERT INTO procure.workspaces (name) VALUES ('DEMO 工作区') RETURNING id").fetchone()["id"]
+        cid = conn.execute(
+            "INSERT INTO procure.feishu_connections (workspace_id, name, link, app_token, source_table_id, "
+            "result_table_id) VALUES (%s, 'DEMO', 'https://demo.example.invalid/base/x', 'bascnDEMO000009', "
+            "'tblDEMO0000001', 'tblDEMO0000001') RETURNING id", (ws,)).fetchone()["id"]
+        oid = _insert_order(conn, ws, "PO-DEMO-FRESH")
+        conn.execute(
+            "INSERT INTO procure.order_sources (workspace_id, purchase_order_id, kind, feishu_connection_id, "
+            "feishu_record_id, snapshot, normalized, fingerprint) VALUES (%s, %s, 'feishu', %s, 'recDEMO9001', "
+            "'{}'::jsonb, %s, 'demo-fp')",
+            (ws, oid, cid, Jsonb({"upstream_order_no": "PO-DEMO-FRESH", "external_buyer_customer_id": "A1DEMO00030"})))
+    assert db_init.run(dsn=scratch_db)["designations_backfilled"] == 0
+    with db.pg_conn(scratch_db) as conn:
+        assert _designations(conn)[oid] == (None, None)                     # 当前结构的库里，指定只由接收写入
+        assert conn.execute("SELECT count(*) AS n FROM procure.events").fetchone()["n"] == 0
+        assert db_init.backfill_designations(conn) == 1                     # 函数本身可单独调用（幂等：只填空的）
+        assert db_init.backfill_designations(conn) == 0
+        assert _designations(conn)[oid] == ("A1DEMO00030", None)
+    capsys.readouterr()
 
 
 def test_schema_problem_uses_configured_database_by_default(clean_db):

@@ -48,16 +48,23 @@ export interface Summary {
 /** 同步结果里列出的问题记录条数上限 */
 export const SYNC_PROBLEM_SHOWN = 5
 
-/** 输入：连接名、立即同步的返回 → 输出：成功提示（有跳过 / 无效 / 待核实的记录时列出样本） */
+/**
+ * 输入：连接名、立即同步的返回 → 输出：成功提示（有跳过 / 无效 / 待核实的记录时列出样本）。
+ * 说整个连接的问题（scope = 'connection'，如来源表里找不到买家号列、本次没有更新指定）排在最前面，只写原因，
+ * 不占记录样本的名额，也不算进「另有 n 条」。
+ */
 export function syncSummary(name: string, res: FeishuSyncResult): Summary {
   const parts = [statsText(res as unknown as Record<string, unknown>), allocationBrief(res.allocation)].filter(Boolean)
   const problems = res.problems ?? []
-  const warnings = problems.slice(0, SYNC_PROBLEM_SHOWN).map((p) => {
-    const who = p.upstream_order_no || `记录 ${p.record_id}`
+  const whole = problems.filter((p) => p.scope === 'connection')
+  const records = problems.filter((p) => p.scope !== 'connection')
+  const shown = records.slice(0, SYNC_PROBLEM_SHOWN).map((p) => {
+    const who = p.upstream_order_no || `记录 ${p.record_id ?? '—'}`
     return `${who}：${labelOf(FEISHU_VERDICT_LABEL, p.verdict)}${p.reason ? `，${p.reason}` : ''}`
   })
-  const more = (res.skipped ?? 0) + (res.invalid ?? 0) + (res.conflict ?? 0) - warnings.length
-  if (warnings.length && more > 0) warnings.push(`另有 ${formatNumber(more)} 条，见「读取记录」`)
+  const warnings = [...whole.map((p) => (p.reason ?? '').trim()).filter(Boolean), ...shown]
+  const more = (res.skipped ?? 0) + (res.invalid ?? 0) + (res.conflict ?? 0) - shown.length
+  if (shown.length && more > 0) warnings.push(`另有 ${formatNumber(more)} 条，见「读取记录」`)
   return { title: `已同步「${name}」`, message: parts.join('；'), warnings }
 }
 

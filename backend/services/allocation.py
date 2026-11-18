@@ -1,22 +1,39 @@
-"""账号自动分配（契约 §3.2）与人工改派校验。
+"""账号分配（契约 §3.2）：来源指定 + 自动分配，以及人工改派校验。
 
-参与的账号：未归档、purchase_enabled、未 execution_paused、站点相符（美国站 = 收货国家 US）。
-参与的任务（「池」）：queued；assigned 且 assignment_kind='auto'、账号仍参与、无在途尝试的（自动分配可重算）；
-以及分配到已归档账号的 assigned 任务。人工分配（manual）固定不动但占用容量；分给已关闭采购开关或
-已暂停执行的账号的任务原样保留（「关闭采购开关只影响新分配」「暂停执行的账号已分配任务保留」）。
+两种方式并存：来源行写了买家号 / 买家号 ID 的任务按**来源指定**分配（assignment_kind='source'，规则见
+services/designation），没写的由系统**自动分配**（'auto'）。优先级：人工改派（'manual'，固定）> 来源指定 > 自动。
+
+参与自动分配的账号：未归档、purchase_enabled、未 execution_paused、站点相符（美国站 = 收货国家 US）。
+参与的任务（「池」，都要求没有在途尝试）：queued；assigned 且 auto、账号仍参与的（自动分配可重算）；assigned 且分配到
+已归档 / 不存在账号的；assigned 且 source 的（每次都按当前的指定重算）；assigned 且 auto、但任务带着来源指定的（停在
+不参与账号上的自动任务后来被指定）。人工分配（manual）固定不动但占用容量；分给已关闭采购开关或已暂停执行的账号的
+**自动**任务原样保留（「关闭采购开关只影响新分配」「暂停执行的账号已分配任务保留」）。
 
 计划日期 plan(t) = max(建议采购日期, 今天)，按日期从早到晚逐日处理。日期 D 内：
 
-- cap(A, D) = daily_limit − used(A, D) − fixed(A, D)；used 按工作区的模拟模式统计（services/quota）。
+- cap(A, D) = daily_limit − used(A, D) − fixed(A, D)；used 按工作区的模拟模式统计（services/quota），fixed 只算 manual。
 - covered(A, D)：D 日 A 已有采购尝试（不论结局，失败、中止也算；外部单号与「清除模拟结果」的不算，见
-  quota.attempted_map），或已有人工固定分配（fixed > 0）。契约 §3.2、方案 v2 §1 默认值 1。
+  quota.attempted_map），或已有人工固定分配（fixed > 0），或第 0 步刚把一笔来源指定的任务分给了它。
+  契约 §3.2、方案 v2 §1 默认值 1。
 - eligible(t, A)：min_amount ≤ subtotal_eff(t) ≤ max_amount（端点含，max 为空 = 不限）且 cap(A, D) > 0。
 
-1. 保底：未覆盖且有额度的账号与当天任务做最大二分匹配（增广路）。账号按（可选任务数升序、优先级降序、
+0. 来源指定：D 日带指定（任一列非空）的任务按（建议采购日期、下单时间、id）逐个处理。指定解析不了 → 未分配 + 原因；
+   解析到账号 A：A 参与自动分配 → 按 designation.placement_problem 的顺序检查（站点、小计、金额区间、每日上限、
+   cap），通过 → 分给 A（kind 'source'），cap(A, D) −1，A 当天算已覆盖；A 不参与（关闭采购开关或暂停执行）→ 任务当前
+   就分配在 A 上（非人工）→ 原样保留（kind 记为 'source'，不做额度运算），否则未分配 + 原因。**带指定的任务不进
+   第 1–3 步，分不出去也不会自动分给别的账号。**
+   指定被来源清空的任务（kind 还是 'source'、两列已空）：当前账号参与自动分配（或已归档）→ 当作自动任务进第 1–3 步
+   重算；当前账号未归档但不参与 → 原地改为 'auto' 并保留（说明 designation.NOTE_CLEARED_KEPT）。
+1. 保底：未覆盖且有额度的账号与当天的自动任务做最大二分匹配（增广路）。账号按（可选任务数升序、优先级降序、
    名称升序）依次找增广路；候选任务按（可选账号数升序、建议采购日期、下单时间、id）。标注「保底：当天首单」。
-2. 填充：剩余任务按（建议采购日期、下单时间、id）依次给可选账号中优先级最高者，同优先级按名称升序；
+2. 填充：剩余自动任务按（建议采购日期、下单时间、id）依次给可选账号中优先级最高者，同优先级按名称升序；
    标注「按优先级填充」。
-3. 分不出去的任务留在 queued，status_reason 写明原因；未覆盖的账号写进 allocation_runs.uncovered。
+3. 分不出去的任务留在 queued，status_reason 写明原因；未覆盖的账号写进 allocation_runs.uncovered（当天没有金额匹配的
+   自动任务、但有金额匹配而由来源指定的任务 → 原因 UNCOVERED_DESIGNATED）。
+
+写回：每个结果是（账号 | None，文字，kind）。账号、kind、说明三者都没变 → 不写任何东西；账号变了才记
+'order.assigned' / 'order.reassigned'（detail 带 kind）；只有 kind 或说明变 → 只更新这两列，不记事件、不动 assigned_at。
+**两次相同的分配：第二次除了 allocation_runs 多一行，不写任务、不写事件。**
 
 名称排序按 Unicode 码位（Python 字符串比较），与数据库排序规则无关，保证结果可复现。
 """
@@ -29,7 +46,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from services import clock, events, orders, quota, settings_svc
+from services import clock, designation, events, orders, quota, settings_svc
 from services.errors import validation
 from services.models import ATTEMPT_INFLIGHT
 
@@ -41,6 +58,7 @@ REASON_FULL = "匹配账号当天额度已满"
 UNCOVERED_NO_QUOTA = "当天额度已用完"
 UNCOVERED_NO_MATCH = "没有金额匹配的订单"
 UNCOVERED_NOT_ENOUGH = "订单数量不足"
+UNCOVERED_DESIGNATED = "金额匹配的订单都已由来源指定给其他账号"
 
 _LOCK_NS = 7_310_431          # pg_advisory_xact_lock 的命名空间（按工作区串行化分配）
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -75,7 +93,9 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
              actor_id: int | None = None) -> dict[str, Any]:
     """输入：工作区、今天（缺省北京今天）、触发方式、操作者 → 输出：分配摘要（契约 §10，并写 allocation_runs）。
 
-    只改「池」里的任务（见模块说明）；同一工作区的分配用事务级咨询锁串行化。
+    只改「池」里的任务（见模块说明）；同一工作区的分配用事务级咨询锁串行化。摘要的
+    stats = {considered, assigned, coverage, fill, designated, unassigned}，assigned = coverage + fill + designated；
+    第 0 步（来源指定）产生的未分配项带 designated: true。
     """
     if trigger not in TRIGGERS:
         raise validation(f"未知的分配触发方式：{trigger}", field="trigger")
@@ -83,11 +103,9 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
     conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
     simulated = settings_svc.simulation_only(conn, workspace_id)
 
-    accounts = conn.execute(
-        "SELECT * FROM procure.buyer_accounts WHERE workspace_id = %s AND archived_at IS NULL "
-        "AND purchase_enabled AND NOT execution_paused",
-        (workspace_id,),
-    ).fetchall()
+    ctx = designation.load_context(conn, workspace_id)          # 全部账号（含已归档）与忽略名单：解析来源指定用
+    live_by_id = {a["id"]: a for a in ctx.accounts if a["archived_at"] is None}
+    accounts = [a for a in live_by_id.values() if a["purchase_enabled"] and not a["execution_paused"]]
     accounts.sort(key=lambda a: a["name"])
     acc_ids = [a["id"] for a in accounts]
     by_id = {a["id"]: a for a in accounts}
@@ -99,7 +117,10 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
         WHERE o.workspace_id = %s
           AND (o.status = 'queued'
                OR (o.status = 'assigned' AND o.assignment_kind = 'auto' AND o.assigned_account_id = ANY(%s))
-               OR (o.status = 'assigned' AND (a.id IS NULL OR a.archived_at IS NOT NULL)))
+               OR (o.status = 'assigned' AND (a.id IS NULL OR a.archived_at IS NOT NULL))
+               OR (o.status = 'assigned' AND o.assignment_kind = 'source')
+               OR (o.status = 'assigned' AND o.assignment_kind = 'auto'
+                   AND (o.designated_customer_id IS NOT NULL OR o.designated_buyer_name IS NOT NULL)))
           AND NOT EXISTS (SELECT 1 FROM procure.purchase_attempts pa
                           WHERE pa.purchase_order_id = o.id AND pa.status = ANY(%s))
         ORDER BY o.id
@@ -116,18 +137,59 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
     used = quota.used_map(conn, workspace_id, dates, simulated)
     attempted = quota.attempted_map(conn, workspace_id, dates, simulated)
 
-    result: dict[int, tuple[int | None, str]] = {}      # 任务 id → (账号 id 或 None, 分配说明或未分配原因)
+    # 任务 id → (账号 id 或 None, 分配说明或未分配原因, 分配方式或 None)
+    result: dict[int, tuple[int | None, str, str | None]] = {}
+    by_designation: set[int] = set()        # 第 0 步处理的任务（未分配项带 designated: true）
+    kept_as_auto: set[int] = set()          # 指定被清空、留在不参与账号上改回 auto 的任务（不算本次考虑的任务）
     uncovered: list[dict[str, Any]] = []
-    n_cov = n_fill = 0
+    n_cov = n_fill = n_des = 0
 
     for d in dates:
-        tasks = sorted(by_date.get(d, []), key=_task_key)
-        sub = {t["id"]: orders.subtotal_eff(t) for t in tasks}
+        day_tasks = sorted(by_date.get(d, []), key=_task_key)
+        sub = {t["id"]: orders.subtotal_eff(t) for t in day_tasks}
         cap = {a["id"]: a["daily_limit"] - used.get((a["id"], d), 0) - fixed.get((a["id"], d), 0) for a in accounts}
         covered = {a["id"]: attempted.get((a["id"], d), 0) > 0 or fixed.get((a["id"], d), 0) > 0 for a in accounts}
 
         def in_range(t: dict[str, Any], a: dict[str, Any]) -> bool:
             return _site_ok(t, a) and orders.amount_in_range(sub[t["id"]], a)
+
+        # ⓪ 来源指定：带指定的任务只可能去它指定的账号；其余任务留给 ①–③
+        designated: list[dict[str, Any]] = []
+        tasks: list[dict[str, Any]] = []
+        for t in day_tasks:
+            if designation.has(t):
+                designated.append(t)
+                continue
+            cur = live_by_id.get(t["assigned_account_id"]) if t["status"] == "assigned" else None
+            if t["assignment_kind"] == designation.KIND and cur is not None and cur["id"] not in by_id:
+                # 来源取消了指定，而任务所在的账号不参与自动分配：原地改回 auto 并保留
+                result[t["id"]] = (cur["id"], designation.NOTE_CLEARED_KEPT, "auto")
+                kept_as_auto.add(t["id"])
+                continue
+            tasks.append(t)
+        for t in designated:
+            by_designation.add(t["id"])
+            res = designation.resolve_order(t, ctx)
+            a = res.account
+            if a is None:
+                result[t["id"]] = (None, res.problem, None)
+                continue
+            on_a = (t["status"] == "assigned" and t["assigned_account_id"] == a["id"]
+                    and t["assignment_kind"] != "manual")
+            if a["id"] not in by_id and on_a:
+                result[t["id"]] = (a["id"], res.note, designation.KIND)       # 原样保留，不做额度运算
+                n_des += 1
+                continue
+            problem = designation.placement_problem(
+                a, site_ok=_site_ok(t, a), subtotal=sub[t["id"]], in_range=orders.amount_in_range(sub[t["id"]], a),
+                on_account=on_a, cap=cap.get(a["id"], 0), day=d)
+            if problem is not None:
+                result[t["id"]] = (None, problem, None)
+                continue
+            result[t["id"]] = (a["id"], res.note, designation.KIND)
+            cap[a["id"]] -= 1
+            covered[a["id"]] = True
+            n_des += 1
 
         # ① 保底：最大二分匹配
         cov_accounts = [a for a in accounts if not covered[a["id"]] and cap[a["id"]] > 0]
@@ -156,7 +218,7 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
             augment(a["id"], set())
         matched_accounts = set(match.values())
         for tid, aid in match.items():
-            result[tid] = (aid, NOTE_COVERAGE)
+            result[tid] = (aid, NOTE_COVERAGE, "auto")
             cap[aid] -= 1
             n_cov += 1
 
@@ -167,61 +229,68 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
             cands = [a for a in accounts if cap[a["id"]] > 0 and in_range(t, a)]
             if cands:
                 best = min(cands, key=lambda a: (-a["priority"], a["name"]))
-                result[t["id"]] = (best["id"], NOTE_FILL)
+                result[t["id"]] = (best["id"], NOTE_FILL, "auto")
                 cap[best["id"]] -= 1
                 n_fill += 1
             elif not accounts:
-                result[t["id"]] = (None, REASON_NO_ACCOUNT)
+                result[t["id"]] = (None, REASON_NO_ACCOUNT, None)
             elif not any(_site_ok(t, a) for a in accounts):
-                result[t["id"]] = (None, f"收货国家 {t.get('country') or '（空）'} 没有对应站点的启用账号")
+                result[t["id"]] = (None, f"收货国家 {t.get('country') or '（空）'} 没有对应站点的启用账号", None)
             elif any(in_range(t, a) for a in accounts):
-                result[t["id"]] = (None, REASON_FULL)
+                result[t["id"]] = (None, REASON_FULL, None)
             else:
-                result[t["id"]] = (None, _reason_out_of_range(sub[t["id"]]))
+                result[t["id"]] = (None, _reason_out_of_range(sub[t["id"]]), None)
 
-        # ③ 未覆盖的账号
+        # ③ 未覆盖的账号（来源指定的任务落到它上面的账号已在 ⓪ 里算作已覆盖）
         for a in accounts:
             if covered[a["id"]] or a["id"] in matched_accounts:
                 continue
             if a["daily_limit"] - used.get((a["id"], d), 0) - fixed.get((a["id"], d), 0) <= 0:
                 why = UNCOVERED_NO_QUOTA
-            elif not any(in_range(t, a) for t in tasks):
-                why = UNCOVERED_NO_MATCH
-            else:
+            elif any(in_range(t, a) for t in tasks):
                 why = UNCOVERED_NOT_ENOUGH
+            elif any(in_range(t, a) for t in designated):
+                why = UNCOVERED_DESIGNATED
+            else:
+                why = UNCOVERED_NO_MATCH
             uncovered.append({"account_id": a["id"], "name": a["name"], "date": d.isoformat(), "reason": why})
 
-    # ④ 写回任务
+    # ④ 写回任务：账号、分配方式、说明三者都没变就什么都不写
     unassigned: list[dict[str, Any]] = []
     now = clock.now()
     for t in pool:
-        aid, text = result[t["id"]]
+        aid, text, kind = result[t["id"]]
         if aid is None:
-            unassigned.append({"order_id": t["id"], "upstream_order_no": t["upstream_order_no"], "reason": text})
+            item = {"order_id": t["id"], "upstream_order_no": t["upstream_order_no"], "reason": text}
+            if t["id"] in by_designation:
+                item["designated"] = True
+            unassigned.append(item)
             if t["status"] == "assigned":
                 orders.transition(conn, t, "queued", reason=text, actor_kind=actor_kind, actor_id=actor_id,
                                   event_detail={"allocation_trigger": trigger})
             elif t["status_reason"] != text:
                 orders._update(conn, workspace_id, t["id"], {"status_reason": text})
             continue
-        acc = by_id[aid]
-        upd = {"assigned_account_id": aid, "assignment_kind": "auto", "assigned_at": now, "assignment_note": text}
+        acc = live_by_id[aid]               # 保留在不参与账号上的任务也在这里取账号行（by_id 只含参与的账号）
+        upd = {"assigned_account_id": aid, "assignment_kind": kind, "assigned_at": now, "assignment_note": text}
         detail = {"account_id": aid, "account_name": acc["name"], "note": text, "trigger": trigger,
-                  "from_account_id": t["assigned_account_id"]}
+                  "from_account_id": t["assigned_account_id"], "kind": kind}
         if t["status"] == "queued":
             orders.transition(conn, t, "assigned", reason=None, actor_kind=actor_kind, actor_id=actor_id,
                               updates=upd, event_detail={"allocation_trigger": trigger})
             events.record(conn, workspace_id, "order", t["id"], "order.assigned", actor_kind=actor_kind,
-                                 actor_id=actor_id, detail={**detail, "kind": "auto"})
-        elif t["assigned_account_id"] != aid or t["assignment_kind"] != "auto":
+                          actor_id=actor_id, detail=detail)
+        elif t["assigned_account_id"] != aid:
             orders._update(conn, workspace_id, t["id"], {**upd, "status_reason": None})
             events.record(conn, workspace_id, "order", t["id"], "order.reassigned", actor_kind=actor_kind,
-                                 actor_id=actor_id, detail={**detail, "kind": "auto"})
-        elif t["assignment_note"] != text:
-            orders._update(conn, workspace_id, t["id"], {"assignment_note": text})
+                          actor_id=actor_id, detail=detail)
+        else:
+            same_account = {k: v for k, v in (("assignment_kind", kind), ("assignment_note", text)) if t[k] != v}
+            if same_account:                # 只有分配方式或说明变：只更新这两列，不记事件、不动 assigned_at
+                orders._update(conn, workspace_id, t["id"], same_account)
 
-    stats = {"considered": len(pool), "assigned": n_cov + n_fill, "coverage": n_cov, "fill": n_fill,
-             "unassigned": len(unassigned)}
+    stats = {"considered": len(pool) - len(kept_as_auto), "assigned": n_cov + n_fill + n_des, "coverage": n_cov,
+             "fill": n_fill, "designated": n_des, "unassigned": len(unassigned)}
     run = conn.execute(
         "INSERT INTO procure.allocation_runs (workspace_id, trigger, bj_date, at, stats, uncovered, unassigned) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
@@ -252,8 +321,10 @@ def allocate_daily(conn, workspace_id: int, *, today: date | None = None) -> dic
 
 
 def _run_out(run: dict[str, Any]) -> dict[str, Any]:
+    stats = {**(run["stats"] or {})}
+    stats.setdefault("designated", 0)       # 有「来源指定」之前写下的分配记录没有这个键
     return {"id": run["id"], "bj_date": run["bj_date"].isoformat(), "at": run["at"].isoformat(),
-            "trigger": run["trigger"], "stats": run["stats"], "uncovered": run["uncovered"],
+            "trigger": run["trigger"], "stats": stats, "uncovered": run["uncovered"],
             "unassigned": run["unassigned"]}
 
 
@@ -271,8 +342,9 @@ def check_manual_assignment(conn, workspace_id: int, order_row: dict[str, Any], 
     """输入：工作区、任务行、目标账号行、今天 → 输出：无；不满足改派条件时抛 VALIDATION（中文原因）。
 
     条件：同一工作区、账号未归档且已启用采购、任务待分配或已分配、站点相符、金额在账号区间内（端点含）、
-    计划日期当天有剩余额度：daily_limit − used − planned > 0（本任务已计划在该账号同一天时不重复计算）。
-    暂停执行的账号允许人工改派（恢复执行后再采购）。
+    计划日期当天有剩余额度：daily_limit − used − planned > 0（本任务已计划在该账号同一天时不重复计算；planned 含
+    来源指定与自动分配的任务，所以人工改派不会挤掉它们）。暂停执行的账号允许人工改派（恢复执行后再采购）。
+    任务有来源指定时也可以改派（人工改派优先于来源指定）。
     """
     if account_row["workspace_id"] != workspace_id or order_row["workspace_id"] != workspace_id:
         raise validation("账号与任务不在同一工作区")

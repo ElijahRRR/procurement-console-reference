@@ -1,6 +1,7 @@
 /**
  * 「账号与浏览器」页的接线（执行入口改造后）：
  * - 账号页签顶部的「待登记的买家号」：登记（账号对话框预填 ID 与名称，走新建接口）、填到已有账号（PATCH）、忽略 / 恢复、自动刷新；
+ *   来源指定的买家号也列在这里（写明指定了几笔任务，没有浏览器登录时写明），已忽略分组列出忽略名单里的全部 ID；
  * - 账号表的「买家号 ID」「所在浏览器」两列；账号对话框没有原来的指定执行环境一项；
  * - 浏览器页签：只读列表、各登录状态的文字、改名、移除、显示已移除、空状态；
  * - 概览的待登记提示与「去登记」；设置页显示工作区 ID。
@@ -283,6 +284,87 @@ describe('账号页签：待登记的买家号', () => {
     expect(buttons('登记')).toHaveLength(0)
   })
 
+  it('来源指定的买家号：写明指定了几笔任务；没有浏览器登录时写明；「登记」「填到已有账号」「忽略」照旧', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([
+      buyer('A2TEST00005', { name_hint: '环境-DEMO-05', source_orders: 1 }),
+      buyer('A2TEST00007', { name_hint: '环境-DEMO-07', browsers: [], last_reported_at: null, source_orders: 2 }),
+      buyer('A2TEST00004'),
+    ])
+    await mountWith(AccountsPanel)
+    const zone = document.body.querySelector('[data-testid="discovered-buyers"]') as HTMLElement
+    const rowOf = (id: string) => [...zone.querySelectorAll('li')].find((li) => (li.textContent ?? '').includes(id)) as HTMLElement
+    expect(zone.textContent).toContain('插件在浏览器里读到、或来源指定了这些买家号')
+    expect(zone.textContent).toContain('3 个')
+    // 浏览器登录着，来源也指定了任务
+    expect(rowOf('A2TEST00005').textContent).toContain('来源指定了 1 笔任务')
+    expect(rowOf('A2TEST00005').textContent).toContain('浏览器 10')
+    expect(rowOf('A2TEST00005').textContent).not.toContain('还没有浏览器登录这个买家号')
+    // 只来自来源
+    expect(rowOf('A2TEST00007').textContent).toContain('来源指定了 2 笔任务')
+    expect(rowOf('A2TEST00007').textContent).toContain('还没有浏览器登录这个买家号')
+    expect(rowOf('A2TEST00007').textContent).toContain('来源里这个买家号叫「环境-DEMO-07」')
+    // 只来自浏览器（旧服务端不给 source_orders 也一样）
+    expect(rowOf('A2TEST00004').textContent).not.toContain('来源指定了')
+    for (const id of ['A2TEST00005', 'A2TEST00007', 'A2TEST00004']) {
+      expect(buttons('登记', rowOf(id))).toHaveLength(1)
+      expect(buttons('填到已有账号', rowOf(id))).toHaveLength(1)
+      expect(buttons('忽略', rowOf(id))).toHaveLength(1)
+    }
+    // 没有上报过的排在最后
+    expect([...zone.querySelectorAll('li')].at(-1)!.textContent).toContain('A2TEST00007')
+  })
+
+  it('登记只来自来源的买家号：对话框说明 ID 来自来源、还没有浏览器登录；名称用来源里的买家号预填', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00007', { name_hint: '环境-DEMO-07', browsers: [], last_reported_at: null, source_orders: 2 })])
+    accountsApi.createAccount.mockResolvedValue(account({ id: 99, name: '环境-DEMO-07', amazon_customer_id: 'A2TEST00007', browsers: [] }))
+    await mountWith(AccountsPanel)
+    buttons('登记')[0].click()
+    await settle()
+    const dialog = openDialog()!
+    expect(dialog.textContent).toContain('登记买家号 · A2TEST00007')
+    expect(dialog.textContent).toContain('这个买家号 ID 是来源指定的，还没有浏览器登录这个买家号。登记后，来源指定给它的 2 笔任务会按指定重新分配')
+    expect(dialog.textContent).not.toContain('由插件从浏览器登录的亚马逊页面读出')
+    expect([...dialog.querySelectorAll('input')].map((i) => i.value)).toContain('环境-DEMO-07')
+    buttons('登记', dialog)[0].click()
+    await settle()
+    expect(accountsApi.createAccount.mock.calls[0][0]).toMatchObject({ name: '环境-DEMO-07', amazon_customer_id: 'A2TEST00007' })
+  })
+
+  it('把只来自来源的买家号填到已有账号：成功提示写明来源指定的任务会重新分配，不提浏览器', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00007', { browsers: [], last_reported_at: null, source_orders: 2 })])
+    accountsApi.updateAccount.mockResolvedValue(account({ id: 8, name: '环境-DEMO-04', amazon_customer_id: 'A2TEST00007', browsers: [] }))
+    const w = await mountWith(AccountsPanel)
+    w.findComponent(ElDropdown).vm.$emit('command', 8)
+    await settle()
+    expect(accountsApi.updateAccount).toHaveBeenCalledWith(8, { amazon_customer_id: 'A2TEST00007' })
+    expect(feedback.notifySuccess).toHaveBeenCalledWith('已把买家号 ID 登记到「环境-DEMO-04」', '来源指定给它的 2 笔任务会按指定重新分配。')
+  })
+
+  it('已忽略分组列出忽略名单里的全部 ID：此刻没有浏览器登录着的也在，每个都能恢复', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([
+      buyer('A2TEST00099', { ignored: true }),
+      buyer('A2TEST00098', { ignored: true, browsers: [], last_reported_at: null }),
+      buyer('A2TEST00097', { ignored: true, browsers: [], last_reported_at: null, source_orders: 1 }),
+    ])
+    accountsApi.unignoreDiscovered.mockResolvedValue({ ok: true })
+    await mountWith(AccountsPanel)
+    expect(bodyText()).toContain('已忽略 3 个')
+    const toggle = [...document.body.querySelectorAll('button')].find((b) => (b.textContent ?? '').includes('已忽略 3 个')) as HTMLButtonElement
+    toggle.click()
+    await flushPromises()
+    const zone = document.body.querySelector('[data-testid="discovered-buyers"]') as HTMLElement
+    const rowOf = (id: string) => [...zone.querySelectorAll('li')].find((li) => (li.textContent ?? '').includes(id)) as HTMLElement
+    expect(rowOf('A2TEST00099').textContent).toContain('浏览器 10')
+    expect(rowOf('A2TEST00099').textContent).toContain('最近上报')
+    expect(rowOf('A2TEST00098').textContent).toContain('还没有浏览器登录这个买家号')
+    expect(rowOf('A2TEST00098').textContent).not.toContain('最近上报')
+    expect(rowOf('A2TEST00097').textContent).toContain('来源指定了 1 笔任务')
+    expect(buttons('恢复', zone)).toHaveLength(3)
+    buttons('恢复', rowOf('A2TEST00098'))[0].click()
+    await settle()
+    expect(accountsApi.unignoreDiscovered).toHaveBeenCalledWith('A2TEST00098')
+  })
+
   it('页面可见时每 10 秒自动刷新；页面不可见时不刷新；卸载后停止', async () => {
     vi.useFakeTimers()
     const state = vi.spyOn(document, 'visibilityState', 'get')
@@ -388,6 +470,8 @@ describe('账号表与账号对话框', () => {
     const dialog = openDialog()!
     expect(dialog.textContent).toContain('新建买家账号')
     expect(dialog.textContent).toContain('亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。')
+    // 账号名称是来源按「买家号」指定时对应账号的依据
+    expect((dialog.querySelector('[data-testid="account-name-help"]') as HTMLElement).textContent).toBe('来源按「买家号」指定时靠名称对应账号，改名后这些任务会回到待分配。')
     expect(dialog.textContent).not.toMatch(/默认设备|绑定|配对/)
     expect((dialog.querySelector('input[aria-label="买家号 ID"]') as HTMLInputElement).readOnly).toBe(false)
     const name = dialog.querySelector('input') as HTMLInputElement
@@ -407,6 +491,8 @@ describe('账号表与账号对话框', () => {
     ;(document.body.querySelector('.el-table__body button[aria-label="编辑账号"]') as HTMLButtonElement).click()
     await settle()
     let dialog = openDialog()!
+    // 编辑时同样提醒改名的影响
+    expect(dialog.textContent).toContain('来源按「买家号」指定时靠名称对应账号，改名后这些任务会回到待分配。')
     buttons('保存', dialog)[0].click()
     await settle()
     expect(accountsApi.updateAccount).toHaveBeenCalledTimes(1)
@@ -631,7 +717,7 @@ describe('概览：待登记的买家号提示', () => {
   it('有待登记的买家号时提示个数，「去登记」跳到账号页签', async () => {
     overviewApi.getOverview.mockResolvedValue(overview({ discovered_buyers: 2 }))
     await mountWith(OverviewView)
-    expect(bodyText()).toContain('插件发现了 2 个还没登记的买家号，登记后才会分到任务')
+    expect(bodyText()).toContain('有 2 个还没登记的买家号（插件读到的或来源指定的），登记后才会分到任务')
     buttons('去登记')[0].click()
     await settle()
     expect(router.currentRoute.value.path).toBe('/accounts')

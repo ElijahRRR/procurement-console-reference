@@ -10,7 +10,7 @@
 - 插件：`Authorization: Bearer <浏览器令牌>`，由 services.devices.authenticate 只按令牌哈希查；缺失或没登记过
   → 401 UNAUTHORIZED「这个浏览器还没有登记，插件会自动重新登记」（插件收到后用同一个令牌调 /plugin/v1/register）。
   令牌只是会话标识，不代表身份；从控制台列表里移除的浏览器照样能认证（再次联系时自动回到列表）。
-  /plugin 的来源检查（本机对端等）在 server/limits.PluginGateMiddleware，先于这里。
+  /plugin 的来源检查（本机对端、不带代理转发头等）在 server/limits.PluginGateMiddleware，先于这里。
 - 防跨站：控制台的写请求必须带 `X-Requested-With: pc-console`（检查在 app.py 的中间件里，见 csrf_ok）。
 """
 

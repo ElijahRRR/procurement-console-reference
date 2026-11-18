@@ -19,8 +19,8 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
 
     needs_attention = 置了「需要留意」提醒的任务数（不论状态）；today_executable = 已分配且建议采购日期 ≤ 北京今天（「today」视图）；future_assigned = 已分配且日期在今天之后；
     accounts.enabled = 未归档且采购开关开启；accounts.paused = 未归档且暂停执行；devices（浏览器）只计未移除的，
-    online = 3 分钟内有联系；discovered_buyers = 未忽略的待登记买家号个数（浏览器上报了、还没有账号登记的买家号
-    ID，见 accounts.discovered）；recent_exceptions = 最近变为「异常」的任务（列表行形状）。
+    online = 3 分钟内有联系；discovered_buyers = 未忽略的待登记买家号个数（浏览器上报了、或来源给未采购任务指定了，
+    而还没有账号登记的买家号 ID，见 accounts.discovered）；recent_exceptions = 最近变为「异常」的任务（列表行形状）。
     """
     today = clock.bj_today()
     counts = {s: 0 for s in ORDER_STATUSES}
@@ -70,7 +70,7 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
         "accounts": {"total": int(acc["total"]), "enabled": int(acc["enabled"]), "paused": int(acc["paused"])},
         "devices": {"total": int(dev["total"]), "online": int(dev["online"])},
         "discovered_buyers": accounts.discovered_count(conn, workspace_id),
-        "recent_exceptions": [orders.order_row_out(r) for r in recent],
+        "recent_exceptions": orders.rows_out(conn, workspace_id, recent),
         "last_allocation": allocation.last_run(conn, workspace_id),
         "simulation_only": settings_svc.simulation_only(conn, workspace_id),
         "feishu_configured": settings.get().feishu_configured,

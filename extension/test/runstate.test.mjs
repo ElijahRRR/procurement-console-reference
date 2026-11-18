@@ -2,7 +2,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
+import { END_REASON_ZH } from "./fake-server.mjs";
 import { CUSTODY_MARGIN_MS, CUSTODY_MAX_MS, custodyOverBudget, custodyStep, helloEndsRun, pingSaysAlive } from "../build/core/custody.js";
 import { runViewActive, startGate } from "../build/core/startgate.js";
 import {
@@ -141,6 +143,26 @@ test("停止原因：服务端的三个值都有中文（不再有「解除绑�
     assert.notEqual(codeLabel(c), c, c);
   }
   assert.equal(ACCOUNT_LEVEL_CODES.has("PLUGIN_SIMULATION_ONLY"), true);
+});
+
+test("批次结束原因：历史的 device_revoked 三端同一句「浏览器的授权已撤销（旧版）」；假服务端的结束原因表与真实服务端逐字一致", () => {
+  const label = "浏览器的授权已撤销（旧版）";
+  assert.equal(STOP_REASON_LABEL.device_revoked, label);
+  assert.equal(stopReasonLabel("device_revoked"), label);
+  assert.equal(END_REASON_ZH.device_revoked, label);
+  // 结束原因是封闭取值：finished / lease_expired / simulation_reset / identity_mismatch，外加历史的 device_revoked
+  assert.deepEqual(Object.keys(END_REASON_ZH).sort(), ["device_revoked", "finished", "identity_mismatch", "lease_expired", "simulation_reset"]);
+  for (const k of ["lease_expired", "simulation_reset", "identity_mismatch", "device_revoked"]) {
+    assert.notEqual(stopReasonLabel(k), "服务端要求停止", `${k} 有中文`);
+  }
+  // 另外两端的源码就在同一个仓库里：能读到就逐字对照（单独拿出插件目录时读不到，跳过）
+  const read = (rel) => { try { return readFileSync(new URL(rel, import.meta.url), "utf8"); } catch { return null; } };
+  const backend = read("../../backend/services/execution.py");
+  if (backend !== null) {
+    for (const [k, zh] of Object.entries(END_REASON_ZH)) assert.ok(backend.includes(`"${k}": "${zh}"`), `服务端 END_REASON_ZH.${k}`);
+  }
+  const web = read("../../web/src/utils/labels.ts");
+  if (web !== null) assert.ok(web.includes(`device_revoked: '${label}'`), "控制台 RUN_END_REASON_LABEL.device_revoked");
 });
 
 test("IDENTITY_MISMATCH 不再是账号级：执行中换了买家号不暂停账号（中止类）；说明里没有「绑定」", () => {
