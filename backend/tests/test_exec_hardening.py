@@ -37,7 +37,7 @@ def _err(fn, *a, **kw) -> DomainError:
 
 def _env(conn, workspace, **acc_kw):
     acc = fx.exec_account(conn, workspace["id"], **acc_kw)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     return acc, dev
 
 
@@ -113,7 +113,7 @@ def test_stale_identity_stops_claiming_until_reported_again(conn, workspace):
     run_id = fx.start(conn, dev)
     _keep_lease(conn, dev, run_id, 601)
     out = execution.next_attempt(conn, dev, run_id)
-    assert out["attempt"] is None and "身份信息已过期" in out["reason"]
+    assert out["attempt"] is None and "插件超过 10 分钟没有上报登录状态" in out["reason"]
     fx.refresh_identity(conn, dev, acc)
     assert execution.next_attempt(conn, dev, run_id)["attempt"] is not None
 
@@ -126,9 +126,11 @@ def test_stale_identity_stops_before_submit(conn, workspace):
     fx.to_guard_passed(conn, dev, a)
     _keep_lease(conn, dev, run_id, 601)
     p = execution.progress(conn, dev, a["attempt_id"], stage="before_submit")
-    assert p["continue"] is False and "身份信息已过期" in p["cancel_reason"]
+    assert p["continue"] is False and p["cancel_code"] == "IDENTITY_STALE"
+    assert p["cancel_reason"] == "插件超过 10 分钟没有上报登录状态"
     e = _err(execution.mark_submitting, conn, dev, a["attempt_id"])
-    assert e.code == "IDENTITY_MISMATCH" and e.detail["stale"] is True
+    assert e.code == "IDENTITY_MISMATCH" and e.http_status == 409
+    assert e.detail == {"login_state": "signed_in", "stale": True, "identity_at": NOW.isoformat()}
     fx.refresh_identity(conn, dev, acc)
     assert execution.mark_submitting(conn, dev, a["attempt_id"])["ok"] is True
     assert fx.order_row(conn, order["id"])["status"] == "executing"
@@ -331,9 +333,10 @@ def test_guard_facts_are_sanitized_before_storage_and_detail(conn, workspace):
     acc, dev = _env(conn, workspace)
     order = fx.assigned_order(conn, ws, acc)
     a = fx.claim(conn, dev, fx.start(conn, dev))
-    facts = fx.good_facts(order, card_last4="4111 1111 1111 1111",
-                          delivery={**_days(3), "text": "Arriving " + "x" * 500},
-                          billing={"card_number": "4111111111111111", "cvv": "123"}, page_html="<html>DEMO</html>")
+    facts = fx.facts_for(conn, order, card_last4="4111 1111 1111 1111",
+                         delivery={**_days(3), "text": "Arriving " + "x" * 500},
+                         billing={"card_number": "4111111111111111", "cvv": "123"}, page_html="<html>DEMO</html>",
+                         cookies="session-id=DEMO")
     facts["ship_to"] = {"postal_code": "32960-1234", "name": "Demo Buyer", "line1": "100 Demo Street"}
     v = execution.submit_guard(conn, dev, a["attempt_id"], facts)
     assert v["verdict"] == "pass"
@@ -344,6 +347,8 @@ def test_guard_facts_are_sanitized_before_storage_and_detail(conn, workspace):
     detail = json.dumps(orders.get_detail(conn, ws, order["id"]), ensure_ascii=False, default=str)
     assert "4111111111111111" not in detail and "4111 1111" not in detail
     assert "cvv" not in detail and "page_html" not in detail and "billing" not in detail
+    assert "cookies" not in detail and "session-id" not in detail
+    assert stored["customer_id"] == acc["amazon_customer_id"]          # 结算页读到的买家号 ID 留作凭据
 
 
 def test_non_dict_guard_facts_block_without_storing_raw(conn, workspace):

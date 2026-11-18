@@ -64,37 +64,51 @@ def make_account(conn, ws_id: int, **kw: Any) -> dict[str, Any]:
     ).fetchone()
 
 
-def make_device(conn, ws_id: int, *, name: str | None = None, bound_account_id: int | None = None,
-                identity: dict[str, Any] | None = None, identity_status: str = "unknown",
-                last_seen_at: datetime | None | object = _DEFAULT, token_hash: str | None = None,
-                revoked_at: datetime | None = None) -> dict[str, Any]:
-    """输入：工作区、设备名、绑定账号、身份、最近心跳 → 输出：devices 行（缺省刚刚心跳过）。"""
+def make_device(conn, ws_id: int, *, name: str | None = None, customer_id: str | None = None,
+                identity: dict[str, Any] | None = None, last_seen_at: datetime | None | object = _DEFAULT,
+                token_hash: str | None = None, hidden_at: datetime | None = None,
+                ext_version: str = "0.2.0") -> dict[str, Any]:
+    """输入：工作区、浏览器名、登录的买家号 ID（给了就是「已登录、读到这个 ID」）或完整的身份、最近联系时间、
+    是否已移除 → 输出：devices 行（缺省刚刚联系过、从未上报身份）。
+
+    直接写库：login_customer_id 按「已登录、有 ID、没有分歧」从身份推出，与 services/devices 存的一致。
+    """
     n = _n()
     seen = clock.now() if last_seen_at is _DEFAULT else last_seen_at
+    if identity is None and customer_id is not None:
+        identity = {"signed_in": True, "customer_id": customer_id, "site": "US",
+                    "page_url": "https://www.amazon.com/gp/css/order-history", "conflict": False}
+    login = None
+    if identity is not None:
+        identity = {"conflict": False, **identity, "at": (seen or clock.now()).isoformat()}
+        if identity.get("signed_in") is True and identity.get("customer_id") and not identity.get("conflict"):
+            login = identity["customer_id"]
     return conn.execute(
         """
-        INSERT INTO procure.devices (workspace_id, name, browser, token_hash, bound_account_id, ext_version,
-                                     last_seen_at, identity, identity_status, identity_at, created_at, revoked_at)
-        VALUES (%s, %s, 'chrome', %s, %s, '0.1.0', %s, %s, %s, %s, %s, %s) RETURNING *
+        INSERT INTO procure.devices (workspace_id, name, token_hash, ext_version, last_seen_at, identity, identity_at,
+                                     login_customer_id, created_at, hidden_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
         """,
-        (ws_id, name or f"Mac-DEMO-{n:03d}", token_hash or f"demo-token-hash-{n}", bound_account_id, seen,
-         Jsonb(identity) if identity is not None else None, identity_status, seen, clock.now(), revoked_at),
+        (ws_id, name or f"浏览器-DEMO-{n:03d}", token_hash or f"demo-token-hash-{n}", ext_version, seen,
+         Jsonb(identity) if identity is not None else None, (seen or clock.now()) if identity is not None else None,
+         login, clock.now(), hidden_at),
     ).fetchone()
 
 
 def make_run(conn, ws_id: int, account_id: int, device_id: int, *, simulated: bool = True,
-             trigger: str = "manual") -> dict[str, Any]:
-    """输入：工作区、账号、设备 → 输出：未结束的 execution_runs 行（租约 180 秒）。"""
+             trigger: str = "manual", scheduled_slot: str | None = None) -> dict[str, Any]:
+    """输入：工作区、账号、浏览器（定时批次另给时间点）→ 输出：未结束的 execution_runs 行（租约 180 秒）。"""
     from datetime import timedelta
 
     now = clock.now()
     return conn.execute(
         """
         INSERT INTO procure.execution_runs (workspace_id, account_id, device_id, trigger, simulated, started_at,
-                                            heartbeat_at, lease_expires_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
+                                            heartbeat_at, lease_expires_at, bj_date, scheduled_slot)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
         """,
-        (ws_id, account_id, device_id, trigger, simulated, now, now, now + timedelta(seconds=180)),
+        (ws_id, account_id, device_id, trigger, simulated, now, now, now + timedelta(seconds=180),
+         clock.bj_date(now), scheduled_slot),
     ).fetchone()
 
 

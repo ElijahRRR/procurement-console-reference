@@ -33,7 +33,7 @@ def real(conn, workspace, monkeypatch):
     monkeypatch.setattr(writeback, "enqueue_for_order", lambda c, ws, oid: calls.append((ws, oid)))
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     run = f.make_run(conn, ws, acc["id"], dev["id"], simulated=False)
     return {"ws": ws, "uid": workspace["user_id"], "acc": acc, "dev": dev, "run_id": run["id"], "calls": calls}
 

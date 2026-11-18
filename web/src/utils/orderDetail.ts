@@ -8,12 +8,12 @@ import { displayValue, formatMoney, parseAmount } from './format'
 import {
   CONFLICT_KIND_LABEL,
   FEISHU_VERDICT_LABEL,
-  GUARD_CODE_LABEL,
   ORDER_STATUS_LABEL,
   PROGRESS_CANCEL_LABEL,
   SOURCE_KIND_LABEL,
   errorCodeLabel,
   fieldLabel,
+  guardCodeLabel,
   labelOf,
 } from './labels'
 
@@ -122,7 +122,7 @@ export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
   push(changesText(d.changes))
   push(changesText(d.fields))
   if (typeof d.error_code === 'string' && d.error_code) push(errorCodeLabel(d.error_code))
-  if (e.kind === 'attempt.guard_blocked' && typeof d.code === 'string' && d.code) push(labelOf(GUARD_CODE_LABEL, d.code))
+  if (e.kind === 'attempt.guard_blocked' && typeof d.code === 'string' && d.code) push(guardCodeLabel(d.code))
   for (const k of EVENT_TEXT_KEYS) {
     const v = d[k]
     if (typeof v === 'string' && v) push(v)

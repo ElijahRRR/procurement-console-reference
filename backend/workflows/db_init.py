@@ -1,5 +1,9 @@
 """建库 + 建表：库不存在时先建库（连同一服务器的维护库 postgres 执行 CREATE DATABASE），再执行
-refdata/schema.sql（幂等，可反复执行）。"""
+refdata/schema.sql（幂等，可反复执行；旧库靠脚本里的「追加」段升级到当前结构）。
+
+另提供 schema_problem()：serve 启动前检查库结构是不是当前版本，不是就让入口层打印说明并以非零码退出
+（升级顺序：停服务 → python cli.py db_init → 启动 → 重新加载插件）。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,25 @@ from registry import db, paths
 
 #: 库不存在（invalid_catalog_name）
 _DB_MISSING = "3D000"
+
+SCHEMA_OUTDATED_MESSAGE = "数据库结构是旧版：请先运行 python cli.py db_init"
+SCHEMA_MISSING_MESSAGE = "数据库还没有建表：请先运行 python cli.py db_init"
+#: 当前结构的标志：这些（表, 列）必须都在。每次 schema.sql 加了服务代码依赖的列，就在这里补一项。
+_REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("devices", "login_customer_id"),
+    ("devices", "hidden_at"),
+    ("execution_runs", "bj_date"),
+    ("execution_runs", "scheduled_slot"),
+    ("ignored_buyer_ids", "customer_id"),
+)
+#: 旧结构的标志：这些（表, 列）必须都不在（升级时删掉的列）。
+_REMOVED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("devices", "bound_account_id"),
+    ("devices", "identity_status"),
+    ("devices", "revoked_at"),
+    ("buyer_accounts", "default_device_id"),
+    ("device_pairings", "code_hash"),
+)
 
 
 def _missing_dbname(exc: psycopg.OperationalError, dsn: str | None) -> str | None:
@@ -72,3 +95,24 @@ def run(dsn: str | None = None) -> dict[str, Any]:
         conn.execute(script)
     print(f"已按 {paths.SCHEMA_SQL.name} 建表（幂等，已有的表不受影响）", file=sys.stderr)
     return {"schema": str(paths.SCHEMA_SQL.name), "ok": True, "database": name, "database_created": created}
+
+
+def schema_problem(dsn: str | None = None, conn=None) -> str | None:
+    """输入：可选 DSN（缺省 PC_PG_DSN）或现成的连接 → 输出：库结构不是当前版本时的中文说明；是当前版本 → None。
+
+    只读 information_schema，不改任何东西。还没建过表 → SCHEMA_MISSING_MESSAGE；缺当前结构的列、或旧结构的列还在
+    （例如 devices.login_customer_id 不存在）→ SCHEMA_OUTDATED_MESSAGE。连不上数据库时照常抛出连接错误。
+    `python cli.py serve` 启动时调用：有说明就打印并以非零码退出。
+    """
+    if conn is None:
+        with db.pg_conn(dsn) as c:
+            return schema_problem(conn=c)
+    rows = conn.execute(
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'procure'"
+    ).fetchall()
+    have = {(r["table_name"], r["column_name"]) for r in rows}
+    if not any(table == "devices" for table, _ in have):
+        return SCHEMA_MISSING_MESSAGE
+    if any(col not in have for col in _REQUIRED_COLUMNS) or any(col in have for col in _REMOVED_COLUMNS):
+        return SCHEMA_OUTDATED_MESSAGE
+    return None

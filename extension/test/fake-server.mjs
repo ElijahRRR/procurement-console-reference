@@ -1,33 +1,50 @@
-/** 内存假服务端：按开发契约 v2 §4（护栏）与 §5（执行协议）、对照 backend/services/execution.py 实现插件接口，
- *  供引擎、客户端与后台测试用。
+/** 内存假服务端：按执行入口改造规格 v3（§2.2 – §2.5、§2.8）与开发契约 v2 §4（护栏）、§5（执行协议），
+ *  对照 backend/services/devices.py、execution.py 实现插件接口，供引擎、客户端与后台测试用。
  *
  * 只实现插件这一侧会碰到的规则，但**边角路径照真实服务端的样子回**（这些地方模型一偏，引擎测试就会
  * 「过了，真跑不对」）：
- *   · Host 允许名单（rejectHost：403 FORBIDDEN，原话同 server/limits）、配对限速（pairRateLimit：429 RATE_LIMITED，
- *     detail.retry_after_s 与 Retry-After 头）、设备令牌校验（Bearer）、配对码一次性；
- *   · 身份新鲜度（identity_fresh_s，默认 600 秒；心跳捎带身份或单独上报身份才算上报）：开始批次 403
- *     IDENTITY_MISMATCH（detail.stale）、领取不下发、进度 continue=false（IDENTITY_STALE）、提交登记 409
- *     IDENTITY_MISMATCH（detail.stale）；
- *   · 开始批次的前置条件（已绑定、未归档、身份 match 且新鲜、未暂停、只允许 simulated）与 ACCOUNT_BUSY；
- *     返回 {run_id, lease_ttl_s, lease_expires_at}，租约按 lease_ttl_s 过期，只有批次心跳续租；
- *   · 批次心跳 stop_reason 取 account_paused / account_archived / device_unbound / identity_mismatch；
+ *   · 插件入口闸（gate：{code, message} → 403，在认证之前，例如非本机对端、网页来源）；
+ *   · 设备登记 `POST /register {device_token, ext_version?, workspace_id?}`（不要令牌头）：令牌形状不对 → 422；
+ *     同一个令牌再登记 → 返回那一行、created=false（幂等）；没有工作区 → 409 CONFLICT；多个工作区且没带
+ *     存在的 workspace_id → 409 WORKSPACE_REQUIRED；设备数到上限 → 429 RATE_LIMITED（registerRateLimit：
+ *     detail.retry_after_s 与 Retry-After 头）；名称「浏览器 <id>」；
+ *   · 版本闸：登记或心跳带来的 ext_version 低于 0.2.0 → 409 PLUGIN_OUTDATED；
+ *   · 其余接口带 Bearer 令牌，未知令牌 → 401 UNAUTHORIZED（forgetDevices() 模拟服务端换了库）；
+ *   · 身份上报（心跳捎带或单独 `POST /identity`，返回同一形状）：清洗（customer_id 大写、形状不对当没读到，
+ *     绝不报错）；设备登录状态 unknown / conflict / signed_out / no_id / signed_in；signed_in 时按买家号 ID
+ *     解析成 ready（未归档账号登记了它）/ ignored / unregistered；stale = 超过 identity_fresh_s（默认 600 秒）；
+ *   · 心跳形状 {device, login, account, device_run, server_time, bj_date, simulation_only}；account 只在 ready 时有，
+ *     含 executable_today、future_assigned、active_run；
+ *   · 开始批次 `POST /runs {customer_id, trigger, slot?, simulated}`，依次：缺 customer_id → 422；设备已有未结束
+ *     批次 → 409 DEVICE_BUSY（detail {run_id, account_name, since, lease_expires_at}）；登录状态不是 signed_in、
+ *     ID 与请求不同、过期 → 403 IDENTITY_MISMATCH（detail {login_state, identity_at, stale}）；没有登记这个 ID
+ *     的账号 → 403 ACCOUNT_NOT_REGISTERED；暂停 → 403 ACCOUNT_PAUSED；非模拟 → 403 REAL_PURCHASE_DISABLED；
+ *     定时：缺 slot、账号不是定时模式、slot 不在执行时间里、北京时间还没到点 → 422，同一（账号、北京日期、slot）
+ *     已有未结束或以 finished 结束的定时批次 → 409 SLOT_DONE；账号已有未结束批次 → 409 ACCOUNT_BUSY；
+ *     返回 {run_id, lease_ttl_s, lease_expires_at, account: {id, name}}，租约按 lease_ttl_s 过期，只有批次心跳续租；
+ *   · 执行中的身份检查（领取、进度、提交登记）：这台设备最新的登录状态是 signed_in、买家号 ID 等于批次账号
+ *     **当前**登记的 ID、且不过期；批次心跳 stop_reason 取 account_paused / account_archived / identity_mismatch；
  *   · 领取（同一批次已有在途尝试 → 409 ATTEMPT_IN_FLIGHT）；
  *   · 进度：{continue, cancel_reason, cancel_code}。尝试已结束 → ATTEMPT_FINISHED；未登记提交时依次看
- *     上游取消（UPSTREAM_CANCELLED）、账号归档（ACCOUNT_ARCHIVED）、暂停（ACCOUNT_PAUSED）、身份不符
- *     （IDENTITY_MISMATCH）、身份过期（IDENTITY_STALE）、来源暂停（task.hold → SOURCE_HOLD）、领取后来源有变化
+ *     上游取消（UPSTREAM_CANCELLED）、账号归档（ACCOUNT_ARCHIVED）、暂停（ACCOUNT_PAUSED）、买家号不符
+ *     （IDENTITY_MISMATCH）、登录状态过期（IDENTITY_STALE）、来源暂停（task.hold → SOURCE_HOLD）、领取后来源有变化
  *     （task.drift → SOURCE_CHANGED）。legacy: true 模拟旧服务端：不给 cancel_code、不认 ABORTED_BY_SERVER；
  *   · 护栏：放行 → guard_passed；拦截 → 尝试**结束为 failed**、任务转异常；对已结束的尝试再判 → 409
- *     detail.attempt_status；
+ *     detail.attempt_status。buyer 项：事实里没有 customer_id → DATA_UNRELIABLE；与批次账号登记的 ID 不同 →
+ *     IDENTITY_MISMATCH（原因「结算页登录的买家号（…）不是这个批次的买家号（…）」）；
  *   · 提交登记：不在 guard_passed → 409（detail.attempt_status，已登记的是 submitting）、任务已取消 → 409、
- *     账号归档 → 409、暂停 → 409 ACCOUNT_PAUSED、身份不符或过期 → 409 IDENTITY_MISMATCH、来源暂停或有变化 →
- *     409 SOURCE_CHANGED（detail.fields）、复核护栏不过 → 409 GUARD_BLOCKED（detail.block_code，可以没有）；
+ *     账号归档 → 409、暂停 → 409 ACCOUNT_PAUSED、买家号不符或过期 → 409 IDENTITY_MISMATCH（detail.login_state /
+ *     stale）、来源暂停或有变化 → 409 SOURCE_CHANGED（detail.fields）、复核护栏不过 → 409 GUARD_BLOCKED；
  *   · 结果处理表（账号级错误暂停账号、PAGE_LOAD_FAILED 首次重试、登记后非成功 → unknown、
- *     中止类（含 ABORTED_BY_SERVER）回已分配、不暂停账号，再按领取后的来源变化重新定状态（task.drift.to），
- *     未知错误码按任务级失败）；已结束的尝试再报同一份 → 200 duplicate；
+ *     中止类（含 ABORTED_BY_SERVER、IDENTITY_MISMATCH）回已分配、**不暂停账号**，再按领取后的来源变化重新定状态
+ *     （task.drift.to），未知错误码按任务级失败）；已结束的尝试再报同一份 → 200 duplicate；
  *     已是 unknown 而这次不同 → 409 detail.late_receipt_recorded；其他不同 → 409；
- *     未登记提交、批次已失效 → LEASE_LOST；
+ *     未登记提交、批次已失效 → LEASE_LOST；**结果上报、结束批次不做身份检查**；
  *   · 结束批次 {reason, detail?}：detail 去掉首尾空白截到 200 字（非字符串先转成 JSON 文本）记为 finish_detail；
  *     在途尝试按租约过期处理（已登记 → unknown + 暂停账号，否则 aborted）。
+ *
+ * 为了让引擎、客户端测试不用先走一遍登记：缺省预先登记一个浏览器（令牌 DEMO_TOKEN，登着账号的买家号、
+ * 刚上报过身份）。后台测试传 preRegistered: false，让真正的后台自己生成令牌、自己登记。
  *
  * 故障注入（faults：{match: 路径正则, times}）：
  *   · 默认：请求没到服务端就断了（network）；
@@ -35,15 +52,40 @@
  *   · resend: true：请求到了、处理了、响应丢了，**浏览器把同一个 POST 原样重发**，返回第二次的答复；
  *   · status: 500：服务端回 5xx（事务回滚，什么都没改）。
  *
- * 所有数据都是虚构的演示数据。
+ * 所有数据都是虚构的演示数据（买家号 ID 用 A1DEMO…、A9OTHER… 这类明显的假值）。
  */
 
 const json = (status, body, headers = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 const err = (status, code, message, detail = null, headers = {}) => json(status, { code, message, detail: detail ?? {} }, headers);
 
-/** server/limits.FORBIDDEN_HOST_MESSAGE 的原话。 */
-export const FORBIDDEN_HOST_MESSAGE = "不接受这个主机名的请求：只接受本机地址；其他地址请在 PC_ALLOWED_HOSTS 里登记";
+/** 预先登记的那个浏览器的令牌（形状合格的假值）。 */
+export const DEMO_TOKEN = "demo-token-000000000000000000000000001";
+/** 演示账号登记的买家号 ID、另一个买家号 ID（都是假值）。 */
+export const DEMO_CID = "A1DEMO00000";
+export const OTHER_CID = "A9OTHER00000";
+
+const TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/;
+const MIN_EXT_VERSION = [0, 2, 0];
+
+/** 输入：版本文本 → 输出：能解析且低于 0.2.0。缺失或解析不了不拦。 */
+function outdated(v) {
+  if (typeof v !== "string" || !/^\d+(\.\d+)*$/.test(v.trim())) return false;
+  const p = v.trim().split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const d = (p[i] ?? 0) - MIN_EXT_VERSION[i];
+    if (d !== 0) return d < 0;
+  }
+  return false;
+}
+
+function bjDate(ms) {
+  return new Date(ms + 8 * 3600_000).toISOString().slice(0, 10);
+}
+function bjHm(ms) {
+  return new Date(ms + 8 * 3600_000).toISOString().slice(11, 16);
+}
 
 /** 输入：结束批次的 detail → 输出：真实服务端 execution._plugin_detail 记下的文本（去空白、截 200 字）。 */
 function pluginDetail(v) {
@@ -73,7 +115,7 @@ function daysBetween(a, b) {
 /** 服务端 services/models.ERROR_CODES 的类别（插件会碰到的那些）。 */
 const CATEGORY = {
   OUT_OF_STOCK: "task", PAGE_LOAD_FAILED: "retry_once", LOGIN_REQUIRED: "account", ACCOUNT_RESTRICTED: "account",
-  CARD_DECLINED: "account", CAPTCHA_ENCOUNTERED: "account", IDENTITY_MISMATCH: "account",
+  CARD_DECLINED: "account", CAPTCHA_ENCOUNTERED: "account", IDENTITY_MISMATCH: "abort",
   ABORTED_UPSTREAM_CANCELLED: "abort", ABORTED_BY_USER: "abort", ABORTED_BY_SERVER: "abort",
   ITEM_MISMATCH: "guard", ZIP_MISMATCH: "guard", SUBTOTAL_OUT_OF_RANGE: "guard", PRICE_OVER_CAP: "guard",
   DELIVERY_TOO_LONG: "guard", DATA_UNRELIABLE: "guard", CARD_MISMATCH: "guard", GUARD_BLOCKED: "guard",
@@ -82,7 +124,7 @@ const CATEGORY = {
 /** 账号级错误码的中文（真实服务端暂停账号时用 ERROR_CODES 的 zh 作暂停原因）。 */
 const ACCOUNT_ZH = {
   LOGIN_REQUIRED: "买家账号登录失效", ACCOUNT_RESTRICTED: "买家账号受限", CARD_DECLINED: "银行卡被拒付",
-  CAPTCHA_ENCOUNTERED: "遇到验证码或风控验证，需要人工处理", IDENTITY_MISMATCH: "浏览器登录的买家账号与绑定不符",
+  CAPTCHA_ENCOUNTERED: "遇到验证码或风控验证，需要人工处理",
   PLUGIN_SIMULATION_ONLY: "插件只执行模拟任务，却领到了真实任务",
 };
 const IN_FLIGHT = new Set(["claimed", "checking", "guard_passed", "submitting", "verifying"]);
@@ -100,32 +142,36 @@ export function createFakeServer(opts = {}) {
   const categories = { ...CATEGORY };
   if (legacy) delete categories.ABORTED_BY_SERVER;
   const identityFreshS = opts.identityFreshS ?? 600;
+  const account0 = {
+    id: 3,
+    name: "环境-DEMO",
+    amazon_customer_id: DEMO_CID,
+    min_amount: "20.00",
+    max_amount: "50.00",
+    daily_limit: 20,
+    max_delivery_days: 10,
+    expected_card_last4: null,
+    purchase_enabled: true,
+    execution_paused: false,
+    pause_reason: null,
+    archived: false,
+    purchase_mode: "scheduled",
+    schedule_times: ["14:00"],
+    ...(opts.account ?? {}),
+  };
   const state = {
-    token: "tok-demo-1",
-    pairingCodes: new Set(opts.pairingCodes ?? ["DEMO2345"]),
-    device: { id: 5, name: "Mac-AdsPower-DEMO", bound_account_id: 3 },
-    account: {
-      id: 3,
-      name: "环境-DEMO",
-      amazon_customer_id: "A1DEMO0000",
-      min_amount: "20.00",
-      max_amount: "50.00",
-      daily_limit: 20,
-      max_delivery_days: 10,
-      expected_card_last4: null,
-      execution_paused: false,
-      pause_reason: null,
-      archived: false,
-      purchase_mode: "scheduled",
-      schedule_times: ["14:00"],
-      ...(opts.account ?? {}),
-    },
-    identityStatus: opts.identityStatus ?? "match",
-    /** 最近一次上报的身份（心跳捎带或单独上报）。 */
-    identity: null,
-    /** 最近一次上报身份的时刻（服务端时钟）；null = 从没上报过。默认按创建时刚上报过。 */
-    identityAt: opts.identityAt === undefined ? clock : opts.identityAt,
+    workspaces: opts.workspaces ?? [{ id: 1, name: "工作区-DEMO" }],
+    /** 令牌 → 设备。真实服务端只存哈希；这里直接拿令牌当键。 */
+    tokens: new Map(),
+    devices: [],
+    nextDeviceId: 5,
+    /** 第一个账号也叫 state.account（多数测试只有一个账号）。 */
+    account: account0,
+    accounts: [account0, ...(opts.accounts ?? [])],
+    ignored: new Set(opts.ignored ?? []),
+    /** 所有设备的身份上报记录（心跳捎带或单独上报）。 */
     identityReports: [],
+    registrations: [],
     tasks: (opts.tasks ?? []).map((t, i) => ({
       id: i + 1,
       status: "assigned",
@@ -133,6 +179,7 @@ export function createFakeServer(opts = {}) {
       page_load_failures: 0,
       postal_code: "32960",
       quantity: 1,
+      account_id: account0.id,
       ...t,
     })),
     runs: new Map(),
@@ -140,9 +187,26 @@ export function createFakeServer(opts = {}) {
     lateReceipts: [],
     nextRunId: 9,
     nextAttemptId: 7,
-    /** 别的设备正占着这个账号时设置：{device_id, device_name, since}。 */
+    /** 别的浏览器正占着这个账号时设置：{device_id, device_name, since}。 */
     foreignRun: opts.foreignRun ?? null,
+    /** 最近一个登记或认证过的设备（多数测试只有一个浏览器）。 */
+    device: null,
   };
+  /** 输入：令牌、工作区 → 输出：新登记的设备行。 */
+  function addDevice(token, ws) {
+    const id = state.nextDeviceId++;
+    const dev = { id, name: `浏览器 ${id}`, workspace_id: ws.id, workspace_name: ws.name, identity: null, identityAt: null, hidden: false, ext_version: null };
+    state.tokens.set(token, dev);
+    state.devices.push(dev);
+    state.device = dev;
+    return dev;
+  }
+  if (opts.preRegistered !== false) {
+    const dev = addDevice(opts.token ?? DEMO_TOKEN, state.workspaces[0] ?? { id: 1, name: "工作区-DEMO" });
+    // 缺省：登着演示账号的买家号、刚上报过身份（引擎测试不用先报一遍）。identity: null = 从没上报过。
+    dev.identity = opts.identity === undefined ? { signed_in: true, customer_id: account0.amazon_customer_id, site: "US", page_url: null, conflict: false } : opts.identity;
+    dev.identityAt = dev.identity === null ? null : opts.identityAt === undefined ? clock : opts.identityAt;
+  }
   const calls = [];
   /** 故障注入：见文件头。 */
   const faults = [...(opts.faults ?? [])];
@@ -157,16 +221,88 @@ export function createFakeServer(opts = {}) {
   const leaseLost = (run) =>
     err(409, "LEASE_LOST", run && run.ended ? `执行批次已结束（${run.end_reason ?? "已结束"}），请重新开始批次` : "执行权已超时（租约过期），请重新开始批次",
       { run_id: run?.id ?? null });
-  const identityStale = () => state.identityAt === null || clock - state.identityAt > identityFreshS * 1000;
-  const STALE_TEXT = `插件超过 ${Math.max(1, Math.floor(identityFreshS / 60))} 分钟没有上报登录身份，身份信息已过期`;
-  /** 真实服务端 _identity_problem 的原话（身份不是 match 时）。 */
-  const identityProblem = () => {
-    const st = state.identityStatus;
-    if (st === "match") return null;
-    if (st === "mismatch") return `浏览器登录的买家账号（A9OTHER0000）与绑定账号 ${state.account.name}（${state.account.amazon_customer_id}）不符，拒绝领取`;
-    if (st === "signed_out") return `浏览器没有登录亚马逊买家账号，请先登录绑定账号 ${state.account.name}`;
-    return "插件还没有识别到浏览器登录的买家账号，请打开亚马逊页面后重试";
+  const iso = (ms) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
+  const accountOf = (run) => state.accounts.find((x) => x.id === run.account_id) ?? state.account;
+  const deviceOf = (run) => state.devices.find((d) => d.id === run.device_id) ?? state.device;
+  /** 身份清洗（真实服务端 devices.clean_identity）：坏 ID 当没读到，绝不报错；page_url 只留 origin + path。 */
+  function cleanIdentity(v) {
+    const o = v && typeof v === "object" ? v : {};
+    const cid = typeof o.customer_id === "string" ? o.customer_id.replace(/\s+/g, "").toUpperCase() : "";
+    let page = null;
+    try { const u = new URL(String(o.page_url ?? "")); page = u.origin + u.pathname; } catch { page = null; }
+    return { signed_in: o.signed_in === true, customer_id: CUSTOMER_ID_RE.test(cid) ? cid : null, site: "US", page_url: page, conflict: o.conflict === true };
+  }
+  /** 设备登录状态（不含解析结果）：unknown / conflict / signed_out / no_id / signed_in。 */
+  function loginState(dev) {
+    const i = dev.identity;
+    if (!i) return "unknown";
+    if (i.conflict) return "conflict";
+    if (!i.signed_in) return "signed_out";
+    return i.customer_id ? "signed_in" : "no_id";
+  }
+  const loginCustomerId = (dev) => (loginState(dev) === "signed_in" ? dev.identity.customer_id : null);
+  const registered = (cid) => state.accounts.find((a) => !a.archived && a.amazon_customer_id === cid) ?? null;
+  /** 解析：signed_in 时按买家号 ID 找账号 → ready / ignored / unregistered；其余状态原样。 */
+  function resolveLogin(dev) {
+    const st = loginState(dev);
+    if (st !== "signed_in") return { state: st, account: null };
+    const acc = registered(dev.identity.customer_id);
+    if (acc) return { state: "ready", account: acc };
+    return { state: state.ignored.has(dev.identity.customer_id) ? "ignored" : "unregistered", account: null };
+  }
+  const identityStale = (dev) => dev.identityAt === null || clock - dev.identityAt > identityFreshS * 1000;
+  const STALE_TEXT = `插件超过 ${Math.max(1, Math.floor(identityFreshS / 60))} 分钟没有上报登录状态`;
+  const LOGIN_PROBLEM = {
+    unknown: "插件还没有读到这个浏览器的登录状态，请打开或刷新亚马逊页面后重试",
+    conflict: "这个浏览器的亚马逊标签页显示的买家号不一致，请刷新或关闭较早打开的标签页",
+    signed_out: "浏览器没有登录亚马逊",
+    no_id: "这个浏览器已登录亚马逊，但没有读到买家号 ID，请打开订单页后重试",
   };
+  /** 执行中的身份检查（真实服务端 _identity_problem）：这台设备登着的不是批次账号**当前**登记的买家号时的原话。 */
+  function identityProblem(dev, acc) {
+    const st = loginState(dev);
+    if (st !== "signed_in") return LOGIN_PROBLEM[st];
+    if (dev.identity.customer_id !== acc.amazon_customer_id) {
+      return `浏览器登录的买家号（${dev.identity.customer_id}）不是这个批次的买家号（账号 ${acc.name}：${acc.amazon_customer_id ?? "未登记"}）`;
+    }
+    return null;
+  }
+  function storeIdentity(dev, raw, via) {
+    dev.identity = cleanIdentity(raw);
+    dev.identityAt = clock;
+    state.identityReports.push({ via, at: clock, device_id: dev.id, ...dev.identity });
+  }
+  const runOfDevice = (dev) => [...state.runs.values()].find((r) => !r.ended && r.device_id === dev.id) ?? null;
+  const runOfAccount = (acc) => [...state.runs.values()].find((r) => !r.ended && r.account_id === acc.id) ?? null;
+  /** 心跳与身份上报的返回（同一形状，规格 §2.4）。 */
+  function statusOut(dev) {
+    const { state: st, account: acc } = resolveLogin(dev);
+    const mine = runOfDevice(dev);
+    const tasks = acc ? state.tasks.filter((t) => t.account_id === acc.id && t.status === "assigned" && !t.cancelled) : [];
+    const holder = acc ? runOfAccount(acc) : null;
+    const foreign = acc && acc.id === state.account.id ? state.foreignRun : null;
+    return {
+      device: { id: dev.id, name: dev.name },
+      login: { state: st, customer_id: dev.identity?.customer_id ?? null, at: iso(dev.identityAt), stale: dev.identityAt !== null && identityStale(dev) },
+      account: acc ? {
+        id: acc.id, name: acc.name, amazon_customer_id: acc.amazon_customer_id, purchase_enabled: acc.purchase_enabled !== false,
+        execution_paused: acc.execution_paused, pause_reason: acc.pause_reason, purchase_mode: acc.purchase_mode,
+        schedule_times: acc.schedule_times, effective_max_delivery_days: acc.max_delivery_days,
+        quota_today: { limit: acc.daily_limit, used: 0, planned: tasks.length, available: acc.daily_limit },
+        executable_today: tasks.filter((t) => !t.future && !t.hold).length,
+        future_assigned: tasks.filter((t) => t.future).length,
+        active_run: holder
+          ? { id: holder.id, device_id: holder.device_id, device_name: deviceOf(holder).name, started_at: iso(holder.started_at), is_mine: holder.device_id === dev.id }
+          : foreign
+            ? { id: 900, device_id: foreign.device_id, device_name: foreign.device_name, started_at: foreign.since, is_mine: false }
+            : null,
+      } : null,
+      device_run: mine ? { id: mine.id, account_id: mine.account_id, account_name: accountOf(mine).name, started_at: iso(mine.started_at) } : null,
+      server_time: new Date(clock).toISOString(),
+      bj_date: bjDate(clock),
+      simulation_only: true,
+    };
+  }
   /** 未登记提交就结束的尝试：任务回已分配（上游已取消 → cancelled），再按领取后的来源变化重新定状态
    *  （drift.to，例如待核实）；来源把任务暂停着（hold）→ conflict，不再领取。 */
   const release = (t) => {
@@ -174,20 +310,23 @@ export function createFakeServer(opts = {}) {
     t.status = t.drift?.to ?? (t.hold ? "conflict" : "assigned");
     t.drift = null;
   };
-  const stopReason = () => {
-    const acc = state.account;
+  const stopReason = (run) => {
+    const acc = accountOf(run);
     if (acc.archived) return "account_archived";
     if (acc.execution_paused) return "account_paused";
-    if (state.device.bound_account_id !== acc.id) return "device_unbound";
-    if (state.identityStatus !== "match") return "identity_mismatch";
+    if (identityProblem(deviceOf(run), acc)) return "identity_mismatch";
     return null;
   };
 
   function guardEval(a, facts) {
     const t = taskOf(a);
-    const acc = state.account;
+    const acc = accountOf(runOf(a.run_id));
     const checks = [];
     const fail = (code, reason) => checks.push({ code, ok: false, reason });
+    // buyer：把「谁在下单」钉在下单那一页。没读到 → 数据不可靠；不是批次账号登记的 ID → 拦截。
+    const buyer = typeof facts.customer_id === "string" && CUSTOMER_ID_RE.test(facts.customer_id.trim().toUpperCase()) ? facts.customer_id.trim().toUpperCase() : null;
+    if (buyer === null) fail("DATA_UNRELIABLE", "结算页没有读到买家号 ID");
+    else if (buyer !== acc.amazon_customer_id) fail("IDENTITY_MISMATCH", `结算页登录的买家号（${buyer}）不是这个批次的买家号（${acc.amazon_customer_id}）`);
     const items = Array.isArray(facts.items) ? facts.items : [];
     if (items.length !== 1 || items[0].asin !== t.asin || items[0].quantity !== t.quantity) fail("ITEM_MISMATCH", "商品或数量不符");
     const zip = String(facts.ship_to?.postal_code ?? "").slice(0, 5);
@@ -206,7 +345,7 @@ export function createFakeServer(opts = {}) {
     if (days === null) fail("DATA_UNRELIABLE", "配送天数不可得");
     else if (days > acc.max_delivery_days) fail("DELIVERY_TOO_LONG", `配送 ${days} 天超过上限 ${acc.max_delivery_days} 天`);
     if (acc.expected_card_last4 && facts.card_last4 !== acc.expected_card_last4) fail("CARD_MISMATCH", "卡尾号不符");
-    const order = ["ITEM_MISMATCH", "ZIP_MISMATCH", "SUBTOTAL_OUT_OF_RANGE", "PRICE_OVER_CAP", "DELIVERY_TOO_LONG", "DATA_UNRELIABLE", "CARD_MISMATCH"];
+    const order = ["IDENTITY_MISMATCH", "ITEM_MISMATCH", "ZIP_MISMATCH", "SUBTOTAL_OUT_OF_RANGE", "PRICE_OVER_CAP", "DELIVERY_TOO_LONG", "DATA_UNRELIABLE", "CARD_MISMATCH"];
     const first = order.find((c) => checks.some((x) => x.code === c)) ?? null;
     return { verdict: first ? "block" : "pass", code: first, reasons: checks.map((c) => c.reason), checks };
   }
@@ -223,8 +362,9 @@ export function createFakeServer(opts = {}) {
     if (a.submitted_at) {
       finishAttempt(a, "unknown", { error_detail: cause });
       t.status = "result_unknown";
-      state.account.execution_paused = true;
-      state.account.pause_reason = "结果待核实";
+      const acc = accountOf(runOf(a.run_id));
+      acc.execution_paused = true;
+      acc.pause_reason = "结果待核实";
     } else {
       finishAttempt(a, "aborted", { error_detail: cause });
       release(t);
@@ -241,90 +381,122 @@ export function createFakeServer(opts = {}) {
     return categories[body.error_code ?? ""] === "abort" ? "aborted" : "failed";
   }
 
-  function route(path, body) {
-    let m;
-    if (path === "/plugin/v1/pair") {
-      const rl = opts.pairRateLimit;
-      if (rl) return err(429, "RATE_LIMITED", "尝试次数过多，请稍后再试", { retry_after_s: rl.retry_after_s }, { "retry-after": String(rl.header ?? rl.retry_after_s) });
-      if (!state.pairingCodes.has(body.code)) return err(400, "VALIDATION", "配对码无效或已过期");
-      state.pairingCodes.delete(body.code);
-      return json(200, { device_id: state.device.id, device_token: state.token, workspace_name: "工作区-DEMO" });
+  /** 设备登记（不要令牌头）。 */
+  function register(body) {
+    const rl = opts.registerRateLimit;
+    if (rl) return err(429, "RATE_LIMITED", "登记的浏览器太多：请稍后再试", rl.retry_after_s === undefined ? {} : { retry_after_s: rl.retry_after_s }, rl.header === undefined && rl.retry_after_s === undefined ? {} : { "retry-after": String(rl.header ?? rl.retry_after_s) });
+    const token = body.device_token;
+    if (typeof token !== "string" || !TOKEN_RE.test(token)) return err(422, "VALIDATION", "设备令牌格式不对");
+    if (outdated(body.ext_version)) return err(409, "PLUGIN_OUTDATED", "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）");
+    state.registrations.push({ at: clock, token, workspace_id: body.workspace_id ?? null, ext_version: body.ext_version ?? null });
+    let dev = state.tokens.get(token);
+    let created = false;
+    if (dev) {
+      dev.hidden = false; // 幂等：返回那一行，不看 workspace_id
+    } else {
+      let ws = null;
+      if (state.workspaces.length === 0) return err(409, "CONFLICT", "服务端还没有初始化：请先打开控制台创建用户");
+      if (state.workspaces.length === 1) ws = state.workspaces[0];
+      else ws = state.workspaces.find((w) => w.id === body.workspace_id) ?? null;
+      if (!ws) return err(409, "WORKSPACE_REQUIRED", "系统里有多个工作区：请在插件设置的「工作区 ID」里填写（控制台「设置」页可以查到）");
+      if (opts.maxDevices !== undefined && state.devices.filter((d) => d.workspace_id === ws.id).length >= opts.maxDevices) {
+        return err(429, "RATE_LIMITED", "登记的浏览器太多：请稍后再试");
+      }
+      dev = addDevice(token, ws);
+      created = true;
     }
-    if (path === "/plugin/v1/heartbeat") {
-      if (body.identity) { state.identity = body.identity; state.identityAt = clock; state.identityReports.push({ via: "heartbeat", at: clock, ...body.identity }); }
-      const acc = state.account;
-      const bound = state.device.bound_account_id === acc.id && !acc.archived;
-      const active = [...state.runs.values()].find((r) => !r.ended);
-      return json(200, {
-        device: state.device,
-        account: bound ? {
-          id: acc.id, name: acc.name, amazon_customer_id: acc.amazon_customer_id, purchase_mode: acc.purchase_mode,
-          schedule_times: acc.schedule_times, effective_max_delivery_days: acc.max_delivery_days, purchase_enabled: true,
-          execution_paused: acc.execution_paused, pause_reason: acc.pause_reason, min_amount: acc.min_amount,
-          max_amount: acc.max_amount, daily_limit: acc.daily_limit, expected_card_last4: acc.expected_card_last4,
-          quota_today: { limit: acc.daily_limit, used: 0, planned: state.tasks.length, available: acc.daily_limit },
-        } : null,
-        identity_status: state.identityStatus,
-        server_time: new Date(clock).toISOString(),
-        bj_date: "2026-11-05",
-        simulation_only: true,
-        active_run: active ? { id: active.id, device_id: state.device.id, device_name: state.device.name, is_mine: true } : null,
+    dev.ext_version = body.ext_version ?? dev.ext_version;
+    return json(200, { device_id: dev.id, device_name: dev.name, workspace_id: dev.workspace_id, workspace_name: dev.workspace_name, created });
+  }
+
+  /** 开始批次（规格 §2.5 的顺序）。 */
+  function startRun(dev, body) {
+    if (body.customer_id === undefined || body.customer_id === null) return err(422, "VALIDATION", "插件版本过旧，请更新插件");
+    const cid = typeof body.customer_id === "string" ? body.customer_id.trim().toUpperCase() : "";
+    if (!CUSTOMER_ID_RE.test(cid)) return err(422, "VALIDATION", "买家号 ID 格式不对");
+    if (body.trigger !== "manual" && body.trigger !== "scheduled") return err(422, "VALIDATION", "触发方式不对");
+    const mine = runOfDevice(dev);
+    if (mine) {
+      return err(409, "DEVICE_BUSY", "这个浏览器上一个批次还没有结束", {
+        run_id: mine.id, account_name: accountOf(mine).name, since: iso(mine.started_at), lease_expires_at: iso(mine.lease_until),
       });
     }
+    const st = loginState(dev);
+    const stale = identityStale(dev);
+    const detail = { login_state: st, identity_at: iso(dev.identityAt), stale };
+    if (st !== "signed_in") return err(403, "IDENTITY_MISMATCH", LOGIN_PROBLEM[st], detail);
+    if (dev.identity.customer_id !== cid) return err(403, "IDENTITY_MISMATCH", "页面上的买家号与插件最近上报的不一致，请刷新亚马逊页面后重试", detail);
+    if (stale) return err(403, "IDENTITY_MISMATCH", `${STALE_TEXT}，请打开或刷新亚马逊页面后重试`, detail);
+    const acc = registered(cid);
+    if (!acc) return err(403, "ACCOUNT_NOT_REGISTERED", "这个买家号还没有登记：请在控制台「账号」页登记后再开始");
+    if (acc.execution_paused) return err(403, "ACCOUNT_PAUSED", `账号已暂停执行${acc.pause_reason ? `：${acc.pause_reason}` : ""}`);
+    if (body.simulated !== true) return err(403, "REAL_PURCHASE_DISABLED", "本阶段只允许模拟执行");
+    let slot = null;
+    if (body.trigger === "scheduled") {
+      const m = typeof body.slot === "string" ? /^\s*(\d{1,2}):(\d{2})\s*$/.exec(body.slot) : null;
+      if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) return err(422, "VALIDATION", "定时执行需要带上时间点（slot，北京时间 HH:MM）", { field: "slot" });
+      slot = `${m[1].padStart(2, "0")}:${m[2]}`;
+      if (acc.purchase_mode !== "scheduled") return err(422, "VALIDATION", `账号 ${acc.name} 不是定时执行模式，不能按时间点开始`, { field: "slot" });
+      if (!acc.schedule_times.includes(slot)) return err(422, "VALIDATION", `时间点 ${slot} 不在账号 ${acc.name} 的执行时间里`, { field: "slot" });
+      if (bjHm(clock) < slot) return err(422, "VALIDATION", `北京时间还没有到 ${slot}，不能开始这个时间点的批次`, { field: "slot" });
+      const taken = [...state.runs.values()].some((r) => r.account_id === acc.id && r.trigger === "scheduled" && r.bj_date === bjDate(clock) && r.scheduled_slot === slot && (!r.ended || r.end_reason === "finished"));
+      if (taken) return err(409, "SLOT_DONE", "这个时间点今天已经执行过");
+    }
+    if (state.foreignRun && acc.id === state.account.id) {
+      return err(409, "ACCOUNT_BUSY", `账号 ${acc.name} 正由浏览器「${state.foreignRun.device_name}」执行`, {
+        holder_device_id: state.foreignRun.device_id, holder_device_name: state.foreignRun.device_name, since: state.foreignRun.since,
+      });
+    }
+    const holder = runOfAccount(acc);
+    if (holder) {
+      return err(409, "ACCOUNT_BUSY", `账号 ${acc.name} 正由浏览器「${deviceOf(holder).name}」执行`, {
+        holder_device_id: holder.device_id, holder_device_name: deviceOf(holder).name, since: iso(holder.started_at),
+      });
+    }
+    const run = {
+      id: state.nextRunId++, trigger: body.trigger, account_id: acc.id, device_id: dev.id, customer_id: cid, scheduled_slot: slot, bj_date: bjDate(clock),
+      started_at: clock, lease_until: clock + leaseTtlS * 1000, ended: false, stop: false, stop_reason: null, end_reason: null, finish_detail: null, beats: 0,
+    };
+    state.runs.set(run.id, run);
+    return json(200, { run_id: run.id, lease_ttl_s: leaseTtlS, lease_expires_at: iso(run.lease_until), account: { id: acc.id, name: acc.name } });
+  }
+
+  function route(path, body, dev) {
+    let m;
+    if (path === "/plugin/v1/heartbeat") {
+      if (outdated(body.ext_version)) return err(409, "PLUGIN_OUTDATED", "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）");
+      dev.hidden = false;
+      if (body.identity) storeIdentity(dev, body.identity, "heartbeat");
+      return json(200, statusOut(dev));
+    }
     if (path === "/plugin/v1/identity") {
-      state.identity = body;
-      state.identityAt = clock;
-      state.identityReports.push({ via: "identity", at: clock, signed_in: body.signed_in, customer_id: body.customer_id });
-      return json(200, { identity_status: state.identityStatus });
+      storeIdentity(dev, body, "identity");
+      return json(200, statusOut(dev));
     }
 
-    if (path === "/plugin/v1/runs") {
-      if (!state.device.bound_account_id) return err(403, "NOT_BOUND", "设备未绑定账号");
-      if (state.account.archived) return err(403, "NOT_BOUND", "设备绑定的买家账号已归档，请在控制台重新绑定");
-      if (identityProblem()) return err(403, "IDENTITY_MISMATCH", identityProblem(), { identity_status: state.identityStatus, stale: false });
-      if (identityStale()) return err(403, "IDENTITY_MISMATCH", `${STALE_TEXT}，请打开或刷新亚马逊页面后重试`, { identity_status: "match", stale: true });
-      if (state.account.execution_paused) return err(403, "ACCOUNT_PAUSED", "账号已暂停执行");
-      if (body.simulated !== true) return err(403, "REAL_PURCHASE_DISABLED", "本阶段只允许模拟执行");
-      if (state.foreignRun) {
-        return err(409, "ACCOUNT_BUSY", "账号正在其他设备执行", {
-          holder_device_id: state.foreignRun.device_id,
-          holder_device_name: state.foreignRun.device_name,
-          since: state.foreignRun.since,
-        });
-      }
-      const active = [...state.runs.values()].find((r) => !r.ended);
-      if (active) {
-        return err(409, "ACCOUNT_BUSY", "账号正在其他设备执行", {
-          holder_device_id: state.device.id,
-          holder_device_name: state.device.name,
-          since: new Date(active.started_at).toISOString(),
-        });
-      }
-      const run = { id: state.nextRunId++, trigger: body.trigger, started_at: clock, lease_until: clock + leaseTtlS * 1000, ended: false, stop: false, stop_reason: null, end_reason: null, finish_detail: null, beats: 0 };
-      state.runs.set(run.id, run);
-      return json(200, { run_id: run.id, lease_ttl_s: leaseTtlS, lease_expires_at: new Date(run.lease_until).toISOString() });
-    }
+    if (path === "/plugin/v1/runs") return startRun(dev, body);
     if ((m = /^\/plugin\/v1\/runs\/(\d+)\/heartbeat$/.exec(path))) {
       const run = runOf(m[1]);
       if (!runActive(run)) return leaseLost(run);
       run.beats += 1;
       run.lease_until = clock + leaseTtlS * 1000;
-      const reason = run.stop ? run.stop_reason : stopReason();
+      const reason = run.stop ? run.stop_reason : stopReason(run);
       return json(200, { lease_expires_at: new Date(run.lease_until).toISOString(), stop: reason !== null, stop_reason: reason });
     }
     if ((m = /^\/plugin\/v1\/runs\/(\d+)\/next$/.exec(path))) {
       const run = runOf(m[1]);
       if (!runActive(run)) return leaseLost(run);
+      const acc = accountOf(run);
       const inflight = [...state.attempts.values()].find((a) => a.run_id === run.id && IN_FLIGHT.has(a.status));
       if (inflight) return err(409, "ATTEMPT_IN_FLIGHT", "本批次已有在途尝试", { attempt_id: inflight.id });
-      // 真实服务端 next_attempt：账号暂停 / 归档、设备换绑、身份不符时不领取，返回原因
-      const sr = stopReason();
-      if (sr === "account_paused") return json(200, { attempt: null, reason: `账号已暂停执行：${state.account.pause_reason ?? "人工暂停"}` });
+      // 真实服务端 next_attempt：账号暂停 / 归档、买家号不符、登录状态过期时不领取，返回原因
+      const sr = stopReason(run);
+      if (sr === "account_paused") return json(200, { attempt: null, reason: `账号已暂停执行：${acc.pause_reason ?? "人工暂停"}` });
       if (sr === "account_archived") return json(200, { attempt: null, reason: "账号已归档，停止领取" });
-      if (sr !== null) return json(200, { attempt: null, reason: identityProblem() ?? "设备与账号的绑定已变化，停止领取" });
-      if (identityStale()) return json(200, { attempt: null, reason: `${STALE_TEXT}，停止领取（请打开或刷新亚马逊页面后重新开始）` });
+      if (sr !== null) return json(200, { attempt: null, reason: `${identityProblem(dev, acc)}，停止领取` });
+      if (identityStale(dev)) return json(200, { attempt: null, reason: `${STALE_TEXT}，停止领取（请打开或刷新亚马逊页面后重新开始）` });
       if (hooks.beforeClaim) { const r = hooks.beforeClaim(state); if (r) return json(200, r); }
-      const t = state.tasks.find((x) => x.status === "assigned" && !x.cancelled && !x.hold);
+      const t = state.tasks.find((x) => x.account_id === acc.id && x.status === "assigned" && !x.cancelled && !x.hold && !x.future);
       if (!t) return json(200, { attempt: null, reason: "今天没有可执行的任务" });
       t.status = "executing";
       const a = { id: state.nextAttemptId++, task_id: t.id, run_id: run.id, status: "claimed", submitted_at: null, guard: null, guards: 0, submits: 0, results: [] };
@@ -333,11 +505,11 @@ export function createFakeServer(opts = {}) {
       return json(200, {
         attempt: {
           attempt_id: a.id, upstream_order_no: t.upstream_order_no, asin: t.asin, quantity: t.quantity,
-          unit_price: t.unit_price, price_cap: t.price_cap, max_delivery_days: state.account.max_delivery_days,
-          amount_range: { min: state.account.min_amount, max: state.account.max_amount },
+          unit_price: t.unit_price, price_cap: t.price_cap, max_delivery_days: acc.max_delivery_days,
+          amount_range: { min: acc.min_amount, max: acc.max_amount },
           recipient_name: "Demo Buyer", address1: "1 Demo Way", address2: null, city: "Demo City", state: "FL",
           postal_code: t.postal_code, phone: "000-000-0000", country: "US",
-          expected_card_last4: state.account.expected_card_last4, simulated: t.simulated ?? true,
+          expected_card_last4: acc.expected_card_last4, simulated: t.simulated ?? true,
         },
         reason: null,
       });
@@ -359,6 +531,7 @@ export function createFakeServer(opts = {}) {
       if (!a) return err(404, "NOT_FOUND", "采购尝试不存在");
       const run = runOf(a.run_id);
       const t = taskOf(a);
+      const acc = accountOf(run);
       const op = m[2];
       if (op === "progress") {
         if (!runActive(run)) return leaseLost(run);
@@ -368,10 +541,10 @@ export function createFakeServer(opts = {}) {
         if (a.status === "claimed") a.status = "checking";
         if (!a.submitted_at) {
           if (t.cancelled) return stop("UPSTREAM_CANCELLED", "上游已取消");
-          if (state.account.archived) return stop("ACCOUNT_ARCHIVED", "账号已归档");
-          if (state.account.execution_paused) return stop("ACCOUNT_PAUSED", `账号已暂停执行：${state.account.pause_reason ?? "人工暂停"}`);
-          if (identityProblem()) return stop("IDENTITY_MISMATCH", identityProblem());
-          if (identityStale()) return stop("IDENTITY_STALE", STALE_TEXT);
+          if (acc.archived) return stop("ACCOUNT_ARCHIVED", "账号已归档");
+          if (acc.execution_paused) return stop("ACCOUNT_PAUSED", `账号已暂停执行：${acc.pause_reason ?? "人工暂停"}`);
+          if (identityProblem(dev, acc)) return stop("IDENTITY_MISMATCH", identityProblem(dev, acc));
+          if (identityStale(dev)) return stop("IDENTITY_STALE", `${STALE_TEXT}，登录状态已过期`);
           if (t.hold) return stop("SOURCE_HOLD", `${t.hold.text}，未提交前中止`);
           if (t.drift) return stop("SOURCE_CHANGED", `${t.drift.text}，未提交前中止`);
         }
@@ -405,10 +578,10 @@ export function createFakeServer(opts = {}) {
           return err(409, "CONFLICT", msg, { attempt_status: a.status });
         }
         if (t.cancelled) return err(409, "CONFLICT", "上游已取消，不能提交", { order_status: t.status });
-        if (state.account.archived) return err(409, "CONFLICT", "账号已归档，不能提交");
-        if (state.account.execution_paused) return err(409, "ACCOUNT_PAUSED", `账号已暂停执行（${state.account.pause_reason ?? "人工暂停"}），不能提交`);
-        if (identityProblem()) return err(409, "IDENTITY_MISMATCH", `${identityProblem()}，不能提交`, { identity_status: state.identityStatus });
-        if (identityStale()) return err(409, "IDENTITY_MISMATCH", `${STALE_TEXT}，不能提交`, { identity_status: "match", stale: true, identity_at: state.identityAt === null ? null : new Date(state.identityAt).toISOString() });
+        if (acc.archived) return err(409, "CONFLICT", "账号已归档，不能提交");
+        if (acc.execution_paused) return err(409, "ACCOUNT_PAUSED", `账号已暂停执行（${acc.pause_reason ?? "人工暂停"}），不能提交`);
+        if (identityProblem(dev, acc)) return err(409, "IDENTITY_MISMATCH", `${identityProblem(dev, acc)}，不能提交`, { login_state: loginState(dev), stale: false, identity_at: iso(dev.identityAt) });
+        if (identityStale(dev)) return err(409, "IDENTITY_MISMATCH", `${STALE_TEXT}，不能提交`, { login_state: "signed_in", stale: true, identity_at: iso(dev.identityAt) });
         if (t.hold) return err(409, "SOURCE_CHANGED", `${t.hold.text}，不能提交`, { conflict_kind: t.hold.kind ?? null });
         if (t.drift) return err(409, "SOURCE_CHANGED", `${t.drift.text}，不能提交`, { fields: t.drift.fields ?? [], review: false, external: false });
         const refused = hooks.submitRefusal ? hooks.submitRefusal(a, t) : null;
@@ -449,7 +622,7 @@ export function createFakeServer(opts = {}) {
       }
       if (target === "unknown") {
         finishAttempt(a, "unknown", { error_code: body.error_code ?? null }); t.status = "result_unknown";
-        state.account.execution_paused = true; state.account.pause_reason = "结果待核实";
+        acc.execution_paused = true; acc.pause_reason = "结果待核实";
         return json(200, { attempt_status: "unknown", order_status: t.status });
       }
       if (target === "aborted") {
@@ -460,7 +633,7 @@ export function createFakeServer(opts = {}) {
       const category = categories[body.error_code ?? ""] ?? "task";
       finishAttempt(a, "failed", { error_code: body.error_code });
       if (category === "account") {
-        release(t); state.account.execution_paused = true; state.account.pause_reason = ACCOUNT_ZH[body.error_code] ?? "账号级错误";
+        release(t); acc.execution_paused = true; acc.pause_reason = ACCOUNT_ZH[body.error_code] ?? "账号级错误";
       } else if (category === "retry_once") {
         t.page_load_failures += 1;
         if (t.page_load_failures >= 2) t.status = "exception"; else release(t);
@@ -477,26 +650,32 @@ export function createFakeServer(opts = {}) {
     const path = u.pathname;
     let body = {};
     try { body = init.body ? JSON.parse(init.body) : {}; } catch { body = {}; }
-    const auth = (init.headers ?? {})["Authorization"] ?? (init.headers ?? {})["authorization"] ?? null;
-    calls.push({ path, body, auth, at: clock });
-    // Host 允许名单在认证之前（server/limits.HostOriginMiddleware）
-    if (opts.rejectHost) return err(403, "FORBIDDEN", FORBIDDEN_HOST_MESSAGE);
+    const headers = init.headers ?? {};
+    const auth = headers["Authorization"] ?? headers["authorization"] ?? null;
+    calls.push({ path, body, auth, at: clock, origin: u.origin, contentType: headers["Content-Type"] ?? headers["content-type"] ?? null });
+    // 插件入口闸在认证之前（server/limits）：非本机对端、外来 Host、网页来源、不是 JSON
+    if (opts.gate) return err(403, opts.gate.code ?? "FORBIDDEN", opts.gate.message ?? "插件接口只接受本机请求：跨机器部署需要接入密钥，当前版本不支持");
+    const isRegister = path === "/plugin/v1/register";
+    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    const dev = isRegister ? null : (token ? state.tokens.get(token) ?? null : null);
+    const authed = isRegister || dev !== null;
+    const handle = () => (isRegister ? register(body) : route(path, body, dev));
     const f = faults.find((x) => x.times > 0 && x.match.test(path));
-    const authed = path === "/plugin/v1/pair" || auth === `Bearer ${state.token}`;
     if (f) {
       f.times -= 1;
       if (f.status) return err(f.status, "INTERNAL", "服务器内部错误");
       if (f.resend) {
-        if (authed) route(path, body); // 第一次：处理了，响应丢了
+        if (authed) handle(); // 第一次：处理了，响应丢了
         calls.push({ path, body, auth, at: clock, resent: true });
         // 浏览器在复用的连接上把同一个 POST 原样重发：返回第二次的答复
       } else {
-        if (f.after && authed) route(path, body); // 请求到了服务端，但响应丢了
+        if (f.after && authed) handle(); // 请求到了服务端，但响应丢了
         throw new TypeError("fetch failed");
       }
     }
-    if (!authed) return err(401, "UNAUTHORIZED", "设备令牌无效");
-    const res = route(path, body);
+    if (!authed) return err(401, "UNAUTHORIZED", "这个浏览器还没有登记，插件会自动重新登记");
+    if (dev) state.device = dev;
+    const res = handle();
     clock += tickMs;
     return res;
   }
@@ -509,5 +688,10 @@ export function createFakeServer(opts = {}) {
     setNow: (ms) => { clock = ms; },
     advance: (ms) => { clock += ms; },
     count: (re) => calls.filter((c) => re.test(c.path)).length,
+    /** 输入：设备（缺省最近的那个）、身份 → 输出：无。直接改这台设备最新的身份（等于它刚上报了这一份）。 */
+    setLogin: (identity, dev = state.device) => { dev.identity = identity === null ? null : cleanIdentity(identity); dev.identityAt = identity === null ? null : clock; },
+    /** 服务端换了库（或这一行被清理了）：所有令牌都不认识了。之后带令牌的请求回 401，重新登记得到新的一行。 */
+    forgetDevices: () => { state.tokens.clear(); state.devices.length = 0; state.device = null; },
+    loginState: (dev = state.device) => resolveLogin(dev).state,
   };
 }

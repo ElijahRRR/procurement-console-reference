@@ -10,6 +10,7 @@ import type {
   AllocationSummary,
   Attempt,
   Device,
+  DiscoveredBuyer,
   EventRecord,
   FeishuConnection,
   FeishuFieldsResult,
@@ -38,7 +39,10 @@ export interface Fixtures {
   me: Me
   settings: Settings
   accounts: Account[]
+  /** 装了插件的浏览器（含一条已移除的） */
   devices: Device[]
+  /** 插件读到、还没登记的买家号（含一条已忽略的） */
+  discovered: DiscoveredBuyer[]
   orders: OrderRow[]
   details: Record<number, OrderDetail>
   lastAllocation: AllocationSummary
@@ -89,74 +93,147 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     },
   }
 
-  // ── 设备与账号 ──────────────────────────────────────────────────────────────
+  // ── 浏览器与账号 ────────────────────────────────────────────────────────────
+  // 买家号 ID 全部虚构：已登记的用 A1DEMO…，插件读到还没登记的用 A2TEST…
 
   const devices: Device[] = [
     {
+      // 登录着已登记的买家号，正在执行
       id: 5,
       name: 'Mac-AdsPower-DEMO-01',
-      browser: 'adspower',
-      ext_version: '0.1.0',
-      bound_account: { id: 3, name: '环境-DEMO-01' },
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(0.5),
-      identity: { signed_in: true, customer_id: 'A1DEMO00001', site: 'US', page_url: 'https://www.amazon.com/gp/css/homepage.html', at: ago(1) },
-      identity_status: 'match',
       created_at: ago(60 * 24 * 6),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00001', at: ago(1), stale: false },
+      account: { id: 3, name: '环境-DEMO-01' },
+      active_run: { id: 9, account_id: 3, started_at: ago(6), simulated: true },
     },
     {
+      // 离线：上报已过期
       id: 6,
       name: 'Mac-Chrome-DEMO-02',
-      browser: 'chrome',
-      ext_version: '0.1.0',
-      bound_account: { id: 4, name: '环境-DEMO-02' },
+      ext_version: '0.2.0',
       online: false,
       last_seen_at: ago(60 * 5),
-      identity: { signed_in: true, customer_id: 'A1DEMO00002', site: 'US', page_url: 'https://www.amazon.com/', at: ago(60 * 5) },
-      identity_status: 'match',
       created_at: ago(60 * 24 * 4),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00002', at: ago(60 * 5), stale: true },
+      account: { id: 4, name: '环境-DEMO-02' },
+      active_run: null,
     },
     {
+      // 对应的账号已暂停执行
       id: 7,
       name: 'Win-AdsPower-DEMO-03',
-      browser: 'adspower',
-      ext_version: '0.1.0',
-      bound_account: { id: 7, name: '环境-DEMO-03' },
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(1),
-      identity: { signed_in: true, customer_id: 'A9OTHER0099', site: 'US', page_url: 'https://www.amazon.com/', at: ago(2) },
-      identity_status: 'mismatch',
       created_at: ago(60 * 24 * 2),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00003', at: ago(2), stale: false },
+      account: { id: 7, name: '环境-DEMO-03' },
+      active_run: null,
     },
     {
+      // 已从列表移除（「显示已移除」时才出现）
       id: 8,
       name: 'Mac-Chrome-DEMO-旧环境',
-      browser: 'chrome',
-      ext_version: '0.0.9',
-      bound_account: null,
+      ext_version: '0.1.0',
       online: false,
       last_seen_at: ago(60 * 24 * 9),
-      identity: null,
-      identity_status: 'unknown',
       created_at: ago(60 * 24 * 20),
-      revoked_at: ago(60 * 24 * 8),
+      hidden_at: ago(60 * 24 * 8),
+      login: { state: 'unknown', customer_id: null, at: null, stale: true },
+      account: null,
+      active_run: null,
     },
     {
       id: 9,
-      name: 'Mac-Chrome-DEMO-新装',
-      browser: 'chrome',
-      ext_version: '0.1.0',
-      bound_account: null,
+      name: '浏览器 9',
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(0.2),
-      identity: { signed_in: false, customer_id: null, site: 'US', page_url: 'https://www.amazon.com/ap/signin', at: ago(0.3) },
-      identity_status: 'signed_out',
       created_at: ago(12),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'signed_out', customer_id: null, at: ago(0.3), stale: false },
+      account: null,
+      active_run: null,
     },
+    {
+      // 读到了还没登记的买家号
+      id: 10,
+      name: '浏览器 10',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.4),
+      created_at: ago(9),
+      hidden_at: null,
+      login: { state: 'unregistered', customer_id: 'A2TEST00005', at: ago(1), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      // 还没登记的买家号，来源里的名称与一个没登记 ID 的账号同名
+      id: 11,
+      name: '浏览器 11',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.6),
+      created_at: ago(8),
+      hidden_at: null,
+      login: { state: 'unregistered', customer_id: 'A2TEST00004', at: ago(3), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 12,
+      name: '浏览器 12',
+      ext_version: '0.2.0',
+      online: false,
+      last_seen_at: ago(60 * 10),
+      created_at: ago(60 * 24),
+      hidden_at: null,
+      login: { state: 'ignored', customer_id: 'A2TEST00099', at: ago(60 * 10), stale: true },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 13,
+      name: '浏览器 13',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.3),
+      created_at: ago(30),
+      hidden_at: null,
+      login: { state: 'no_id', customer_id: null, at: ago(0.5), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 14,
+      name: '浏览器 14',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.1),
+      created_at: ago(45),
+      hidden_at: null,
+      login: { state: 'conflict', customer_id: null, at: ago(0.2), stale: false },
+      account: null,
+      active_run: null,
+    },
+  ]
+
+  const browserRef = (id: number) => {
+    const d = devices.find((x) => x.id === id)!
+    return { id: d.id, name: d.name, online: d.online, last_seen_at: d.last_seen_at }
+  }
+
+  const discovered: DiscoveredBuyer[] = [
+    { customer_id: 'A2TEST00005', ignored: false, browsers: [browserRef(10)], last_reported_at: ago(1), name_hint: '环境-DEMO-05' },
+    { customer_id: 'A2TEST00004', ignored: false, browsers: [browserRef(11)], last_reported_at: ago(3), name_hint: '环境-DEMO-04' },
+    { customer_id: 'A2TEST00099', ignored: true, browsers: [browserRef(12)], last_reported_at: ago(60 * 10), name_hint: null },
   ]
 
   const accounts: Account[] = [
@@ -180,11 +257,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'scheduled',
       schedule_times: ['14:00', '16:30'],
-      default_device_id: 5,
       expected_card_last4: '1234',
       notes: null,
       quota_today: { limit: 20, used: 3, planned: 5, available: 12 },
-      devices: [{ id: 5, name: 'Mac-AdsPower-DEMO-01', online: true, identity_status: 'match', last_seen_at: ago(0.5) }],
+      browsers: [browserRef(5)],
       active_run: { id: 9, device_id: 5, device_name: 'Mac-AdsPower-DEMO-01', started_at: ago(6) },
       created_at: ago(60 * 24 * 10),
       updated_at: ago(60 * 3),
@@ -209,11 +285,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
-      default_device_id: null,
       expected_card_last4: null,
       notes: '只接 FBA 商品',
       quota_today: { limit: 15, used: 15, planned: 0, available: 0 },
-      devices: [{ id: 6, name: 'Mac-Chrome-DEMO-02', online: false, identity_status: 'match', last_seen_at: ago(60 * 5) }],
+      browsers: [browserRef(6)],
       active_run: null,
       created_at: ago(60 * 24 * 9),
       updated_at: ago(60 * 20),
@@ -239,11 +314,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 1,
       purchase_mode: 'scheduled',
       schedule_times: ['15:00'],
-      default_device_id: 7,
       expected_card_last4: null,
       notes: null,
       quota_today: { limit: 10, used: 1, planned: 2, available: 7 },
-      devices: [{ id: 7, name: 'Win-AdsPower-DEMO-03', online: true, identity_status: 'mismatch', last_seen_at: ago(1) }],
+      browsers: [browserRef(7)],
       active_run: null,
       created_at: ago(60 * 24 * 8),
       updated_at: ago(95),
@@ -268,11 +342,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
-      default_device_id: null,
       expected_card_last4: null,
       notes: '新账号，暂不接单',
       quota_today: { limit: 20, used: 0, planned: 0, available: 20 },
-      devices: [],
+      browsers: [],
       active_run: null,
       created_at: ago(60 * 24),
       updated_at: ago(60 * 24),
@@ -631,7 +704,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       kind,
       detail,
     })
-    // kind 与服务端 events.record 的取值一致（order.* / attempt.*）；操作者名由服务端按用户或设备填 actor_name
+    // kind 与服务端 events.record 的取值一致（order.* / attempt.*）；操作者名由服务端按用户或浏览器填 actor_name
     const list: EventRecord[] = [ev(r.id * 10 + 1, 60 * 30, 'order.created', 'source', null, { from: null, to: 'queued' })]
     if (r.assigned_account) list.push(ev(r.id * 10 + 2, 60 * 29, 'order.assigned', 'system', null, { account_name: r.assigned_account.name, reason: r.assignment_note, kind: 'auto' }))
     if (r.has_override) list.push(ev(r.id * 10 + 3, 60 * 4, 'order.override_set', 'user', 'DEMO 所有者', { note: '上游限价与结算口径不一致，按 $50.00 执行' }))
@@ -800,7 +873,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     today_executable: assigned.filter((o) => (o.suggested_purchase_date ?? '9999') <= bjToday).length,
     future_assigned: assigned.filter((o) => (o.suggested_purchase_date ?? '') > bjToday).length,
     accounts: { total: accounts.length, enabled: accounts.filter((a) => a.purchase_enabled).length, paused: accounts.filter((a) => a.execution_paused).length },
-    devices: { total: devices.filter((d) => !d.revoked_at).length, online: devices.filter((d) => !d.revoked_at && d.online).length },
+    devices: { total: devices.filter((d) => !d.hidden_at).length, online: devices.filter((d) => !d.hidden_at && d.online).length },
+    discovered_buyers: discovered.filter((x) => !x.ignored).length,
     needs_attention: orders.filter((o) => o.needs_attention).length,
     // 同服务端 overview：最近变为「异常」的任务（结果待核实单独提示）
     recent_exceptions: orders.filter((o) => o.status === 'exception'),
@@ -1179,6 +1253,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     settings,
     accounts,
     devices,
+    discovered,
     orders,
     details,
     lastAllocation,

@@ -1,4 +1,4 @@
-"""路由的公共依赖：数据库事务、控制台会话、插件设备令牌、分页、防跨站请求头、会话 Cookie。
+"""路由的公共依赖：数据库事务、控制台会话、插件的浏览器令牌、分页、防跨站请求头、会话 Cookie。
 
 事务边界（铁律 4）：每个请求一个 `registry.db.pg_conn()` 事务。依赖以生成器形式交出连接，路由正常返回 →
 提交；路由抛异常（含 DomainError）→ 回滚。FastAPI 在发送响应**之前**执行依赖的收尾，所以提交失败会变成
@@ -7,7 +7,10 @@
 - 控制台：会话 Cookie `pc_session`（HttpOnly、SameSite=Strict、Secure 取 settings.cookie_secure、
   Max-Age 取 settings.session_days），由 services.auth.session_me 校验；无效 → 401 UNAUTHORIZED。
   工作区一律取会话里的工作区，请求不能指定工作区（跨工作区访问由服务层返回 404）。
-- 插件：`Authorization: Bearer <设备令牌>`，由 services.devices.authenticate 校验；缺失、未知或已撤销 → 401。
+- 插件：`Authorization: Bearer <浏览器令牌>`，由 services.devices.authenticate 只按令牌哈希查；缺失或没登记过
+  → 401 UNAUTHORIZED「这个浏览器还没有登记，插件会自动重新登记」（插件收到后用同一个令牌调 /plugin/v1/register）。
+  令牌只是会话标识，不代表身份；从控制台列表里移除的浏览器照样能认证（再次联系时自动回到列表）。
+  /plugin 的来源检查（本机对端等）在 server/limits.PluginGateMiddleware，先于这里。
 - 防跨站：控制台的写请求必须带 `X-Requested-With: pc-console`（检查在 app.py 的中间件里，见 csrf_ok）。
 """
 
@@ -31,7 +34,6 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 PAGE_SIZE_MAX = 200
 
 _UNAUTHORIZED_CONSOLE = "请先登录"
-_UNAUTHORIZED_DEVICE = "设备未授权或授权已撤销，请在插件里重新配对"
 
 
 @dataclass
@@ -54,7 +56,7 @@ class Console:
 
 @dataclass
 class Plugin:
-    """一次已认证的插件请求：事务连接 + 设备行（含 workspace_id）。"""
+    """一次已认证的插件请求：事务连接 + 浏览器行（devices 行，含它登记时归属的 workspace_id）。"""
 
     conn: Any
     device: dict[str, Any]
@@ -97,12 +99,13 @@ def bearer_token(request: Request) -> str | None:
 
 
 def plugin(request: Request) -> Iterator[Plugin]:
-    """输入：请求（读设备令牌）→ 输出：Plugin（事务连接 + 设备行）；令牌缺失、未知或已撤销 → 401 UNAUTHORIZED。"""
+    """输入：请求（读浏览器令牌）→ 输出：Plugin（事务连接 + 浏览器行）；令牌缺失或没登记过 → 401 UNAUTHORIZED
+    （devices.unauthorized()：插件收到后自动重新登记）。"""
     token = bearer_token(request)
     with db.pg_conn() as conn:
         device = devices.authenticate(conn, token) if token else None
         if device is None:
-            raise DomainError("UNAUTHORIZED", _UNAUTHORIZED_DEVICE, 401)
+            raise devices.unauthorized()
         yield Plugin(conn=conn, device=device)
 
 

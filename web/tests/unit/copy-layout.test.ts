@@ -35,6 +35,22 @@ describe('文案规则', () => {
     expect(all).not.toMatch(/>\s*问题行\s*</)
     expect(all).not.toMatch(/\/>读取记录</)
   })
+  it('界面上不再出现「设备」「绑定」「配对」「采用此 ID」「身份一致」（执行入口改造；浏览器由插件自动登记）', () => {
+    // 例外只有历史事件的中文名：旧记录还要显示，标注了「（旧版）」
+    const legacy = /^\s*'device\.(pairing_code_created|paired|revoked)': '[^']*（旧版）',$|^\s*\/\/ .*历史事件.*$/
+    const bad: string[] = []
+    for (const { p, text } of sources) {
+      text.split('\n').forEach((line, i) => {
+        if (/设备|绑定|配对|采用此 ID|身份一致|身份不符/.test(line) && !(p.endsWith('labels.ts') && legacy.test(line))) bad.push(`${p}:${i + 1} ${line.trim()}`)
+      })
+    }
+    expect(bad).toEqual([])
+  })
+  it('没有配对码对话框，也没有调用配对、绑定、采用 ID、撤销这些旧接口', () => {
+    const all = sources.map(({ text }) => text).join('\n')
+    expect(sources.some(({ p }) => /PairingDialog|DevicesPanel/.test(p))).toBe(false)
+    for (const gone of ['pairing-codes', 'adopt-customer-id', '/revoke', 'bound_account_id', 'default_device_id', 'identity_status']) expect(all).not.toContain(gone)
+  })
   it('导入模板是工作区共用的（v2 §4、契约 §7），不叫「个人模板」', () => {
     const bad = sources.filter(({ text }) => text.includes('个人模板')).map(({ p }) => p)
     expect(bad).toEqual([])

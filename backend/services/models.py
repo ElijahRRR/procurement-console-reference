@@ -50,6 +50,11 @@ ATTEMPT_INFLIGHT = frozenset({"claimed", "checking", "guard_passed", "submitting
 #: 不占额度的尝试结局
 ATTEMPT_QUOTA_FREE = frozenset({"failed", "aborted"})
 
+# ── 买家号 ID ─────────────────────────────────────────────────────────────────
+#: 亚马逊 customerId 的形状（库里 buyer_accounts.amazon_customer_id 的 CHECK 同一条）。买家号的身份就是它：
+#: 账号登记、插件上报、开始批次、护栏 buyer 项都按这个形状校验；一律先去空白、转大写再比。
+CUSTOMER_ID_RE = re.compile(r"^A[0-9A-Z]{8,}$")
+
 # ── 执行所需字段（缺一即 needs_info）────────────────────────────────────────────
 
 REQUIRED_FOR_EXECUTION = (
@@ -74,7 +79,9 @@ EXECUTION_FIELDS = (
 
 # ── 插件错误码 ────────────────────────────────────────────────────────────────
 # category：task = 本任务转异常；account = 暂停账号执行、任务保留；retry_once = 提交前页面错误自动重试一次；
-#           abort = 插件按服务端指示中止；guard = 服务端护栏拦截（按 task 处理）。
+#           abort = 未提交前中止（任务回已分配、不暂停账号、不占额度）；guard = 服务端护栏拦截（按 task 处理）。
+# IDENTITY_MISMATCH 是中止类：执行中途换了买家号不是账号的问题，不暂停账号；它同时是护栏 buyer 项的拦截码
+# （结算页登录的买家号不是批次的买家号，见 services/guard）。
 
 
 @dataclass(frozen=True)
@@ -95,10 +102,10 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("ACCOUNT_RESTRICTED", "account", "买家账号受限"),
     ErrorCode("CARD_DECLINED", "account", "银行卡被拒付"),
     ErrorCode("CAPTCHA_ENCOUNTERED", "account", "遇到验证码或风控验证，需要人工处理"),
-    ErrorCode("IDENTITY_MISMATCH", "account", "浏览器登录的买家账号与绑定不符"),
+    ErrorCode("IDENTITY_MISMATCH", "abort", "执行中途浏览器登录的买家号变了"),
     ErrorCode("ABORTED_UPSTREAM_CANCELLED", "abort", "上游已取消，已中止"),
     ErrorCode("ABORTED_BY_USER", "abort", "插件端人工中止"),
-    ErrorCode("ABORTED_BY_SERVER", "abort", "服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止"),
+    ErrorCode("ABORTED_BY_SERVER", "abort", "服务端要求中止（账号暂停或归档、浏览器登录的买家号变了或登录状态过期、来源有变化），未提交前中止"),
     ErrorCode("ITEM_MISMATCH", "guard", "结算商品或数量与任务不一致"),
     ErrorCode("ZIP_MISMATCH", "guard", "收货邮编与任务不一致"),
     ErrorCode("SUBTOTAL_OUT_OF_RANGE", "guard", "商品小计不在账号金额区间内"),
@@ -111,6 +118,17 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("SUBMIT_REJECTED", "task", "服务端拒绝了提交登记"),
     ErrorCode("PLUGIN_SIMULATION_ONLY", "account", "插件只执行模拟任务，却领到了真实任务"),
 )}
+
+
+# ── 接口统一错误码 ────────────────────────────────────────────────────────────
+#: 接口错误体 {code, message, detail} 里 code 的全部取值（契约 §8）。顺序与契约、web/src/api/types.ts 的
+#: API_ERROR_CODES、extension/src/core/codes.ts 的 SERVER_CODE_LABEL 相同；服务层抛出的 DomainError 只用这里的码。
+API_ERROR_CODES: tuple[str, ...] = (
+    "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION", "CONFLICT", "ACCOUNT_BUSY", "DEVICE_BUSY",
+    "ATTEMPT_IN_FLIGHT", "IDENTITY_MISMATCH", "ACCOUNT_NOT_REGISTERED", "ACCOUNT_PAUSED", "REAL_PURCHASE_DISABLED",
+    "LEASE_LOST", "SLOT_DONE", "WORKSPACE_REQUIRED", "PLUGIN_OUTDATED", "FEISHU_NOT_CONFIGURED", "FEISHU_ERROR",
+    "INVALID_TRANSITION", "SOURCE_CHANGED", "GUARD_BLOCKED", "RATE_LIMITED", "METHOD_NOT_ALLOWED", "INTERNAL",
+)
 
 
 # ── 上游记录与来源引用 ────────────────────────────────────────────────────────

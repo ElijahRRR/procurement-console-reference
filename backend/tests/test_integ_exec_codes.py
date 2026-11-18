@@ -27,7 +27,7 @@ from services.models import ERROR_CODES
 from tests import factories as f
 from tests import factories_exec as fx
 from tests.api_helpers import (api, bearer, create_account, err, import_orders, import_row, ok,  # noqa: F401
-                               owner, pair_device, plugin_client)
+                               owner, plugin_client, register_device, run_body)
 
 NOW = datetime(2026, 10, 31, 2, 0, tzinfo=timezone.utc)   # 北京 2026-10-31 10:00
 TODAY = date(2026, 10, 31)
@@ -44,7 +44,7 @@ def _frozen(clean_db):
 def _claimed(conn, workspace, no: str) -> dict:
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.file_source(conn, ws, 2)
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no=no)
     run_id = fx.start(conn, dev)
@@ -123,8 +123,8 @@ CASES = [
     ("UPSTREAM_CANCELLED", _cause_upstream, "上游已取消", "cancelled"),
     ("ACCOUNT_ARCHIVED", _cause_archived, "账号已归档", "assigned"),
     ("ACCOUNT_PAUSED", _cause_paused, "DEMO 人工暂停", "assigned"),
-    ("IDENTITY_MISMATCH", _cause_mismatch, "不符", "assigned"),
-    ("IDENTITY_STALE", _cause_stale, "身份信息已过期", "assigned"),
+    ("IDENTITY_MISMATCH", _cause_mismatch, "浏览器登录的买家号变了", "assigned"),
+    ("IDENTITY_STALE", _cause_stale, "没有上报登录状态", "assigned"),
     ("SOURCE_HOLD", _cause_hold, "来源要求暂停采购", "conflict"),
     ("SOURCE_CHANGED", _cause_changed, "ASIN", "conflict"),
 ]
@@ -234,9 +234,9 @@ def test_aborted_by_server_over_http(owner, api):  # noqa: F811
     acc = create_account(owner)
     import_orders(owner, [import_row("PO-DEMO-HABS")])
     plugin = plugin_client(api)
-    dev = pair_device(owner, plugin, account=acc)
+    dev = register_device(plugin, acc)
     h = bearer(dev["token"])
-    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    run = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h))
     att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
     ok(owner.post(f"/api/v1/accounts/{acc['id']}/pause", json={"reason": "DEMO 暂停"}))
     pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress", json={"stage": "x"}, headers=h))
@@ -267,7 +267,7 @@ def _run_ended_detail(conn, run_id: int) -> dict:
 ])
 def test_finish_run_records_plugin_detail(conn, workspace, detail, expected):
     acc = fx.exec_account(conn, workspace["id"])
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     run_id = fx.start(conn, dev)
     out = execution.finish_run(conn, dev, run_id, "completed", detail)
     assert out["end_reason"] == "finished"
@@ -278,16 +278,16 @@ def test_finish_run_records_plugin_detail(conn, workspace, detail, expected):
 def test_finish_run_detail_over_http(owner, api):  # noqa: F811
     acc = create_account(owner)
     plugin = plugin_client(api)
-    dev = pair_device(owner, plugin, account=acc)
+    dev = register_device(plugin, acc)
     h = bearer(dev["token"])
-    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    run = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h))
     out = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/finish",
                          json={"reason": "completed", "detail": "DEMO 今天没有可执行的任务"}, headers=h))
     assert out["end_reason"] == "finished"
     with db.pg_conn() as conn:
         d = _run_ended_detail(conn, run["run_id"])
     assert d["plugin_detail"] == "DEMO 今天没有可执行的任务"
-    run2 = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    run2 = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h))
     ok(plugin.post(f"/plugin/v1/runs/{run2['run_id']}/finish", json={"reason": "stopped"}, headers=h))
     with db.pg_conn() as conn:
         assert _run_ended_detail(conn, run2["run_id"])["plugin_detail"] is None
@@ -299,7 +299,7 @@ def test_finish_run_detail_over_http(owner, api):  # noqa: F811
 def test_claim_busy_retry_comes_from_settings(clean_db, conn, workspace, monkeypatch):
     monkeypatch.setattr(settings, "_loaded", dataclasses.replace(settings.get(), claim_busy_retry_s=7))
     acc = fx.exec_account(conn, workspace["id"])
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     order = fx.assigned_order(conn, workspace["id"], acc)
     run_id = fx.start(conn, dev)
     conn.commit()

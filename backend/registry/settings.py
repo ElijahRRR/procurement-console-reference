@@ -29,15 +29,19 @@ class Settings:
     lease_ttl_s: int
     identity_fresh_s: int
     claim_busy_retry_s: int
-    pairing_ttl_s: int
     sweep_interval_s: int
     writeback_interval_s: int
     intake_check_s: int
     web_dist: Path
     login_fail_limit: int
-    pair_fail_limit: int
     rate_window_s: int
     allowed_hosts: tuple[str, ...]
+    #: 一个工作区最多登记多少个浏览器（devices 行）；满了以后新登记 → 429
+    max_devices: int
+    #: 多少天没有联系、且没有任何批次 / 尝试引用的浏览器行由清扫任务删除
+    device_retention_days: int
+    #: 允许调用 /plugin 的扩展 ID 名单（小写）；空 = 不按扩展 ID 限制（仍拒绝网页来源）
+    plugin_extension_ids: tuple[str, ...]
 
     @property
     def feishu_configured(self) -> bool:
@@ -111,15 +115,16 @@ def get() -> Settings:
             lease_ttl_s=_int("PC_LEASE_TTL_S", 180),
             identity_fresh_s=_int("PC_IDENTITY_FRESH_S", 600),
             claim_busy_retry_s=_int("PC_CLAIM_BUSY_RETRY_S", 5),
-            pairing_ttl_s=_int("PC_PAIRING_TTL_S", 600),
             sweep_interval_s=_int("PC_SWEEP_INTERVAL_S", 30),
             writeback_interval_s=_int("PC_WRITEBACK_INTERVAL_S", 60),
             intake_check_s=_int("PC_INTAKE_CHECK_S", 30),
             web_dist=Path(_str("PC_WEB_DIST", str(paths.REPO_DIR / "web" / "dist"))),
             login_fail_limit=_int("PC_LOGIN_FAIL_LIMIT", 10),
-            pair_fail_limit=_int("PC_PAIR_FAIL_LIMIT", 20),
             rate_window_s=_int("PC_RATE_WINDOW_S", 600),
             allowed_hosts=_list("PC_ALLOWED_HOSTS"),
+            max_devices=_int("PC_MAX_DEVICES", 500),
+            device_retention_days=_int("PC_DEVICE_RETENTION_DAYS", 30),
+            plugin_extension_ids=_list("PC_PLUGIN_EXTENSION_IDS"),
         )
     return _loaded
 

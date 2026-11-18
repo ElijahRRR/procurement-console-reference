@@ -292,11 +292,13 @@ describe('任务详情：回填目标与需要留意', () => {
     }
   }
 
-  it('显示尝试的账号、设备与核实人，事件的操作者与中文 kind', async () => {
+  it('显示尝试的账号、浏览器与核实人，事件的操作者与中文 kind', async () => {
     ordersApi.getOrder.mockResolvedValue(detail())
     await mountWith(OrderDetailDrawer, { orderId: 7, modelValue: true })
     const text = document.body.textContent ?? ''
     expect(text).toContain('DEMO-环境-A / Mac-DEMO-01')
+    expect(text).toContain('账号 / 浏览器')
+    expect(text).not.toContain('账号 / 设备')
     expect(text).toContain('DEMO 所有者')
     expect(text).toContain('上游在采购开始后修改')
     expect(text).toContain('用户 DEMO 所有者')

@@ -72,5 +72,6 @@ def auth_logout(request: Request, ctx: deps.Console = Depends(deps.console)):
 
 @router.get("/me")
 def auth_me(ctx: deps.Console = Depends(deps.console)):
-    """输入：当前会话 → 输出：{user, workspace, role}。"""
+    """输入：当前会话 → 输出：{user, workspace: {id, name}, role}（workspace.id 即「设置」页显示的工作区 ID：
+    系统里有多个工作区时，插件设置里要填它）。"""
     return respond(ctx.me)

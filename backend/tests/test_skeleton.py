@@ -11,8 +11,30 @@ def test_schema_tables_exist(conn):
     names = {r["tablename"] for r in conn.execute(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'procure'").fetchall()}
     for t in ("purchase_orders", "purchase_attempts", "execution_runs", "buyer_accounts",
-              "devices", "feishu_connections", "import_batches", "writebacks", "events"):
+              "devices", "ignored_buyer_ids", "feishu_connections", "import_batches", "writebacks", "events"):
         assert t in names
+    assert "device_pairings" not in names                      # 配对码表已删除
+
+
+def test_api_error_codes_catalogue_covers_everything_services_raise():
+    """models.API_ERROR_CODES 是接口统一错误码（契约 §8 的顺序）；服务层、接口适配层抛出的码都在里面。"""
+    import re
+
+    from registry import paths
+    from services.models import API_ERROR_CODES
+
+    assert API_ERROR_CODES == (
+        "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION", "CONFLICT", "ACCOUNT_BUSY", "DEVICE_BUSY",
+        "ATTEMPT_IN_FLIGHT", "IDENTITY_MISMATCH", "ACCOUNT_NOT_REGISTERED", "ACCOUNT_PAUSED", "REAL_PURCHASE_DISABLED",
+        "LEASE_LOST", "SLOT_DONE", "WORKSPACE_REQUIRED", "PLUGIN_OUTDATED", "FEISHU_NOT_CONFIGURED", "FEISHU_ERROR",
+        "INVALID_TRANSITION", "SOURCE_CHANGED", "GUARD_BLOCKED", "RATE_LIMITED", "METHOD_NOT_ALLOWED", "INTERNAL")
+    assert len(set(API_ERROR_CODES)) == len(API_ERROR_CODES) and "NOT_BOUND" not in API_ERROR_CODES
+    used: set[str] = set()
+    for folder in ("services", "api", "workflows"):
+        for path in (paths.BACKEND_DIR / folder).glob("*.py"):
+            used |= set(re.findall(r'(?:code=|DomainError\(\s*)"([A-Z_]+)"', path.read_text(encoding="utf-8")))
+    assert {"DEVICE_BUSY", "SLOT_DONE", "ACCOUNT_NOT_REGISTERED", "WORKSPACE_REQUIRED", "PLUGIN_OUTDATED"} <= used
+    assert used - set(API_ERROR_CODES) == set()
 
 
 def test_bj_date_crosses_midnight():

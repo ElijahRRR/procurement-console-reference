@@ -31,7 +31,6 @@ import {
   ATTEMPT_KIND_LABEL,
   ATTEMPT_STATUS_LABEL,
   ATTEMPT_STATUS_TAG,
-  GUARD_CODE_LABEL,
   RESOLUTION_LABEL,
   REVIEW_STATUS_LABEL,
   REVIEW_STATUS_TAG,
@@ -40,6 +39,7 @@ import {
   errorCodeLabel,
   eventKindLabel,
   fieldLabel,
+  guardCodeLabel,
   labelOf,
   tagOf,
 } from '@/utils/labels'
@@ -797,7 +797,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
                   <el-tag v-if="a.submitted_at" size="small" type="danger" disable-transitions>已登记提交</el-tag>
                 </div>
                 <dl class="pc-kv mt-3">
-                  <dt>账号 / 设备</dt>
+                  <dt>账号 / 浏览器</dt>
                   <dd>{{ a.account_name || a.buyer_account_name || '—' }} / {{ a.device_name || '—' }}</dd>
                   <dt>额度日期</dt>
                   <dd>{{ formatDate(a.bj_date) }}</dd>
@@ -848,7 +848,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
                       {{ a.guard_verdict.verdict === 'pass' ? '通过' : '拦截' }}
                     </el-tag>
                     <span v-if="a.guard_verdict.code" class="text-red-600 dark:text-red-400">
-                      {{ labelOf(GUARD_CODE_LABEL, a.guard_verdict.code) }}
+                      {{ guardCodeLabel(a.guard_verdict.code) }}
                     </span>
                   </div>
                   <ul v-if="a.guard_verdict.reasons?.length" class="mb-2 list-disc pl-5 text-sm text-gray-700 dark:text-gray-300">

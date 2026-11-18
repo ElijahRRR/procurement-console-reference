@@ -34,7 +34,7 @@ def _env(conn, workspace, no):
     """飞书来源（连接的准入规则：只负责「自采购DEMO」）的已分配任务、已配对设备。"""
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.feishu_source(conn, ws, f"rec{no}")
     conn.execute("UPDATE procure.feishu_connections SET admission = %s WHERE id = %s", (Jsonb(ADM), src.connection_id))
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no=no, purchaser="自采购DEMO")

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** 概览：状态计数、今日可采购、在线设备、最近异常、最近一次分配摘要（未覆盖账号与原因），快捷操作「重新分配」。 */
+/** 概览：状态计数、今日可采购、在线浏览器、待登记的买家号提示、最近异常、最近一次分配摘要（未覆盖账号与原因），快捷操作「重新分配」。 */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import type { AllocationSummary, OrderRow, Overview } from '@/api/types'
@@ -15,6 +15,7 @@ import { formatCount, formatDate, formatDateTime, formatNumber, greeting } from 
 import { displayName, session } from '@/stores/session'
 import { ALLOCATION_TRIGGER_LABEL, labelOf } from '@/utils/labels'
 import { exceptionManual, preStartManual, uncoveredTitle } from '@/utils/overview'
+import { discoveredNotice } from '@/utils/accounts'
 import { confirmAction, notifyFailure, notifySuccess } from '@/utils/feedback'
 
 const router = useRouter()
@@ -47,6 +48,8 @@ const unknownCount = computed(() => counts.value.result_unknown ?? 0)
 /** 置了「需要留意」提醒的任务数（不论状态） */
 const attentionCount = computed(() => data.value?.needs_attention ?? 0)
 const last = computed<AllocationSummary | null>(() => data.value?.last_allocation ?? null)
+/** 插件读到、还没登记的买家号：登记后才会分到任务（没有为空串） */
+const discoveredText = computed(() => discoveredNotice(data.value?.discovered_buyers))
 
 async function reallocate() {
   const ok = await confirmAction({ message: '确定要重新分配吗？自动分配的任务会按当前账号配置重算，人工改派的任务保持不动。' })
@@ -75,7 +78,7 @@ function open(row: OrderRow | { id: number }) {
     <PageHeader :title="session.me ? `${greeting()}，${displayName(session.me)}` : '今日概况'">
       <template #description>
         <template v-if="data">北京日期 {{ formatDate(data.bj_date) }} · 账号 {{ formatNumber(data.accounts.enabled) }}/{{ formatNumber(data.accounts.total) }} 个开启采购<template v-if="data.accounts.paused"> · {{ formatNumber(data.accounts.paused) }} 个暂停执行</template></template>
-        <template v-else>今日采购任务、执行设备与最近一次分配</template>
+        <template v-else>今日采购任务、在线浏览器与最近一次分配</template>
       </template>
       <template #actions>
         <el-button :loading="loading" @click="load"><AppIcon name="refresh" size="sm" class="mr-1.5" />刷新</el-button>
@@ -84,6 +87,14 @@ function open(row: OrderRow | { id: number }) {
     </PageHeader>
 
     <el-alert v-if="loadError" :title="`读取概览失败：${loadError}`" type="error" show-icon :closable="false" class="mb-6" />
+
+    <div v-if="discoveredText" class="mb-6">
+      <el-alert :title="discoveredText" type="warning" show-icon :closable="false">
+        <template #default>
+          <el-button size="small" class="mt-2" @click="router.push({ path: '/accounts', query: { tab: 'accounts' } })">去登记</el-button>
+        </template>
+      </el-alert>
+    </div>
 
     <div v-loading="loading && !data" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
       <StatCard
@@ -123,13 +134,13 @@ function open(row: OrderRow | { id: number }) {
         @click="router.push({ path: '/exceptions', query: { view: exceptions.view } })"
       />
       <StatCard
-        label="设备在线"
+        label="浏览器在线"
         :value="data ? `${formatNumber(data.devices.online)} / ${formatNumber(data.devices.total)}` : '—'"
-        icon="cpu"
+        icon="globe"
         tone="success"
         :hint="data ? `已采购 ${formatCount(counts.purchased ?? 0, '笔')}` : ''"
         clickable
-        @click="router.push('/accounts')"
+        @click="router.push({ path: '/accounts', query: { tab: 'browsers' } })"
       />
     </div>
 

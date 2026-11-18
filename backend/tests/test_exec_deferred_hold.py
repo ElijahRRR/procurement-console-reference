@@ -31,7 +31,7 @@ def _frozen(clean_db):
 def _env(conn, workspace, no, *, primary="file"):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.file_source(conn, ws, 2) if primary == "file" else f.feishu_source(conn, ws, f"rec{no}")
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no=no)
     run_id = fx.start(conn, dev)

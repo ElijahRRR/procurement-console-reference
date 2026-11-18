@@ -1,25 +1,19 @@
-/** 设置页：服务端地址、配对 / 解除配对、模拟结局、服务端下发的账号配置、日志。 */
+/** 设置页。只有这几样（规格 §3、§5）：
+ *    · 服务端地址（缺省 http://127.0.0.1:8790，装好不用改就能用）；
+ *    · 状态区：连接、本浏览器名称、当前买家号、账号，以及「立即同步」「重新登记」；
+ *    · 模拟结局；
+ *    · 高级：工作区 ID（只有服务端里有多个工作区时才需要填）。
+ *  没有配对码、设备名称、浏览器类型：登记是自动的，浏览器的名字由服务端起、在控制台改。
+ *  保存设置、重新登记是特权消息，后台只接受从这一页（扩展自己的页面）发来的。 */
 
-import { maskCustomerId } from "../core/identity.js";
 import type { StateSnapshot } from "../core/messages.js";
-import { normalizeSlots } from "../core/schedule.js";
-import { BROWSER_OPTIONS, DEFAULT_SERVER_URL, isValidPairingCode, validateServerUrl } from "../core/settings.js";
+import { DEFAULT_SERVER_URL, validateServerUrl, validateWorkspaceIdText } from "../core/settings.js";
 import { SIM_OUTCOMES, type SimOutcome } from "../core/simulate.js";
+import type { StatusAction } from "../core/status.js";
 import { bjShort } from "../core/time.js";
-import type { Browser } from "../core/types.js";
-import { fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
+import { copyText, fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
 import { LOGO_SVG, themeCss } from "../ui/theme.js";
-import {
-  accountText,
-  connectionText,
-  h,
-  identityConflictText,
-  identityText,
-  quotaText,
-  receiptLines,
-  renderLogLines,
-  scheduleText,
-} from "../ui/view.js";
+import { TONE_DOT, accountText, connectionText, h, receiptLines, statusBlock, statusOf } from "../ui/view.js";
 
 const PAGE_CSS = `
 body { margin: 0; background: var(--pc-bg-page); color: var(--pc-text-body); font: 400 14px/20px var(--pc-font-sans); -webkit-font-smoothing: antialiased; }
@@ -29,15 +23,14 @@ body { margin: 0; background: var(--pc-bg-page); color: var(--pc-text-body); fon
 .page-title { font: 700 24px/32px var(--pc-font-sans); color: var(--pc-text-strong); }
 .stack { display: flex; flex-direction: column; gap: 24px; }
 .card-title { font: 600 18px/28px var(--pc-font-sans); color: var(--pc-text-strong); }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
-.grid .full { grid-column: 1 / -1; }
 .btns { display: flex; gap: 8px; flex-wrap: wrap; }
 .pc-kv { grid-template-columns: 120px 1fr; font-size: 14px; }
-.pc-log { max-height: 320px; }
 .desc { margin: 0 0 16px; color: var(--pc-text-muted); font-size: 13px; line-height: 20px; }
 .hint { color: var(--pc-text-muted); font-size: 12px; line-height: 16px; margin-top: 6px; }
 .grow { flex: 1; min-width: 0; }
-@media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+.inline { display: flex; gap: 8px; align-items: flex-start; }
+.inline .pc-input { flex: 1; }
+.gap { margin-top: 12px; }
 `;
 
 const app = document.getElementById("app")!;
@@ -45,11 +38,13 @@ const style = document.createElement("style");
 style.textContent = themeCss(":root") + PAGE_CSS;
 document.head.append(style);
 
+type Reply = { ok: boolean; message: string };
+
 let state: StateSnapshot | null = null;
 let message: { tone: "danger" | "brand" | "warning"; text: string } | null = null;
 let pending = false;
-// 配对表单的输入在重画之间保留。
-const form = { serverUrl: "", code: "", deviceName: "", browser: "chrome" as Browser };
+// 两个输入框的内容在重画之间保留。
+const form = { serverUrl: "", workspaceId: "" };
 let formInit = false;
 
 function logo(): HTMLElement {
@@ -74,41 +69,60 @@ function card(title: string, ...children: Array<Node | null>): HTMLElement {
   );
 }
 
+function show(tone: "danger" | "brand" | "warning", text: string): void {
+  message = { tone, text };
+  render();
+}
+
 async function refresh(): Promise<void> {
   state = await fetchState();
   if (state && !formInit) {
-    form.serverUrl = state.device.server_url ?? state.settings.serverUrl ?? DEFAULT_SERVER_URL;
+    form.serverUrl = state.settings.serverUrl ?? DEFAULT_SERVER_URL;
+    form.workspaceId = state.settings.workspaceId === null ? "" : String(state.settings.workspaceId);
     formInit = true;
   }
   render();
 }
 
-async function doPair(): Promise<void> {
-  const url = validateServerUrl(form.serverUrl);
-  if (!url.ok) return show("danger", `配对失败：${url.reason}`);
-  if (!isValidPairingCode(form.code)) return show("danger", "配对失败：配对码应为 8 位字母或数字");
-  if (!form.deviceName.trim()) return show("danger", "配对失败：请填写设备名称");
+/** 发一条要等结果的消息；后台没有响应时给一句「动作 + 失败：原因」。 */
+async function ask(msg: Parameters<typeof toSw>[0], what: string): Promise<Reply> {
   pending = true;
   render();
   try {
-    const r = await toSw<{ ok: boolean; message: string }>(
-      { type: "pc.pair", serverUrl: form.serverUrl, code: form.code, deviceName: form.deviceName, browser: form.browser },
-      60_000,
-    );
-    if (r.ok) form.code = "";
-    show(r.ok ? "brand" : "danger", r.message);
+    const r = await toSw<Reply>(msg, 90_000);
+    return r && typeof r.ok === "boolean" ? r : { ok: false, message: `${what}失败：插件后台没有给出答复` };
   } catch {
-    show("danger", "配对失败：插件后台没有响应，请重新加载插件后再试");
+    return { ok: false, message: `${what}失败：插件后台没有响应，请重新加载插件后再试` };
   } finally {
     pending = false;
-    await refresh();
   }
 }
 
-async function doUnpair(): Promise<void> {
-  if (!window.confirm("确定要解除配对吗？解除后本浏览器不再领取任务；如需让服务端也作废这个设备，请在控制台撤销该设备。")) return;
-  const r = await toSw<{ ok: boolean; message: string }>({ type: "pc.unpair" }).catch(() => ({ ok: false, message: "解除配对失败：插件后台没有响应" }));
+async function saveServerUrl(): Promise<void> {
+  const v = validateServerUrl(form.serverUrl);
+  if (!v.ok) return show("danger", `保存失败：${v.reason}`);
+  const changed = !!state && form.serverUrl.trim().replace(/\/+$/, "") !== state.settings.serverUrl;
+  if (changed && state?.device.registered && !window.confirm("确定要修改服务端地址吗？修改后这个浏览器会在新地址重新登记。")) return;
+  const r = await ask({ type: "pc.saveSettings", patch: { serverUrl: form.serverUrl } }, "保存");
+  formInit = !r.ok; // 保存成功后按后台规范化过的值重填
   show(r.ok ? "brand" : "danger", r.message);
+  await refresh();
+}
+
+async function saveWorkspaceId(): Promise<void> {
+  const v = validateWorkspaceIdText(form.workspaceId);
+  if (!v.ok) return show("danger", `保存失败：${v.reason}`);
+  const moving = !!state && state.device.registered && v.value !== null && state.device.workspace_id !== null && state.device.workspace_id !== v.value;
+  if (moving && !window.confirm("确定要更换工作区吗？更换后这个浏览器会在新的工作区重新登记。")) return;
+  const r = await ask({ type: "pc.saveSettings", patch: { workspaceId: v.value } }, "保存");
+  formInit = !r.ok;
+  show(r.ok ? "brand" : "danger", r.message);
+  await refresh();
+}
+
+async function saveOutcome(v: SimOutcome): Promise<void> {
+  const r = await ask({ type: "pc.saveSettings", patch: { simulationOutcome: v } }, "保存");
+  show(r.ok ? "brand" : "danger", r.ok ? "模拟结局已保存" : r.message);
   await refresh();
 }
 
@@ -119,91 +133,78 @@ async function doSync(): Promise<void> {
   pending = false;
   await refresh();
   if (state?.connection?.ok) show("brand", "已同步");
-  else show("danger", `同步失败：${state?.connection?.message ?? "未知原因"}`);
+  else show("danger", `同步失败：${state?.connection?.message ?? "插件后台没有响应"}`);
 }
 
-async function saveOutcome(v: SimOutcome): Promise<void> {
-  const r = await toSw<{ ok: boolean; message: string }>({ type: "pc.saveSettings", patch: { simulationOutcome: v } }).catch(() => ({ ok: false, message: "保存失败：插件后台没有响应" }));
-  show(r.ok ? "brand" : "danger", r.ok ? "模拟结局已保存" : r.message);
+async function doReregister(): Promise<void> {
+  const r = await ask({ type: "pc.reregister" }, "重新登记");
+  show(r.ok ? "brand" : "danger", r.message);
   await refresh();
 }
 
-function show(tone: "danger" | "brand" | "warning", text: string): void {
-  message = { tone, text };
-  render();
+async function copyId(): Promise<void> {
+  const id = state ? statusOf(state).customer_id : null;
+  if (!id) return;
+  const ok = await copyText(id, document.body);
+  show(ok ? "brand" : "warning", ok ? "已复制买家号 ID" : "复制失败：请选中买家号 ID 手动复制");
 }
 
-function pairingCard(s: StateSnapshot): HTMLElement {
-  if (!s.device.paired) {
-    const browserSel = h("select", { class: "pc-select", id: "browser" });
-    for (const o of BROWSER_OPTIONS) {
-      const opt = h("option", { value: o.value }, o.label);
-      if (o.value === form.browser) opt.selected = true;
-      browserSel.append(opt);
-    }
-    browserSel.addEventListener("change", () => { form.browser = browserSel.value as Browser; });
-    return card(
-      "连接与配对",
-      h("p", { class: "desc" }, "在控制台「账号与设备」里生成配对码（10 分钟内有效，只能用一次），填到这里完成配对。一个浏览器环境（一个 Chrome 用户或一个 AdsPower 环境）配对一次。"),
+/** 状态区里画哪些状态按钮：「重试」「打开设置」在这一页用「立即同步」与上面的表单代替。 */
+const statusActions: Partial<Record<StatusAction, () => void>> = {
+  open_orders: () => void toSw({ type: "pc.openOrders" }).catch(() => undefined),
+  reread: () => void toSw({ type: "pc.refreshIdentity" }, 30_000).catch(() => undefined).then(() => refresh()),
+  copy_id: () => void copyId(),
+  open_console: () => void toSw({ type: "pc.openConsole" }).catch(() => undefined),
+};
+
+function serverCard(): HTMLElement {
+  return card(
+    "服务端地址",
+    h("p", { class: "desc" }, "控制台所在的地址。服务端在本机、端口没改过时不用动：插件装好就会自动连上，并把这个浏览器登记到服务端。"),
+    h(
+      "div",
+      { class: "pc-field" },
+      h("label", { class: "pc-label", for: "server" }, "服务端地址"),
       h(
         "div",
-        { class: "grid" },
-        h("div", { class: "pc-field full" },
-          h("label", { class: "pc-label", for: "server" }, "服务端地址"),
-          input({ id: "server", placeholder: DEFAULT_SERVER_URL, autocomplete: "off" }, form.serverUrl, (v) => { form.serverUrl = v; }),
-          h("div", { class: "hint" }, `控制台所在的地址，默认 ${DEFAULT_SERVER_URL}。当前版本只支持本机（127.0.0.1 或 localhost）。`)),
-        h("div", { class: "pc-field" },
-          h("label", { class: "pc-label", for: "code" }, "配对码"),
-          input({ id: "code", placeholder: "8 位配对码", maxlength: "12", autocomplete: "off", spellcheck: "false" }, form.code, (v) => { form.code = v; })),
-        h("div", { class: "pc-field" },
-          h("label", { class: "pc-label", for: "browser" }, "浏览器"),
-          browserSel),
-        h("div", { class: "pc-field full" },
-          h("label", { class: "pc-label", for: "name" }, "设备名称"),
-          input({ id: "name", placeholder: "例如 Mac-AdsPower-环境1", maxlength: "60", autocomplete: "off" }, form.deviceName, (v) => { form.deviceName = v; }),
-          h("div", { class: "hint" }, "在控制台里区分不同电脑与浏览器环境用。")),
+        { class: "inline" },
+        input({ id: "server", placeholder: DEFAULT_SERVER_URL, autocomplete: "off", spellcheck: "false" }, form.serverUrl, (v) => { form.serverUrl = v; }),
+        h("button", { class: "pc-btn pc-btn-primary", type: "button", disabled: pending, onclick: () => void saveServerUrl() }, "保存"),
       ),
-      h("div", { class: "btns" }, h("button", { class: "pc-btn pc-btn-primary", type: "button", disabled: pending, onclick: () => void doPair() }, pending ? "正在配对" : "配对")),
-    );
-  }
+      h("div", { class: "hint" }, `默认 ${DEFAULT_SERVER_URL}。当前版本只支持本机（127.0.0.1 或 localhost）。正在执行、或有结果回执还没送到服务端时不能修改。`),
+    ),
+  );
+}
+
+function statusCard(s: StateSnapshot): HTMLElement {
   const conn = connectionText(s, Date.now());
-  const ident = identityText(s);
-  const dotClass = conn.tone === "success" ? "pc-dot pc-dot-green" : conn.tone === "danger" ? "pc-dot pc-dot-red" : conn.tone === "warning" ? "pc-dot pc-dot-yellow" : "pc-dot";
-  const tagClass = `pc-tag pc-tag-${ident.tone}`;
+  const st = statusOf(s);
+  const receipts = receiptLines(s);
+  const browser = s.device.registered
+    ? `${s.device.device_name ?? "—"}（ID ${s.device.device_id ?? "—"}${s.device.workspace_name ? `，工作区 ${s.device.workspace_name}` : ""}${s.device.registered_at ? `，${bjShort(s.device.registered_at)} 登记` : ""}）`
+    : "还没有登记";
+  const block = statusBlock(st, statusActions, pending);
+  block.classList.add("gap");
   return card(
-    "连接与配对",
+    "状态",
     h(
       "dl",
       { class: "pc-kv" },
-      h("dt", {}, "服务端"), h("dd", {}, h("span", { class: "pc-code" }, s.device.server_url ?? "—")),
-      h("dt", {}, "连接状态"), h("dd", {}, h("span", { class: "pc-row" }, h("span", { class: dotClass }), conn.text)),
-      h("dt", {}, "设备"), h("dd", {}, `${s.device.device_name ?? "—"}（ID ${s.device.device_id ?? "—"}，${BROWSER_OPTIONS.find((b) => b.value === s.device.browser)?.label ?? "—"}）`),
-      h("dt", {}, "工作区"), h("dd", {}, s.device.workspace_name ?? "—"),
-      h("dt", {}, "配对时间"), h("dd", {}, s.device.paired_at ? `${bjShort(s.device.paired_at)}（北京时间）` : "—"),
-      h("dt", {}, "绑定账号"), h("dd", {}, accountText(s)),
-      h("dt", {}, "身份状态"), h("dd", {}, h("span", { class: tagClass }, ident.short), h("div", { class: "hint" }, ident.long)),
-      h("dt", {}, "页面识别"), h("dd", {}, s.identity
-        ? `${s.identity.signed_in ? `已登录，买家号 ID ${maskCustomerId(s.identity.customer_id)}` : "未登录"} · ${bjShort(s.identity.at)} · ${s.identity.page_url ?? "—"}`
-        : "还没有读到（打开任意亚马逊页面后自动读取）",
-        identityConflictText(s) ? h("div", { class: "hint" }, identityConflictText(s)!) : null),
+      h("dt", {}, "连接"), h("dd", {}, h("span", { class: "pc-row" }, h("span", { class: TONE_DOT[conn.tone] }), conn.text)),
+      h("dt", {}, "本浏览器"), h("dd", {}, browser, s.device.registered ? h("div", { class: "hint" }, "名称由服务端起，可以在控制台的「浏览器」页签里改。") : null),
+      h("dt", {}, "当前买家号"), h("dd", {}, st.customer_id ? h("code", { class: "pc-code pc-id" }, st.customer_id) : "—"),
+      h("dt", {}, "账号"), h("dd", {}, accountText(s)),
+      receipts.length ? h("dt", {}, "待补交回执") : null,
+      receipts.length ? h("dd", {}, `${receipts.length} 条结果回执还没送到服务端，服务端恢复后自动补交（同一份结果，服务端不会登记两次）`, ...receipts.map((t) => h("div", { class: "hint" }, t))) : null,
     ),
+    block,
     h("div", { class: "pc-sep" }),
     h(
       "div",
       { class: "btns" },
       h("button", { class: "pc-btn", type: "button", disabled: pending, onclick: () => void doSync() }, "立即同步"),
-      h("button", { class: "pc-btn pc-btn-danger", type: "button", onclick: () => void doUnpair() }, "解除配对"),
+      h("button", { class: "pc-btn", type: "button", disabled: pending, title: "带着这个浏览器原来的令牌向服务端再登记一次", onclick: () => void doReregister() }, "重新登记"),
     ),
-  );
-}
-
-function receiptsCard(s: StateSnapshot): HTMLElement | null {
-  const lines = receiptLines(s);
-  if (!s.device.paired || lines.length === 0) return null;
-  return card(
-    "待补交的结果回执",
-    h("p", { class: "desc" }, "这些结果在上报时没有送到服务端（断网、服务端重启或插件后台被回收）。插件保存了回执，服务端恢复后自动补交；补交的是同一份结果，服务端不会登记两次。"),
-    ...lines.map((t) => h("div", { class: "hint" }, t)),
   );
 }
 
@@ -218,43 +219,27 @@ function simulationCard(s: StateSnapshot): HTMLElement {
   const hint = SIM_OUTCOMES.find((o) => o.value === s.settings.simulationOutcome)?.hint ?? "";
   return card(
     "模拟执行",
-    h("p", { class: "desc" }, "本版本只做模拟执行：插件领取服务端分配给本账号、已到采购日期的任务，按任务数据推出一份结算信息交给服务端护栏裁决，再走提交登记与结果上报。不打开、不点击、不修改任何亚马逊页面，不会产生真实订单；模拟单号形如 SIM-日期-尝试 ID，不写回飞书，可在控制台一键清除。"),
+    h("p", { class: "desc" }, "本版本只做模拟执行：插件领取服务端分给当前买家号、已到采购日期的任务，按任务数据推出一份结算信息交给服务端护栏裁决，再走提交登记与结果上报。不打开、不点击、不修改任何亚马逊页面，不会产生真实订单；模拟单号形如 SIM-日期-尝试 ID，不写回飞书，可在控制台一键清除。"),
     h("div", { class: "pc-field" }, h("label", { class: "pc-label", for: "outcome" }, "模拟结局"), sel, h("div", { class: "hint" }, hint)),
   );
 }
 
-function configCard(s: StateSnapshot): HTMLElement | null {
-  const hb = s.config?.heartbeat;
-  if (!s.device.paired || !hb) return null;
-  const a = hb.account;
-  const n = (v: number | null | undefined, unit = ""): string => (v === null || v === undefined ? "—" : `${v}${unit}`);
-  const money = (v: string | null | undefined): string => (v === null || v === undefined ? "不限" : `$${v}`);
+function advancedCard(): HTMLElement {
   return card(
-    "账号配置（服务端下发）",
-    h("p", { class: "desc" }, "以下是服务端已确认的有效配置，只读。修改请到控制台「账号与设备」。"),
+    "高级",
     h(
-      "dl",
-      { class: "pc-kv" },
-      h("dt", {}, "执行方式"), h("dd", {}, scheduleText(s)),
-      h("dt", {}, "今日额度"), h("dd", {}, quotaText(s)),
-      h("dt", {}, "金额区间"), h("dd", {}, a ? `${money(a.min_amount)} – ${money(a.max_amount)}（商品单价 × 数量）` : "—"),
-      h("dt", {}, "配送上限"), h("dd", {}, a ? n(a.effective_max_delivery_days, " 天") : "—"),
-      h("dt", {}, "期望卡尾号"), h("dd", {}, a?.expected_card_last4 ?? "未设置"),
-      h("dt", {}, "采购开关"), h("dd", {}, a ? (a.purchase_enabled === false ? "已关闭（不接新分配）" : "开启") : "—"),
-      h("dt", {}, "模拟限定"), h("dd", {}, hb.simulation_only ? "服务端只允许模拟执行" : "服务端允许真实执行（本插件版本仍只做模拟）"),
-      h("dt", {}, "服务端日期"), h("dd", {}, hb.bj_date ? `${hb.bj_date}（北京）` : "—"),
-      h("dt", {}, "今天的定时"), h("dd", {}, todaySchedule(s)),
+      "div",
+      { class: "pc-field" },
+      h("label", { class: "pc-label", for: "workspace" }, "工作区 ID"),
+      h(
+        "div",
+        { class: "inline" },
+        input({ id: "workspace", placeholder: "留空", inputmode: "numeric", autocomplete: "off" }, form.workspaceId, (v) => { form.workspaceId = v; }),
+        h("button", { class: "pc-btn", type: "button", disabled: pending, onclick: () => void saveWorkspaceId() }, "保存"),
+      ),
+      h("div", { class: "hint" }, "只有系统里有多个工作区时才需要填写（控制台「设置」页可以查到）。只有一个工作区时留空。已经登记过的浏览器改填另一个工作区，会在新的工作区重新登记。"),
     ),
   );
-}
-
-function todaySchedule(s: StateSnapshot): string {
-  const a = s.config?.heartbeat.account;
-  if (!a || a.purchase_mode !== "scheduled") return "—";
-  const slots = normalizeSlots(a.schedule_times);
-  if (!slots.length) return "未设置时间";
-  const st = s.schedule && s.schedule.bj_date === s.config?.heartbeat.bj_date ? s.schedule : null;
-  return slots.map((t) => `${t} ${st?.done.includes(t) ? "已处理" : st?.waiting_logged.includes(t) ? "等待环境" : "未到或待执行"}`).join("；");
 }
 
 function render(): void {
@@ -277,17 +262,8 @@ function render(): void {
     app.append(page);
     return;
   }
-  stack.append(pairingCard(state));
-  const rc = receiptsCard(state);
-  if (rc) stack.append(rc);
-  stack.append(simulationCard(state));
-  const cfg = configCard(state);
-  if (cfg) stack.append(cfg);
-  const logBox = h("div", { class: "pc-log", role: "log" }, ...renderLogLines(state.logs));
-  if (state.logs.length === 0) logBox.append(h("div", {}, "暂无日志"));
-  stack.append(card("日志（最近 50 行，北京时间）", logBox));
+  stack.append(serverCard(), statusCard(state), simulationCard(state), advancedCard());
   app.append(page);
-  logBox.scrollTop = logBox.scrollHeight;
 }
 
 /** 正在输入时不重画（重画会让输入框失去焦点），离开输入框后补画一次。 */

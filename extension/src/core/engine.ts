@@ -5,8 +5,9 @@
  * 在浏览器里它跑在亚马逊标签页的内容脚本中，所有请求经由后台转发（content/remote-api.ts）。
  *
  * 流程（契约 §5.4 – §5.12）：
- *   开始批次（simulated: true）→ 循环 [批次心跳 → 领取 → 进度 → （护栏）→ 提交登记 → 结果]
- *   → 领不到（attempt: null）为止 → 结束批次。
+ *   开始批次（{customer_id: 当前页读到的买家号 ID, trigger, slot?, simulated: true}）
+ *   → 循环 [批次心跳 → 领取 → 进度 → （护栏）→ 提交登记 → 结果] → 领不到（attempt: null）为止 → 结束批次。
+ *   服务端按买家号 ID 找账号；没有设备与账号的绑定。
  *
  * 几条不能退让的规矩：
  *   · **提交登记绝不自动重试**，也只认 HTTP 200；登记之后的任何不顺利都不再「重来」，
@@ -19,13 +20,18 @@
  *   · **其他没说上话就停。** 领取、护栏、提交登记的响应丢了，引擎不再继续、也不再续租，
  *     由服务端按契约清扫：未登记提交 → aborted、任务回到已分配；
  *     已登记提交 → unknown、账号暂停。这条路径叫「中断」（abandoned）。
- *   · **服务端是全局权威。** 409 ACCOUNT_BUSY 显示持有者设备与开始时间；
+ *   · **服务端是全局权威。** 409 ACCOUNT_BUSY 显示这个买家号正在哪个浏览器里执行、几点开始；
+ *     409 DEVICE_BUSY 说明这个浏览器上一个批次还没有结束；
  *     LEASE_LOST 立即停止；批次心跳 stop=true 在当前这一笔结束后停止并结束批次。
  *     续租节奏按服务端给的租约有效期（lease_ttl_s）算：min(35 秒, 有效期 / 3)，每一步之前到点就补一次。
- *   · **身份要新鲜。** 服务端在开始批次、领取、进度与提交登记时都要求设备身份在 identity_fresh_s
- *     （默认 600 秒）内上报过：引擎在批次进行中每 identityEveryMs（默认 3 分钟）请宿主重读并上报一次身份，
- *     并且在提交登记之前（登记前最后一次进度确认之前）无条件再报一次 —— 读不到、报不上不影响流程，
- *     服务端是裁决者：身份过期或不符时它让进度 continue=false（IDENTITY_STALE / IDENTITY_MISMATCH）。
+ *   · **身份要新鲜。** 服务端在开始批次、领取、进度与提交登记时都要求这个浏览器的登录状态在 identity_fresh_s
+ *     （默认 600 秒）内上报过、而且登录的买家号就是批次账号登记的那个：引擎在批次进行中每 identityEveryMs
+ *     （默认 3 分钟）请宿主重读并上报一次身份，并且在提交登记之前（登记前最后一次进度确认之前）无条件再报一次
+ *     —— 读不到、报不上不影响流程，服务端是裁决者：登录状态过期或买家号变了时它让进度 continue=false
+ *     （IDENTITY_STALE / IDENTITY_MISMATCH）。
+ *   · **护栏事实带买家号 ID**（取事实那一刻页面上读到的；模拟执行时取当前页面的读数）：服务端的 buyer 项
+ *     把「谁在下单」钉在下单那一页，读不到按数据不可靠拦截，对不上按 IDENTITY_MISMATCH 拦截，本批次随即结束。
+ *     执行中换了买家号是中止类：任务回已分配，**不暂停账号**。
  *   · **服务端要求中止时按原因码上报**（cancel_code，契约 §5 第 7 步）：只有 UPSTREAM_CANCELLED 报
  *     ABORTED_UPSTREAM_CANCELLED；ATTEMPT_FINISHED 不再上报；其余报 ABORTED_BY_SERVER（中止类，任务回到已分配）。
  *   · 本阶段尝试是「原子」的：模拟的一笔在毫秒级内完成，批次心跳的 stop 在两笔之间生效。
@@ -35,8 +41,8 @@
  */
 
 import type { ApiError, RunApi } from "./client.js";
-import { parseBusyHolder } from "./client.js";
-import { ACCOUNT_LEVEL_CODES, abortCodeFor, cancelLabel, codeLabel, stageLabel, stopReasonLabel } from "./codes.js";
+import { parseBusyHolder, parseDeviceBusy, parseIdentityRejection } from "./client.js";
+import { ACCOUNT_LEVEL_CODES, BUYER_CHANGED_TEXT, abortCodeFor, cancelLabel, codeLabel, stageLabel, stopReasonLabel } from "./codes.js";
 import type { LogLevel } from "./log.js";
 import { isLateReceipt, isRetryableResultError } from "./receipts.js";
 import {
@@ -46,7 +52,8 @@ import {
   successResult,
   type SimOutcome,
 } from "./simulate.js";
-import { bjShort } from "./time.js";
+import { busyElsewhereText } from "./status.js";
+import { bjHm } from "./time.js";
 import type { Attempt, BusyHolder, ResultIn, Trigger } from "./types.js";
 
 export type EnginePhase = "idle" | "starting" | "running" | "finishing" | "ended";
@@ -55,9 +62,9 @@ export type EnginePhase = "idle" | "starting" | "running" | "finishing" | "ended
 export type RunEndStatus =
   /** 正常结束：领不到新尝试，或按要求停下，并已调用结束批次。 */
   | "finished"
-  /** 409 ACCOUNT_BUSY：账号正在别处执行，本次没有开始。 */
+  /** 409 ACCOUNT_BUSY（这个买家号正在别的浏览器里执行）或 DEVICE_BUSY（这个浏览器上一个批次还没结束）：本次没有开始。 */
   | "busy"
-  /** 服务端拒绝开始（未绑定、身份不符、账号暂停、只允许模拟……）或没说上话。 */
+  /** 服务端拒绝开始（买家号没登记、登录状态对不上、账号暂停、这个时间点今天执行过……）或没说上话。 */
   | "rejected"
   /** 中途没说上话或执行权已失效：不再续租、不再调用，交给服务端清扫。 */
   | "abandoned";
@@ -111,7 +118,7 @@ export interface StartNotice {
   status: RunEndStatus | null;
   error: ApiError | null;
   message: string;
-  /** ACCOUNT_BUSY 的持有者就是本设备（上一次的批次租约还没到期）：过一会儿自然会好。 */
+  /** 占着的是这个浏览器自己（DEVICE_BUSY：上一次的批次还没结束或租约还没到期）：过一会儿自然会好。 */
   busy_mine: boolean;
 }
 
@@ -136,11 +143,14 @@ export interface EngineDeps {
   maxAttempts?: number;
   /** 一笔结果最多重发多久（从第一次失败算），默认 10 分钟；租约预算先到就先停。 */
   reportRetryMaxMs?: number;
-  /** 本设备 ID：ACCOUNT_BUSY 的持有者就是自己时换一句说明。 */
+  /** 这个浏览器在服务端的 ID：ACCOUNT_BUSY 的持有者就是自己时按「本浏览器未结束」说明。 */
   ownDeviceId?: number | string | null;
   /** 重读本浏览器的亚马逊登录身份并上报服务端（`POST /plugin/v1/identity`）。提交登记之前必调，
    *  批次进行中每 identityEveryMs 补一次。没有它（或它失败）时引擎照常走，由服务端按身份新鲜度裁决。 */
   refreshIdentity?: () => Promise<unknown>;
+  /** 取结算事实那一刻页面上读到的买家号 ID（模拟执行时就是当前页面的读数）；读不到返回 null。
+   *  没有它时事实里的 customer_id 为 null，服务端护栏按数据不可靠拦截 —— 不拿开始批次时的那个 ID 顶替。 */
+  readCustomerId?: () => string | null;
   /** 批次进行中多久补报一次身份，默认 3 分钟（服务端要求 10 分钟内上报过）。 */
   identityEveryMs?: number;
 }
@@ -202,28 +212,43 @@ const NO_TIMERS: Timers = {
   clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
 };
 
-/** 输入：开始批次失败的错误、本设备 ID → 输出：给人看的一句话与 busy 详情。 */
+/** 输入：IDENTITY_MISMATCH 的错误 → 输出：原因（不带「开始执行失败：」）。服务端的原话按情况已经写清楚了；
+ *  没有原话时按 detail {login_state, stale} 说。 */
+function identityRejectionText(err: ApiError): string {
+  if (err.message && err.message !== codeLabel(err.code)) return err.message;
+  const d = parseIdentityRejection(err.detail);
+  if (d.login_state === "signed_out") return "浏览器没有登录亚马逊";
+  if (d.login_state === "conflict") return "这个浏览器的亚马逊标签页显示的买家号不一致，请刷新或关闭较早打开的标签页";
+  if (d.stale) return "插件太久没有上报登录状态，请打开或刷新亚马逊页面后重试";
+  if (d.login_state === "no_id" || d.login_state === "unknown") return "插件还没有读到这个浏览器登录的买家号，请打开订单页后重试";
+  return "页面上的买家号与插件最近上报的不一致，请刷新亚马逊页面后重试";
+}
+
+const deviceBusyText = (accountName: string | null, since: string | null): string => {
+  const at = bjHm(since);
+  const which = accountName || at ? `批次${accountName ? `属于账号「${accountName}」` : ""}${at ? `（${at} 开始）` : ""}，` : "";
+  return `开始执行失败：这个浏览器上一个批次还没有结束。${which}页面刷新或异常退出留下的批次会在租约到期后自动释放`;
+};
+
+/** 输入：开始批次失败的错误、这个浏览器的 ID → 输出：给人看的一句话（规格 §5 状态文案表）、busy 详情、
+ *  占着的是不是这个浏览器自己。 */
 export function describeStartError(err: ApiError, ownDeviceId: number | string | null = null): { message: string; busy: BusyHolder | null; mine: boolean } {
+  if (err.code === "DEVICE_BUSY") {
+    const d = parseDeviceBusy(err.detail);
+    return { busy: null, mine: true, message: deviceBusyText(d.account_name, d.since) };
+  }
   if (err.code === "ACCOUNT_BUSY") {
     const busy = parseBusyHolder(err.detail);
-    const since = bjShort(busy.since);
     const mine = ownDeviceId !== null && busy.holder_device_id !== null && String(busy.holder_device_id) === String(ownDeviceId);
-    if (mine) {
-      return {
-        busy,
-        mine,
-        message:
-          "开始执行失败：本设备已有一个未结束的执行批次" +
-          (since ? `（北京时间 ${since} 开始）` : "") +
-          "，可能是另一个标签页、刚刷新的页面或上次异常退出；租约到期后会自动释放",
-      };
-    }
-    const who = busy.holder_device_name ? `「${busy.holder_device_name}」` : "另一台设备";
-    return {
-      busy,
-      mine,
-      message: `开始执行失败：账号正在${who}上执行` + (since ? `（北京时间 ${since} 开始）` : "") + "，本次没有开始",
-    };
+    // 持有者就是这个浏览器：正常情况下服务端先回 DEVICE_BUSY，这里只是并发时的另一种问法。
+    if (mine) return { busy, mine, message: deviceBusyText(null, busy.since) };
+    return { busy, mine, message: `开始执行失败：${busyElsewhereText(busy.holder_device_name, busy.since)}。` };
+  }
+  if (err.code === "IDENTITY_MISMATCH") {
+    return { busy: null, mine: false, message: `开始执行失败：${identityRejectionText(err)}` };
+  }
+  if (err.code === "UNAUTHORIZED") {
+    return { busy: null, mine: false, message: "开始执行失败：服务端不认识这个浏览器，插件正在重新登记，请稍后再点一次" };
   }
   if (GUIDED_START_CODES.has(err.code)) {
     // 这几种拒绝要人去做一件具体的事：用插件这边写好了处置的说明，服务端原话（如暂停原因）附在后面。
@@ -235,13 +260,7 @@ export function describeStartError(err: ApiError, ownDeviceId: number | string |
 }
 
 /** 开始批次被拒时，插件给出处置说明的几个错误码（契约 §5.4 的前置条件）。 */
-const GUIDED_START_CODES: ReadonlySet<string> = new Set([
-  "UNAUTHORIZED",
-  "NOT_BOUND",
-  "IDENTITY_MISMATCH",
-  "ACCOUNT_PAUSED",
-  "REAL_PURCHASE_DISABLED",
-]);
+const GUIDED_START_CODES: ReadonlySet<string> = new Set(["ACCOUNT_NOT_REGISTERED", "ACCOUNT_PAUSED", "REAL_PURCHASE_DISABLED"]);
 
 export class RunEngine {
   private readonly now: () => number;
@@ -311,18 +330,19 @@ export class RunEngine {
     return { status, reason, trigger, run_id: this.runId, counts: { ...this.view.counts }, error, busy, message };
   }
 
-  /** 输入：触发方式、开始那一步的回调 → 输出：批次总结。一个引擎实例只跑一个批次。 */
-  async run(trigger: Trigger, onStarted?: (n: StartNotice) => void): Promise<RunSummary> {
+  /** 输入：触发方式、当前页面读到的买家号 ID、开始那一步的回调、定时触发的时间点（`HH:MM`，手动为 null）
+   *  → 输出：批次总结。一个引擎实例只跑一个批次。 */
+  async run(trigger: Trigger, customerId: string, onStarted?: (n: StartNotice) => void, slot: string | null = null): Promise<RunSummary> {
     if (this.view.phase !== "idle") {
       throw new Error("一个 RunEngine 只能跑一个批次");
     }
     this.emit({ phase: "starting", trigger, started_at: this.now(), message: "正在申请执行批次" });
-    this.log("info", `申请执行批次（${trigger === "scheduled" ? "定时" : "手动"}，模拟）`);
+    this.log("info", `申请执行批次（${trigger === "scheduled" ? `定时${slot ? ` ${slot}` : ""}` : "手动"}，模拟）`);
 
-    const start = await this.deps.api.startRun(trigger);
+    const start = await this.deps.api.startRun(trigger, customerId, trigger === "scheduled" ? slot : null);
     if (!start.ok) {
       const { message, busy, mine } = describeStartError(start.error, this.deps.ownDeviceId ?? null);
-      const status: RunEndStatus = start.error.code === "ACCOUNT_BUSY" ? "busy" : "rejected";
+      const status: RunEndStatus = start.error.code === "ACCOUNT_BUSY" || start.error.code === "DEVICE_BUSY" ? "busy" : "rejected";
       this.log(status === "busy" ? "warn" : "err", message);
       this.emit({ phase: "ended", message });
       onStarted?.({ started: false, run_id: null, status, error: start.error, message, busy_mine: mine });
@@ -336,7 +356,8 @@ export class RunEngine {
     this.lastBeatOkAt = this.lastBeatAt;
     this.lastIdentityAt = this.lastBeatAt;
     this.emit({ phase: "running", run_id: this.runId, message: `执行批次 #${this.runId} 已开始` });
-    this.log("ok", `执行批次 #${this.runId} 已开始（模拟）`);
+    const accName = start.data.account?.name;
+    this.log("ok", `执行批次 #${this.runId} 已开始（模拟${accName ? `，账号「${accName}」` : ""}）`);
     onStarted?.({ started: true, run_id: this.runId, status: null, error: null, message: `执行批次 #${this.runId} 已开始`, busy_mine: false });
 
     const handle = this.timers.setInterval(() => void this.beat(), this.beatEvery);
@@ -555,7 +576,13 @@ export class RunEngine {
     if (!p.data.continue) {
       const why = p.data.cancel_reason ?? cancelLabel(p.data.cancel_code);
       const code = abortCodeFor(p.data.cancel_code);
-      this.log("warn", `尝试 #${a.attempt_id}（${a.upstream_order_no ?? "—"}）：${why}${/中止$/.test(why) ? "" : "，未提交前中止"}`);
+      if (p.data.cancel_code === "IDENTITY_MISMATCH") {
+        // 执行中换了买家号：面板与日志上用同一句（规格 §5），服务端的原话附在后面。
+        this.log("warn", `尝试 #${a.attempt_id}（${a.upstream_order_no ?? "—"}）：${BUYER_CHANGED_TEXT}${p.data.cancel_reason ? `（服务端：${p.data.cancel_reason}）` : ""}`);
+        this.emit({ message: `${BUYER_CHANGED_TEXT}。` });
+      } else {
+        this.log("warn", `尝试 #${a.attempt_id}（${a.upstream_order_no ?? "—"}）：${why}${/中止$/.test(why) ? "" : "，未提交前中止"}`);
+      }
       if (code === null) {
         // 服务端已经结束了这一笔（例如清除模拟结果、清扫）：不用再上报，继续下一笔。
         this.bump("aborted");
@@ -610,7 +637,14 @@ export class RunEngine {
       return { kind: "continue" };
     }
 
-    const facts = buildCheckoutFacts(a, outcome, this.now());
+    // 事实里的买家号 ID 取这一刻页面上的读数，不沿用开始批次时的那个：中途换了买家号，护栏要看得出来。
+    let buyer: string | null = null;
+    try {
+      buyer = this.deps.readCustomerId?.() ?? null;
+    } catch {
+      buyer = null; // 读页面出错就是没读到，交给服务端按数据不可靠拦截
+    }
+    const facts = buildCheckoutFacts(a, outcome, this.now(), buyer);
     const checkout = await this.progress(a, "checkout", { total: facts.total, delivery_date: facts.delivery.date });
     if (checkout) return checkout;
 
@@ -633,6 +667,15 @@ export class RunEngine {
     if (g.data.verdict !== "pass") {
       const code = g.data.code ?? "GUARD_BLOCKED";
       const why = g.data.reasons.length ? g.data.reasons.join("；") : codeLabel(code);
+      if (code === "IDENTITY_MISMATCH") {
+        // 护栏的 buyer 项：结算页登录的买家号不是这个批次的买家号。再领下一笔结论也一样，本批次到此为止。
+        // 这一笔服务端在拦截时已经结束了，不再上报结果：IDENTITY_MISMATCH 在结果处理里是中止类，
+        // 再报一次只会与护栏记下的结局对不上（409）。
+        this.log("warn", `尝试 #${a.attempt_id}：${BUYER_CHANGED_TEXT}（${why}）`);
+        this.emit({ message: `${BUYER_CHANGED_TEXT}。` });
+        this.bump("aborted");
+        return { kind: "stop", reason: "buyer_changed" };
+      }
       this.log("warn", `尝试 #${a.attempt_id} 护栏拦截：${codeLabel(code)}（${why}）`);
       const rep = await this.report(a, failureResult("failed", code, why));
       if (typeof rep === "object") return rep;
@@ -641,8 +684,8 @@ export class RunEngine {
     }
     this.log("ok", `尝试 #${a.attempt_id} 护栏放行：总额 $${facts.total ?? "—"}，送达 ${facts.delivery.date ?? "—"}`);
 
-    // 提交登记之前先报一次新鲜的身份（服务端在登记前的确认与登记时都要求身份 10 分钟内上报过），
-    // 再做登记前最后一次确认：上游在这之前取消、身份不符或过期、来源有变化，这里拿到 continue=false。
+    // 提交登记之前先报一次新鲜的身份（服务端在登记前的确认与登记时都要求登录状态 10 分钟内上报过），
+    // 再做登记前最后一次确认：上游在这之前取消、买家号变了或登录状态过期、来源有变化，这里拿到 continue=false。
     await this.refreshIdentity();
     const before = await this.progress(a, "before_submit", {});
     if (before) return before;
@@ -684,7 +727,7 @@ export class RunEngine {
         this.bump("blocked");
         return { kind: "continue" };
       }
-      // 其他 409（任务已取消、账号暂停、身份不符、来源有变化……）：先问一次服务端为什么。
+      // 其他 409（任务已取消、账号暂停、买家号变了、来源有变化……）：先问一次服务端为什么。
       this.log("warn", `尝试 #${a.attempt_id} 提交登记被拒绝：${s.error.message}`);
       const again = await this.progress(a, "before_submit", { submit_rejected: s.error.code });
       if (again) return again;

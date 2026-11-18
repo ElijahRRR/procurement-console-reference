@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from server.app import TEST_CLIENT_HOST, create_app
 from server.serialize import content_disposition
-from tests.api_helpers import err, ok
+from tests.api_helpers import err, local_client, ok
 
 INDEX = "<!doctype html><html><head><title>DEMO 控制台</title></head><body><div id=app></div></body></html>"
 
@@ -45,7 +45,12 @@ def test_api_and_plugin_paths_never_fall_back_to_index(clean_db, dist):
     c = TestClient(create_app(web_dist=dist, allowed_hosts=(TEST_CLIENT_HOST,)))
     err(c.get("/api/v1/does-not-exist"), 404, "NOT_FOUND")
     err(c.get("/api"), 404, "NOT_FOUND")
-    err(c.get("/plugin/v1/does-not-exist"), 404, "NOT_FOUND")
+    # /plugin 先过入口闸：测试客户端缺省的对端与主机名（testclient / testserver）不是本机 → 403；本机客户端 → 404
+    err(c.get("/plugin/v1/does-not-exist"), 403, "FORBIDDEN")
+    local = local_client(create_app(web_dist=dist))
+    err(local.get("/plugin/v1/does-not-exist"), 404, "NOT_FOUND")
+    err(local.get("/plugin"), 404, "NOT_FOUND")
+    assert local.get("/orders").text == INDEX
     err(c.get("/api/v1/orders"), 401, "UNAUTHORIZED")            # 真正的接口照常工作
     assert c.get("/api/v1/openapi.json").json()["info"]["title"] == "采购控制台"
 

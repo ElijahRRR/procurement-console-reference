@@ -25,18 +25,22 @@ const ok = { outcome: "succeeded", amazon_order_no: "SIM-20261105-7", amounts: n
 const httpErr = (status, code, detail = {}) => ({ ok: false, error: { kind: "http", status, code, message: code, detail } });
 const netErr = { ok: false, error: { kind: "network", status: null, code: "NETWORK", message: "无法连接服务端", detail: null } };
 
-test("回执的结论：送达（含迟到回执已记下）删、明确不收删、没说上话或 5xx 留着补交", () => {
+test("回执的结论：送达（含迟到回执已记下）删、明确不收删、没说上话或 5xx 留着补交；401（服务端暂时不认识这个浏览器）也留着", () => {
   assert.equal(classifyResultReply({ ok: true, status: 200, data: { duplicate: true } }), "delivered");
   const late = httpErr(409, "CONFLICT", { attempt_status: "unknown", late_receipt_recorded: true });
   assert.equal(isLateReceipt(late.error), true);
   assert.equal(classifyResultReply(late), "delivered");
   assert.equal(classifyResultReply(httpErr(409, "CONFLICT", { attempt_status: "succeeded" })), "drop");
   assert.equal(classifyResultReply(httpErr(404, "NOT_FOUND")), "drop");
-  assert.equal(classifyResultReply(httpErr(401, "UNAUTHORIZED")), "drop");
+  // 没有配对与撤销了：401 只表示服务端这会儿不认识这个浏览器，后台重新登记后再发；重新登记没成功时回执不能丢。
+  // 服务端真的换了库的话，重新登记之后这一笔得到 404，那才不再发。
+  assert.equal(classifyResultReply(httpErr(401, "UNAUTHORIZED")), "retry");
   assert.equal(classifyResultReply(httpErr(503, "INTERNAL")), "retry");
   assert.equal(classifyResultReply(netErr), "retry");
   assert.equal(classifyResultReply({ ok: false, error: { kind: "network", status: null, code: "SW_UNAVAILABLE", message: "x", detail: null } }), "retry");
-  assert.equal(isRetryableResultError(httpErr(null, "NOT_PAIRED").error), false, "本地错误（没配对）不是「没说上话」");
+  // 还没连上服务端：后台按「没说上话」返回（请求没有发出去），回执留着
+  assert.equal(classifyResultReply({ ok: false, error: { kind: "network", status: null, code: "NOT_REGISTERED", message: "还没有连上服务端", detail: null } }), "retry");
+  assert.equal(isRetryableResultError(httpErr(null, "DEVICE_BUSY").error), false, "本地的明确拒绝（请求没发、结论已定）不是「没说上话」");
 });
 
 test("存回执：同一笔同一份不重置；先由发起的一路自己送，宽限之后后台才补交；补交按退避", () => {
@@ -113,12 +117,12 @@ test("回执的补交时机：后台启动、心跳成功时不等退避；引�
   assert.deepEqual(dueReceipts(s, NOW - 600_000 + RECEIPT_MAX_AGE_MS + 1, { ignoreBackoff: true }).map((r) => r.attempt_id), [7], "超过 24 小时的不再补交");
 });
 
-test("回执的结论覆盖真实服务端的几种答复：200 duplicate 送达；409 迟到回执送达；其他 409 与 401 不再发；5xx 与断网留着", () => {
+test("回执的结论覆盖真实服务端的几种答复：200 duplicate 送达；409 迟到回执送达；其他 409 不再发；401、5xx 与断网留着", () => {
   assert.equal(classifyResultReply({ ok: true, status: 200, data: { attempt_status: "succeeded", duplicate: true } }), "delivered");
   assert.equal(classifyResultReply(httpErr(409, "CONFLICT", { attempt_status: "unknown", order_status: "result_unknown", late_receipt_recorded: true })), "delivered");
   assert.equal(classifyResultReply(httpErr(409, "CONFLICT", { attempt_status: "succeeded", reported: "failed" })), "drop");
   assert.equal(classifyResultReply(httpErr(409, "LEASE_LOST")), "drop");
-  assert.equal(classifyResultReply(httpErr(401, "UNAUTHORIZED")), "drop");
+  assert.equal(classifyResultReply(httpErr(401, "UNAUTHORIZED")), "retry");
   assert.equal(classifyResultReply(httpErr(500, "INTERNAL")), "retry");
   assert.equal(classifyResultReply(httpErr(503, "HTTP_503")), "retry");
   assert.equal(classifyResultReply(netErr), "retry");

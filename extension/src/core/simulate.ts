@@ -80,7 +80,11 @@ export function attemptPostalCode(a: Attempt): string | null {
   return null;
 }
 
-/** 输入：尝试载荷、模拟结局、当前时刻 → 输出：模拟的结算页事实（契约 §4 的形状）。
+/** 输入：尝试载荷、模拟结局、当前时刻、这一刻页面上读到的买家号 ID（读不到为 null）
+ *  → 输出：模拟的结算页事实（契约 §4 的形状）。
+ *
+ *  买家号 ID 是**读**来的，不是推出来的：模拟执行不打开结算页，就取当前页面的读数。读不到保持 null，
+ *  服务端护栏的 buyer 项按数据不可靠拦截 —— 不拿尝试载荷或开始批次时的 ID 顶替。
  *
  *  正常（pass）：
  *    subtotal = unit_price × quantity；shipping = 0；tax = 0；total = subtotal；
@@ -88,7 +92,7 @@ export function attemptPostalCode(a: Attempt): string | null {
  *    币种 USD；配送方 amazon。
  *  price_over_cap：total = 限价 + 1（限价读不到则 total 为 null，服务端按数据不可靠拦截）。
  *  delivery_too_long：送达日期 = 洛杉矶今天 + 配送上限 + 1（上限读不到则日期为 null）。 */
-export function buildCheckoutFacts(a: Attempt, outcome: SimOutcome, now: number): CheckoutFacts {
+export function buildCheckoutFacts(a: Attempt, outcome: SimOutcome, now: number, customerId: string | null = null): CheckoutFacts {
   const unit = toCents(a.unit_price);
   const qty = a.quantity !== null && Number.isInteger(a.quantity) && a.quantity > 0 ? a.quantity : null;
   const subtotal = unit !== null && qty !== null ? unit * qty : null;
@@ -127,6 +131,7 @@ export function buildCheckoutFacts(a: Attempt, outcome: SimOutcome, now: number)
     ship_to: { postal_code: attemptPostalCode(a) },
     card_last4: a.expected_card_last4 ?? null,
     fulfillment: "amazon",
+    customer_id: customerId ?? null,
   };
 }
 

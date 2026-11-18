@@ -30,12 +30,11 @@ const accountsApi = vi.hoisted(() => ({
   pauseAccount: vi.fn(),
   updateAccount: vi.fn(),
   createAccount: vi.fn(),
-  adoptCustomerId: vi.fn(),
+  listDiscovered: vi.fn(),
+  ignoreDiscovered: vi.fn(),
+  unignoreDiscovered: vi.fn(),
 }))
 vi.mock('@/api/accounts', () => accountsApi)
-
-const devicesApi = vi.hoisted(() => ({ listDevices: vi.fn() }))
-vi.mock('@/api/devices', () => devicesApi)
 
 const settingsApi = vi.hoisted(() => ({ getSettings: vi.fn(), updateSettings: vi.fn() }))
 vi.mock('@/api/settings', () => settingsApi)
@@ -270,8 +269,8 @@ function account(extra: Partial<Account> = {}): Account {
     id: 7, name: 'DEMO-环境-C', amazon_customer_id: 'A1DEMO00003', site: 'US', min_amount: '30.00', max_amount: null, daily_limit: 10,
     priority: 2, max_delivery_days: null, effective_max_delivery_days: 10, purchase_enabled: true, sync_enabled: false,
     execution_paused: true, pause_reason: '结果待核实：PO-DEMO-7', paused_at: '2026-11-05T01:05:00+00:00', pause_cause: 'result_unknown',
-    open_result_unknown: 0, purchase_mode: 'manual', schedule_times: [], default_device_id: null, expected_card_last4: null, notes: null,
-    quota_today: { limit: 10, used: 1, planned: 0, available: 9 }, devices: [], active_run: null,
+    open_result_unknown: 0, purchase_mode: 'manual', schedule_times: [], expected_card_last4: null, notes: null,
+    quota_today: { limit: 10, used: 1, planned: 0, available: 9 }, browsers: [], active_run: null,
     created_at: '2026-11-01T00:00:00+00:00', updated_at: '2026-11-05T01:05:00+00:00',
     ...extra,
   }
@@ -279,7 +278,7 @@ function account(extra: Partial<Account> = {}): Account {
 
 describe('账号：恢复执行前按最新的暂停起因提醒', () => {
   beforeEach(() => {
-    devicesApi.listDevices.mockResolvedValue({ total: 0, rows: [] })
+    accountsApi.listDiscovered.mockResolvedValue([])
     settingsApi.getSettings.mockResolvedValue({ default_max_delivery_days: 10, simulation_only: true, logistics_sync_time: '08:30', real_purchase_available: false })
   })
 

@@ -4,13 +4,17 @@
 - 错误统一为 JSON {code, message, detail}：
   DomainError → 它自己的 http_status；请求参数校验失败 → 422 VALIDATION「请求参数不正确」；
   框架层 404 / 405 → NOT_FOUND / METHOD_NOT_ALLOWED；其他异常 → 500 INTERNAL「服务器内部错误」（记日志，不把堆栈给客户端）。
-- 防跨站：/api/ 下的写请求必须带 `X-Requested-With: pc-console`，否则 403 FORBIDDEN（/plugin 用设备令牌，不检查）。
+- 防跨站：/api/ 下的写请求必须带 `X-Requested-With: pc-console`，否则 403 FORBIDDEN（/plugin 不检查这个头，
+  它有自己的入口闸）。
+- /plugin 入口闸（server/limits.PluginGateMiddleware，最外层）：只接受本机对端、本机 Host、非网页来源
+  （配置了 PC_PLUGIN_EXTENSION_IDS 时只接受名单里的扩展）、POST 必须是 JSON，否则 403 FORBIDDEN。
 - 防 DNS 重绑定（server/limits.HostOriginMiddleware）：Host 只接受本机地址、settings.host 与 PC_ALLOWED_HOSTS；
   /api 写请求带 Origin 时也要在名单里，否则 403 FORBIDDEN。
 - 请求体大小（server/limits.BodyLimitMiddleware，在认证之前）：POST /api/v1/imports 不超过 10 MB 加 multipart 余量，
   其他请求不超过 1 MB；不论有没有 Content-Length（分块上传也算），超过即 413。
-- 限速（server/ratelimit）：登录（IP + 用户名）与插件配对（IP）在窗口内失败过多 → 429 RATE_LIMITED（带 Retry-After）。
-- OPTIONS 一律 204（不做 CORS：插件从扩展 service worker 调用，凭 host 权限不需要预检）。
+- 限速（server/ratelimit）：登录（IP + 用户名）在窗口内失败过多 → 429 RATE_LIMITED（带 Retry-After）。
+- OPTIONS 一律 204（不做 CORS：插件从扩展 service worker 调用，凭 host 权限不需要预检；网页发来的预检拿不到
+  CORS 头，后面的请求由浏览器自己拦下）。
 - 前端：settings.web_dist（缺省 web/dist）存在时托管在 / 下，非 /api、/plugin 的 GET 找不到文件就回 index.html
   （单页应用回退）；不存在时 / 返回一段 JSON 提示。
 """
@@ -167,7 +171,8 @@ def create_app(web_dist: Path | str | None = None, *, allowed_hosts: tuple[str, 
     """输入：可选的前端构建目录（缺省 settings.web_dist）、额外接受的主机名（测试传 TEST_CLIENT_HOST）→
     输出：配置好路由、错误处理、中间件与前端托管的 FastAPI 应用。
 
-    中间件由外到内：Host / Origin 检查 → 请求体大小 → 失败限速 → OPTIONS / 防跨站 / 兜底 500 → 路由。
+    中间件由外到内：/plugin 入口闸 → Host / Origin 检查 → 请求体大小 → 失败限速 → OPTIONS / 防跨站 / 兜底 500
+    → 路由。
     """
     app = FastAPI(title="采购控制台", version="0.1.0", docs_url=None, redoc_url=None,
                   openapi_url=f"{API_PREFIX}/openapi.json")
@@ -176,14 +181,15 @@ def create_app(web_dist: Path | str | None = None, *, allowed_hosts: tuple[str, 
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
     app.middleware("http")(guard_middleware)
-    app.add_middleware(ratelimit.RateLimitMiddleware,
-                       rules=ratelimit.default_rules(f"{API_PREFIX}/auth/login", f"{PLUGIN_PREFIX}/pair"))
+    app.add_middleware(ratelimit.RateLimitMiddleware, rules=ratelimit.default_rules(f"{API_PREFIX}/auth/login"))
     app.add_middleware(limits.BodyLimitMiddleware,
                        limits={("POST", f"{API_PREFIX}/imports"): imports.MAX_UPLOAD_BYTES + UPLOAD_OVERHEAD_BYTES},
                        too_large=_too_large)
     s = settings.get()
     hosts = (s.host, *s.allowed_hosts, *allowed_hosts)
     app.add_middleware(limits.HostOriginMiddleware, allowed_hosts=[h for h in hosts if h not in ("0.0.0.0", "::")])
+    # 最外层：/plugin 的请求先过入口闸（不看上面的主机名单：测试用的 allowed_hosts 也放不进来）
+    app.add_middleware(limits.PluginGateMiddleware, extension_ids=s.plugin_extension_ids)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():

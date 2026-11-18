@@ -4,7 +4,7 @@
     python cli.py db_init                     # 库不存在时先建库，再建表（幂等）
     python cli.py user_create -p username=david -p workspace="我的工作区"     # 密码交互输入（不进命令历史）
     python cli.py feishu_grant -p workspace_id=2 -p app_token=bascn…        # 把飞书多维表格授权给工作区
-    python cli.py serve                       # HTTP 服务 + 后台调度
+    python cli.py serve                       # HTTP 服务 + 后台调度（库结构是旧版时拒绝启动，先跑 db_init）
     python cli.py allocate [-p workspace_id=1]
     python cli.py sweep
     python cli.py feishu_intake [-p connection_id=1]

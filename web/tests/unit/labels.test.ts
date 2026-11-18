@@ -17,6 +17,7 @@ const ordersPath = resolve(servicesDir, 'orders.py')
 const importsPath = resolve(servicesDir, 'imports.py')
 const executionPath = resolve(servicesDir, 'execution.py')
 const accountsPath = resolve(servicesDir, 'accounts.py')
+const devicesPath = resolve(servicesDir, 'devices.py')
 const haveRepo = [schemaPath, modelsPath, contractPath, ordersPath, executionPath, accountsPath].every((p) => existsSync(p))
 
 /** 输入：目录 → 输出：其下（含子目录，跳过 __pycache__ 与 tests）的全部 .py 文件 */
@@ -54,9 +55,9 @@ function checkValues(sql: string, table: string, column: string): string[] {
   return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1])
 }
 
-/** 输入：Python 源文件文本、元组名 → 输出：元组里的字符串 */
+/** 输入：Python 源文件文本、元组名 → 输出：元组里的字符串（定义可以带类型标注：NAME: tuple[str, ...] = (...)） */
 function pyTuple(src: string, name: string): string[] {
-  const m = new RegExp(`^${name} = \\(([\\s\\S]*?)\\)\\n`, 'm').exec(src)
+  const m = new RegExp(`^${name}(?:: [^=\\n]*)? = \\(([\\s\\S]*?)\\)\\n`, 'm').exec(src)
   if (!m) throw new Error(`没有元组 ${name}`)
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
 }
@@ -78,7 +79,6 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
     ['purchase_attempts', 'status', T.ATTEMPT_STATUSES],
     ['purchase_attempts', 'kind', T.ATTEMPT_KINDS],
     ['order_sources', 'kind', T.SOURCE_KINDS],
-    ['devices', 'identity_status', T.IDENTITY_STATUSES],
     ['buyer_accounts', 'purchase_mode', T.PURCHASE_MODES],
     ['writebacks', 'status', T.WRITEBACK_STATUSES],
     ['import_rows', 'verdict', T.IMPORT_VERDICTS],
@@ -119,6 +119,15 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
     const codes = [...(line ?? '').matchAll(/`([A-Z_]+)`/g)].map((m) => m[1])
     // 顺序也一致（前端错误码表按契约的顺序排）
     expect([...T.API_ERROR_CODES]).toEqual(codes)
+  })
+
+  it('统一错误码与 models.API_ERROR_CODES 同序', () => {
+    expect([...T.API_ERROR_CODES]).toEqual(pyTuple(models, 'API_ERROR_CODES'))
+  })
+
+  it('浏览器的登录状态（含解析结果）与 services/devices.PLUGIN_STATES 一致', () => {
+    expect(existsSync(devicesPath)).toBe(true)
+    expect(sorted(T.LOGIN_STATES)).toEqual(sorted(pyTuple(readFileSync(devicesPath, 'utf8'), 'PLUGIN_STATES')))
   })
 
   it('服务端会返回的错误码都在统一错误码里（services、server、api 里的 DomainError / code= / error_response）', () => {
@@ -218,8 +227,17 @@ describe.skipIf(!haveRepo)('前端枚举与后端定义一致', () => {
 
   it('执行批次结束原因与 schema.sql 注释一致', () => {
     const m = /end_reason\s+text,\s+-- ([^\n]+)/.exec(sql)
-    const reasons = (m?.[1] ?? '').split('/').map((s) => s.trim())
-    expect(sorted(T.RUN_END_REASONS)).toEqual(sorted(reasons))
+    // 注释里括号内是给历史行的说明（「历史行可能有 device_revoked」），不算现行取值
+    const reasons = (m?.[1] ?? '')
+      .replace(/（[^）]*）|\([^)]*\)/g, '')
+      .split('/')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    expect(reasons.length).toBeGreaterThan(0)
+    // 现行取值都在注释里；注释里多出来的只能是历史取值（标签表保留着它们）
+    for (const r of T.RUN_END_REASONS) expect(reasons).toContain(r)
+    const known: readonly string[] = [...T.RUN_END_REASONS, ...T.LEGACY_RUN_END_REASONS]
+    expect(reasons.filter((r) => !known.includes(r))).toEqual([])
   })
 
   it('人工核实结论与 schema.sql 注释一致', () => {
@@ -252,11 +270,12 @@ describe('每张标签表恰好覆盖对应枚举', () => {
     ['SUGGESTED_DATE_BASIS_LABEL', T.SUGGESTED_DATE_BASES, L.SUGGESTED_DATE_BASIS_LABEL],
     ['ALLOCATION_TRIGGER_LABEL', T.ALLOCATION_TRIGGERS, L.ALLOCATION_TRIGGER_LABEL],
     ['PURCHASE_MODE_LABEL', T.PURCHASE_MODES, L.PURCHASE_MODE_LABEL],
-    ['IDENTITY_STATUS_LABEL', T.IDENTITY_STATUSES, L.IDENTITY_STATUS_LABEL],
-    ['IDENTITY_STATUS_TAG', T.IDENTITY_STATUSES, L.IDENTITY_STATUS_TAG],
-    ['IDENTITY_STATUS_DOT', T.IDENTITY_STATUSES, L.IDENTITY_STATUS_DOT],
+    ['LOGIN_STATE_LABEL', T.LOGIN_STATES, L.LOGIN_STATE_LABEL],
+    ['LOGIN_STATE_TAG', T.LOGIN_STATES, L.LOGIN_STATE_TAG],
+    ['LOGIN_STATE_DOT', T.LOGIN_STATES, L.LOGIN_STATE_DOT],
     ['RUN_TRIGGER_LABEL', T.RUN_TRIGGERS, L.RUN_TRIGGER_LABEL],
-    ['RUN_END_REASON_LABEL', T.RUN_END_REASONS, L.RUN_END_REASON_LABEL],
+    // 历史批次上还有 device_revoked，标签保留
+    ['RUN_END_REASON_LABEL', [...T.RUN_END_REASONS, ...T.LEGACY_RUN_END_REASONS], L.RUN_END_REASON_LABEL],
     ['MEMBER_ROLE_LABEL', T.MEMBER_ROLES, L.MEMBER_ROLE_LABEL],
     ['IMPORT_VERDICT_LABEL', T.IMPORT_VERDICTS, L.IMPORT_VERDICT_LABEL],
     ['FEISHU_VERDICT_LABEL', T.FEISHU_VERDICTS, L.FEISHU_VERDICT_LABEL],
@@ -290,8 +309,33 @@ describe('每张标签表恰好覆盖对应枚举', () => {
   })
 
   it('el-tag 类型只用 Element Plus 认的五种', () => {
-    const tagMaps = [L.ORDER_STATUS_TAG, L.ATTEMPT_STATUS_TAG, L.REVIEW_STATUS_TAG, L.IDENTITY_STATUS_TAG, L.VERDICT_TAG, L.BATCH_STATUS_TAG, L.WRITEBACK_STATUS_TAG, L.WRITEBACK_STATE_TAG]
+    const tagMaps = [L.ORDER_STATUS_TAG, L.ATTEMPT_STATUS_TAG, L.REVIEW_STATUS_TAG, L.LOGIN_STATE_TAG, L.VERDICT_TAG, L.BATCH_STATUS_TAG, L.WRITEBACK_STATUS_TAG, L.WRITEBACK_STATE_TAG]
     for (const m of tagMaps) for (const t of Object.values(m)) expect(['primary', 'success', 'warning', 'danger', 'info']).toContain(t)
+  })
+
+  it('统一错误码按定稿的顺序排（契约 §8、插件的 SERVER_CODE_LABEL 同序）', () => {
+    expect([...T.API_ERROR_CODES]).toEqual([
+      'UNAUTHORIZED', 'FORBIDDEN', 'NOT_FOUND', 'VALIDATION', 'CONFLICT', 'ACCOUNT_BUSY', 'DEVICE_BUSY', 'ATTEMPT_IN_FLIGHT',
+      'IDENTITY_MISMATCH', 'ACCOUNT_NOT_REGISTERED', 'ACCOUNT_PAUSED', 'REAL_PURCHASE_DISABLED', 'LEASE_LOST', 'SLOT_DONE',
+      'WORKSPACE_REQUIRED', 'PLUGIN_OUTDATED', 'FEISHU_NOT_CONFIGURED', 'FEISHU_ERROR', 'INVALID_TRANSITION', 'SOURCE_CHANGED',
+      'GUARD_BLOCKED', 'RATE_LIMITED', 'METHOD_NOT_ALLOWED', 'INTERNAL',
+    ])
+    expect(T.API_ERROR_CODES as readonly string[]).not.toContain('NOT_BOUND')
+  })
+
+  it('执行入口改造后的事件 kind 有中文名；不再产生的旧 kind 标签保留（历史记录还要显示）', () => {
+    const current = ['device.registered', 'device.removed', 'device.identity_changed', 'account.buyer_id_ignored', 'account.buyer_id_unignored']
+    const legacy = ['device.paired', 'device.pairing_code_created', 'device.revoked', 'account.customer_id_adopted']
+    for (const k of [...current, ...legacy]) expect(L.eventKindLabel(k)).not.toBe(k)
+    // 现行的说法里不出现「设备」「绑定」「配对」
+    for (const k of current) expect(L.eventKindLabel(k)).not.toMatch(/设备|绑定|配对/)
+    expect(L.EVENT_ENTITY_LABEL.device).toBe('浏览器')
+    expect(L.RUN_END_REASON_LABEL.device_revoked).not.toMatch(/设备/)
+  })
+
+  it('现行的错误码与叫停原因的中文里不出现「设备」「绑定」「配对」', () => {
+    const all = [...Object.values(L.API_ERROR_LABEL), ...Object.values(L.PLUGIN_ERROR_LABEL), ...Object.values(L.PROGRESS_CANCEL_LABEL), ...Object.values(L.LOGIN_STATE_LABEL)]
+    for (const text of all) expect(text).not.toMatch(/设备|绑定|配对/)
   })
 
   it('执行所需字段都有中文名（missing_fields 展示）', () => {

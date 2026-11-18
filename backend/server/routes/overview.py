@@ -14,5 +14,7 @@ router = APIRouter(tags=["overview"])
 @router.get("/overview")
 def get_overview(ctx: deps.Console = Depends(deps.console)):
     """输入：当前会话 → 输出：{bj_date, counts, needs_attention, today_executable, future_assigned, accounts, devices,
-    recent_exceptions, last_allocation, simulation_only, feishu_configured}。"""
+    discovered_buyers, recent_exceptions, last_allocation, simulation_only, feishu_configured}。
+
+    devices（浏览器）只计未移除的；discovered_buyers = 未忽略的待登记买家号个数。"""
     return respond(overview_svc.overview(ctx.conn, ctx.workspace_id))

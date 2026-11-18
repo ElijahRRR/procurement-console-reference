@@ -1,13 +1,24 @@
 <script setup lang="ts">
-/** 新建 / 编辑买家账号：金额区间、每日额度、优先级、配送上限（留空继承全局）、执行模式与时间、默认设备、卡尾号、开关。 */
+/**
+ * 新建 / 编辑买家账号：买家号 ID、金额区间、每日额度、优先级、配送上限（留空继承全局）、执行模式与时间、卡尾号、开关。
+ * 带 preset 打开 = 登记一个插件读到的买家号：买家号 ID 已填好（不可改），名称用来源里的名称预填，提交走新建接口。
+ */
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
-import type { Account, AccountInput, Device, PurchaseMode } from '@/api/types'
+import type { Account, AccountInput, PurchaseMode } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
+import { customerIdProblem, normalizeCustomerId } from '@/utils/accounts'
 import { blankToNull, hasAtMostTwoDecimals, normalizeMoneyInput, parseAmount } from '@/utils/format'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
 
-const props = defineProps<{ account: Account | null; devices: Device[]; defaultMaxDays: number | null }>()
+export interface AccountPreset {
+  /** 要登记的买家号 ID */
+  customerId: string
+  /** 来源数据里这个 ID 用过的「买家号」名称；没有为 null */
+  name?: string | null
+}
+
+const props = defineProps<{ account: Account | null; preset?: AccountPreset | null; defaultMaxDays: number | null }>()
 const visible = defineModel<boolean>({ default: false })
 const emit = defineEmits<{ saved: [account: Account] }>()
 
@@ -24,7 +35,6 @@ const form = reactive({
   max_delivery_days: 10 as number | undefined,
   purchase_mode: 'manual' as PurchaseMode,
   schedule_times: [] as string[],
-  default_device_id: null as number | null,
   expected_card_last4: '',
   purchase_enabled: true,
   sync_enabled: true,
@@ -32,18 +42,27 @@ const form = reactive({
 })
 
 const editing = computed(() => !!props.account)
-const boundDevices = computed(() =>
-  props.devices.filter((d) => !d.revoked_at && (!props.account || d.bound_account?.id === props.account.id)),
+/** 登记一个插件读到的买家号（新建账号，ID 已定） */
+const registering = computed(() => !props.account && !!props.preset?.customerId)
+/** 编辑时把已登记的买家号 ID 改成了别的值（或清空） */
+const customerIdChanged = computed(
+  () => editing.value && !!props.account?.amazon_customer_id && normalizeCustomerId(form.amazon_customer_id) !== props.account.amazon_customer_id,
 )
+const title = computed(() => {
+  if (props.account) return `编辑账号 · ${props.account.name}`
+  return registering.value ? `登记买家号 · ${props.preset?.customerId}` : '新建买家账号'
+})
+const actionName = computed(() => (editing.value ? '保存账号' : registering.value ? '登记买家号' : '创建账号'))
 
 const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`)
 
 watch(visible, (open) => {
   if (!open) return
   const a = props.account
+  const preset = a ? null : (props.preset ?? null)
   Object.assign(form, {
-    name: a?.name ?? '',
-    amazon_customer_id: a?.amazon_customer_id ?? '',
+    name: a?.name ?? preset?.name?.trim() ?? '',
+    amazon_customer_id: a?.amazon_customer_id ?? preset?.customerId ?? '',
     min_amount: a?.min_amount ?? '0.00',
     max_amount: a?.max_amount ?? '',
     daily_limit: a?.daily_limit ?? 20,
@@ -52,7 +71,6 @@ watch(visible, (open) => {
     max_delivery_days: a?.max_delivery_days ?? a?.effective_max_delivery_days ?? props.defaultMaxDays ?? 10,
     purchase_mode: a?.purchase_mode ?? 'manual',
     schedule_times: [...(a?.schedule_times ?? [])],
-    default_device_id: a?.default_device_id ?? null,
     expected_card_last4: a?.expected_card_last4 ?? '',
     purchase_enabled: a?.purchase_enabled ?? true,
     sync_enabled: a?.sync_enabled ?? true,
@@ -71,7 +89,16 @@ const moneyValidator = (allowEmpty: boolean) => (_r: unknown, v: string, cb: (e?
 
 const rules: FormRules = {
   name: [{ required: true, message: '请填写账号名称（与飞书「买家号」取值一致）', trigger: 'blur' }],
-  amazon_customer_id: [{ pattern: /^A[0-9A-Z]{8,}$/, message: '买家号 ID 以 A 开头，至少 9 位大写字母或数字', trigger: 'blur' }],
+  amazon_customer_id: [
+    {
+      validator: (_r: unknown, v: string, cb: (e?: Error) => void) => {
+        const problem = customerIdProblem(v)
+        if (problem) return cb(new Error(problem))
+        cb()
+      },
+      trigger: 'blur',
+    },
+  ],
   min_amount: [{ validator: moneyValidator(false), trigger: 'blur' }],
   max_amount: [
     { validator: moneyValidator(true), trigger: 'blur' },
@@ -100,9 +127,9 @@ const rules: FormRules = {
 
 async function submit() {
   if (!(await formRef.value?.validate().catch(() => false))) return
+  const customerId = normalizeCustomerId(form.amazon_customer_id)
   const body: AccountInput = {
     name: form.name.trim(),
-    amazon_customer_id: blankToNull(form.amazon_customer_id)?.toUpperCase() ?? null,
     min_amount: normalizeMoneyInput(form.min_amount) ?? '0.00',
     max_amount: normalizeMoneyInput(form.max_amount),
     daily_limit: form.daily_limit,
@@ -110,20 +137,21 @@ async function submit() {
     max_delivery_days: form.inherit_days ? null : (form.max_delivery_days ?? null),
     purchase_mode: form.purchase_mode,
     schedule_times: [...form.schedule_times].sort(),
-    default_device_id: form.default_device_id,
     expected_card_last4: blankToNull(form.expected_card_last4),
     purchase_enabled: form.purchase_enabled,
     sync_enabled: form.sync_enabled,
     notes: blankToNull(form.notes),
   }
+  // 编辑时只有改了买家号 ID 才带上它：账号正在执行时服务端不允许改 ID，别的字段照样能保存
+  if (!props.account || customerId !== (props.account.amazon_customer_id ?? null)) body.amazon_customer_id = customerId
   busy.value = true
   try {
     const saved = props.account ? await accountsApi.updateAccount(props.account.id, body) : await accountsApi.createAccount(body)
-    notifySuccess(editing.value ? '账号已保存' : '账号已创建', '分配会按新的配置重新计算。')
+    notifySuccess(editing.value ? '账号已保存' : registering.value ? '买家号已登记' : '账号已创建', '分配会按新的配置重新计算。')
     emit('saved', saved)
     visible.value = false
   } catch (e) {
-    notifyFailure(editing.value ? '保存账号' : '创建账号', e)
+    notifyFailure(actionName.value, e)
   } finally {
     busy.value = false
   }
@@ -131,16 +159,23 @@ async function submit() {
 </script>
 
 <template>
-  <el-dialog v-model="visible" :title="editing ? `编辑账号 · ${account?.name}` : '新建买家账号'" width="760px" top="5vh" append-to-body :close-on-click-modal="false">
+  <el-dialog v-model="visible" :title="title" width="760px" top="5vh" append-to-body :close-on-click-modal="false">
     <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
       <div class="grid gap-x-6 md:grid-cols-2">
         <el-form-item label="账号名称" prop="name">
           <el-input v-model="form.name" placeholder="与飞书「买家号」一致，如 环境-DEMO-01" />
         </el-form-item>
-        <el-form-item label="买家号 ID（可选）" prop="amazon_customer_id">
-          <el-input v-model="form.amazon_customer_id" placeholder="A 开头，如 A1DEMO0000；也可在设备页采用插件识别的 ID" />
+        <el-form-item :label="registering ? '买家号 ID' : '买家号 ID（可选）'" prop="amazon_customer_id">
+          <el-input v-model="form.amazon_customer_id" class="font-mono" :readonly="registering" placeholder="A 开头，如 A1DEMO00000" aria-label="买家号 ID" />
         </el-form-item>
       </div>
+      <p class="-mt-3 mb-4 text-xs text-gray-500 dark:text-dark-400">
+        <template v-if="registering">买家号 ID 由插件从浏览器登录的亚马逊页面读出。登记后，登录着这个买家号的浏览器就能领取这个账号的任务；请确认名称、金额区间与每日单数。</template>
+        <template v-else>亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。</template>
+        <span v-if="customerIdChanged" class="mt-1 block text-amber-700 dark:text-amber-400">
+          修改买家号 ID 后，这个账号的任务改由登录着新买家号的浏览器执行；账号正在执行或有结果待核实的采购时不能修改。
+        </span>
+      </p>
       <div class="grid gap-x-6 md:grid-cols-4">
         <el-form-item label="金额下限（USD）" prop="min_amount">
           <el-input v-model="form.min_amount" placeholder="0.00"><template #prefix>$</template></el-input>
@@ -191,11 +226,9 @@ async function submit() {
           </el-select>
         </el-form-item>
       </div>
-      <el-form-item label="定时执行的默认设备">
-        <el-select v-model="form.default_device_id" class="w-full" clearable placeholder="不指定（任一已绑定且在线的设备）">
-          <el-option v-for="d in boundDevices" :key="d.id" :value="d.id" :label="d.name" />
-        </el-select>
-      </el-form-item>
+      <p class="-mt-3 mb-4 text-xs text-gray-500 dark:text-dark-400">
+        定时执行：到点后，由登录着这个买家号并开着亚马逊页面的浏览器自动开始；同一个时间点每天只执行一次。
+      </p>
       <div class="mb-5 divide-y divide-gray-100 rounded-xl border border-gray-100 dark:divide-dark-700 dark:border-dark-700">
         <div class="flex items-center justify-between gap-4 px-4 py-3">
           <div>
@@ -218,7 +251,7 @@ async function submit() {
     </el-form>
     <template #footer>
       <el-button @click="visible = false">取消</el-button>
-      <el-button type="primary" :loading="busy" @click="submit">{{ editing ? '保存' : '创建' }}</el-button>
+      <el-button type="primary" :loading="busy" @click="submit">{{ editing ? '保存' : registering ? '登记' : '创建' }}</el-button>
     </template>
   </el-dialog>
 </template>

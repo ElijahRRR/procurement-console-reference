@@ -72,8 +72,12 @@ export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number]
 export const SUGGESTED_DATE_BASES = ['source', 'computed'] as const
 export type SuggestedDateBasis = (typeof SUGGESTED_DATE_BASES)[number]
 
-export const IDENTITY_STATUSES = ['unknown', 'match', 'mismatch', 'signed_out'] as const
-export type IdentityStatus = (typeof IDENTITY_STATUSES)[number]
+/**
+ * 浏览器的登录状态（GET /devices 的 login.state，含解析结果；插件心跳用同一套取值）：
+ * 还没有上报 / 未登录 / 已登录但没读到买家号 ID / 各标签页读数不一致 / 买家号还没登记 / 买家号已忽略 / 已登记（对应一个账号）。
+ */
+export const LOGIN_STATES = ['unknown', 'signed_out', 'no_id', 'conflict', 'unregistered', 'ignored', 'ready'] as const
+export type LoginState = (typeof LOGIN_STATES)[number]
 
 export const PURCHASE_MODES = ['manual', 'scheduled'] as const
 export type PurchaseMode = (typeof PURCHASE_MODES)[number]
@@ -99,8 +103,11 @@ export type SyncTrigger = (typeof SYNC_TRIGGERS)[number]
 export const RUN_TRIGGERS = ['manual', 'scheduled'] as const
 export type RunTrigger = (typeof RUN_TRIGGERS)[number]
 
-export const RUN_END_REASONS = ['finished', 'lease_expired', 'device_revoked', 'simulation_reset'] as const
+export const RUN_END_REASONS = ['finished', 'lease_expired', 'simulation_reset'] as const
 export type RunEndReason = (typeof RUN_END_REASONS)[number]
+/** 现在不再产生、但历史批次上还留着的结束原因（标签保留，旧记录还要显示） */
+export const LEGACY_RUN_END_REASONS = ['device_revoked'] as const
+export type LegacyRunEndReason = (typeof LEGACY_RUN_END_REASONS)[number]
 
 export const ALLOCATION_TRIGGERS = ['intake', 'import', 'manual', 'account_change', 'daily'] as const
 export type AllocationTrigger = (typeof ALLOCATION_TRIGGERS)[number]
@@ -169,7 +176,7 @@ export const PLUGIN_ERROR_CODES = [
 ] as const
 export type PluginErrorCode = (typeof PLUGIN_ERROR_CODES)[number]
 
-/** 统一错误码（§8） */
+/** 统一错误码（§8；顺序与契约、插件的 SERVER_CODE_LABEL 相同） */
 export const API_ERROR_CODES = [
   'UNAUTHORIZED',
   'FORBIDDEN',
@@ -177,12 +184,16 @@ export const API_ERROR_CODES = [
   'VALIDATION',
   'CONFLICT',
   'ACCOUNT_BUSY',
+  'DEVICE_BUSY',
   'ATTEMPT_IN_FLIGHT',
   'IDENTITY_MISMATCH',
-  'NOT_BOUND',
+  'ACCOUNT_NOT_REGISTERED',
   'ACCOUNT_PAUSED',
   'REAL_PURCHASE_DISABLED',
   'LEASE_LOST',
+  'SLOT_DONE',
+  'WORKSPACE_REQUIRED',
+  'PLUGIN_OUTDATED',
   'FEISHU_NOT_CONFIGURED',
   'FEISHU_ERROR',
   'INVALID_TRANSITION',
@@ -379,8 +390,8 @@ export interface OrderSource {
   snapshot: Record<string, unknown>
 }
 
-/** 护栏检查项（services/guard.CHECK_ORDER 的顺序） */
-export const GUARD_CHECK_KEYS = ['item', 'zip', 'subtotal', 'price_cap', 'delivery', 'data', 'card'] as const
+/** 护栏检查项（services/guard.CHECK_ORDER 的顺序）；buyer = 结算页登录的买家号必须是批次账号登记的买家号 ID */
+export const GUARD_CHECK_KEYS = ['buyer', 'item', 'zip', 'subtotal', 'price_cap', 'delivery', 'data', 'card'] as const
 export type GuardCheckKey = (typeof GUARD_CHECK_KEYS)[number]
 
 /** 护栏单项结果（services/guard.evaluate）：ok 为 true 通过 / false 不通过 / null 缺数据无法判定 */
@@ -523,14 +534,17 @@ export interface Overview {
   today_executable: number
   future_assigned: number
   accounts: { total: number; enabled: number; paused: number }
+  /** 装了插件的浏览器（只算没有移除的） */
   devices: { total: number; online: number }
+  /** 插件读到、还没登记也没忽略的买家号个数 */
+  discovered_buyers?: number
   recent_exceptions: OrderRow[]
   last_allocation: AllocationSummary | null
   simulation_only: boolean
   feishu_configured: boolean
 }
 
-// ── 账号与设备 ────────────────────────────────────────────────────────────────
+// ── 账号与浏览器 ──────────────────────────────────────────────────────────────
 
 export interface QuotaToday {
   limit: number
@@ -539,11 +553,11 @@ export interface QuotaToday {
   available: number
 }
 
-export interface AccountDevice {
+/** 一个装了插件的浏览器的简要信息（账号的「所在浏览器」、待登记买家号的来源浏览器） */
+export interface BrowserRef {
   id: number
   name: string
   online: boolean
-  identity_status: IdentityStatus
   last_seen_at: Timestamp | null
 }
 
@@ -576,11 +590,11 @@ export interface Account {
   open_result_unknown?: number
   purchase_mode: PurchaseMode
   schedule_times: string[]
-  default_device_id: number | null
   expected_card_last4: string | null
   notes: string | null
   quota_today: QuotaToday
-  devices: AccountDevice[]
+  /** 当前登录着这个账号的买家号的浏览器（没有移除的）；账号没登记买家号 ID 时为空 */
+  browsers: BrowserRef[]
   active_run: ActiveRun | null
   created_at: Timestamp
   updated_at: Timestamp
@@ -599,36 +613,52 @@ export interface AccountInput {
   sync_enabled?: boolean
   purchase_mode?: PurchaseMode
   schedule_times?: string[]
-  default_device_id?: number | null
   expected_card_last4?: string | null
   notes?: string | null
 }
 
-export interface DeviceIdentity {
-  signed_in: boolean
-  customer_id: string | null
-  site: string | null
-  page_url: string | null
-  at: Timestamp | null
+/**
+ * 插件读到、还没登记到任何账号的买家号（GET /accounts/discovered 的一项）：按买家号 ID 聚合，
+ * browsers 是当前登录着它的浏览器，name_hint 是来源数据里这个 ID 最近用过的「买家号」名称（查不到为 null）。
+ */
+export interface DiscoveredBuyer {
+  customer_id: string
+  ignored: boolean
+  browsers: BrowserRef[]
+  last_reported_at: Timestamp | null
+  name_hint: string | null
 }
 
+/** 浏览器当前的登录状态：state 含解析结果；stale = 太久没有上报（执行前要重新上报） */
+export interface DeviceLogin {
+  state: LoginState
+  customer_id: string | null
+  at: Timestamp | null
+  stale: boolean
+}
+
+/** 浏览器上未结束的执行批次 */
+export interface DeviceRun {
+  id: number
+  account_id: number
+  started_at: Timestamp
+  simulated: boolean
+}
+
+/** 一个装了插件的浏览器（接口路径与字段沿用 device） */
 export interface Device {
   id: number
   name: string
-  browser: string | null
   ext_version: string | null
-  bound_account: Ref | null
   online: boolean
   last_seen_at: Timestamp | null
-  identity: DeviceIdentity | null
-  identity_status: IdentityStatus
   created_at: Timestamp
-  revoked_at: Timestamp | null
-}
-
-export interface PairingCode {
-  code: string
-  expires_at: Timestamp
+  /** 从列表里移除的时刻；没有移除为 null（插件再次联系服务端时自动清空） */
+  hidden_at: Timestamp | null
+  login: DeviceLogin
+  /** login.state = ready 时对应的账号；execution_paused 服务端给了就用，没给时由页面按账号列表补 */
+  account: (Ref & { execution_paused?: boolean }) | null
+  active_run: DeviceRun | null
 }
 
 // ── 设置 ──────────────────────────────────────────────────────────────────────

@@ -1,14 +1,16 @@
-/** 身份快照（契约 §5.3）与页面类型判断（纯函数）。
+/** 身份快照（规格 §2.3）与页面类型判断（纯函数）。
  *
- * 身份 = 这个浏览器环境此刻登着哪个亚马逊买家账号。只从页面上读（导航栏与内联脚本里的
+ * 身份 = 这个浏览器环境此刻登着哪个亚马逊买家号。只从页面上读（导航栏的登录状态、内联脚本里的
  * customerId），**不读 Cookie**：插件不申请 cookies 权限，登录状态留在浏览器里。
  * 不上传页面 HTML，page_url 只留 origin + pathname（不带查询串，查询串里常有订单号等信息）。
+ *
+ * 买家号 ID 就是「领谁的任务」的依据：服务端按上报的 ID 找账号，没有设备与账号的绑定。
  */
 
-import type { Identity, IdentityStatus } from "./types.js";
-import type { LoginState } from "../dom/parse.js";
+import type { Identity } from "./types.js";
+import type { PageLogin } from "../dom/parse.js";
 
-/** 本地保存的身份快照：上报体 + 读取时刻。 */
+/** 本地保存的身份快照：上报体 + 读取时刻。单页读数的 conflict 恒为 false（分歧是多页对账的结论）。 */
 export interface IdentitySnapshot extends Identity {
   at: number;
   /** 读到它的那一页的加载时刻（performance.timeOrigin，epoch 毫秒）。内容脚本总会带上；缺失按 at。 */
@@ -38,7 +40,7 @@ export function sanitizePageUrl(href: string | null | undefined): string | null 
 /** 输入：登录状态、读到的买家号 ID、页面地址、当前时刻 → 输出：身份快照；
  *  登录状态读不出来（unknown）时返回 null —— 「这一轮没读到」不是一个结论，不上报。 */
 export function identityFromPage(
-  login: LoginState,
+  login: PageLogin,
   customerId: string | null | undefined,
   href: string | null | undefined,
   now: number,
@@ -51,12 +53,13 @@ export function identityFromPage(
     customer_id: signedIn ? customerId ?? null : null,
     site: "US",
     page_url: sanitizePageUrl(href),
+    conflict: false,
     at: now,
   };
 }
 
-/** 输入：两份快照 → 输出：登录状态与买家号 ID 是否相同（页面地址与时刻不算）。 */
-export function sameIdentity(a: Identity | null | undefined, b: Identity | null | undefined): boolean {
+/** 输入：两份快照 → 输出：登录状态与买家号 ID 是否相同（页面地址、时刻、有没有分歧不算）。 */
+export function sameIdentity(a: Pick<Identity, "signed_in" | "customer_id" | "site"> | null | undefined, b: Pick<Identity, "signed_in" | "customer_id" | "site"> | null | undefined): boolean {
   if (!a || !b) return false;
   return a.signed_in === b.signed_in && (a.customer_id ?? null) === (b.customer_id ?? null) && a.site === b.site;
 }
@@ -66,25 +69,20 @@ export function isFresh(s: IdentitySnapshot | null | undefined, now: number, max
   return !!s && typeof s.at === "number" && now - s.at <= maxAgeMs && now >= s.at - 60_000;
 }
 
-/** 输入：快照 → 输出：上报体（去掉本地的读取时刻）。 */
+/** 输入：快照（单页读数或对账结论）→ 输出：上报体（去掉本地的读取时刻）。
+ *  **conflict 不能丢**：各标签页读数有分歧时，服务端靠它把登录状态记为 conflict（不解析账号、
+ *  不让开始批次；进行中的批次按买家号不符处理）。只在插件自己「不开始」是不够的。 */
 export function toIdentity(s: IdentitySnapshot): Identity {
-  return { signed_in: s.signed_in, customer_id: s.customer_id ?? null, site: "US", page_url: s.page_url ?? null };
+  return { signed_in: s.signed_in, customer_id: s.customer_id ?? null, site: "US", page_url: s.page_url ?? null, conflict: s.conflict === true };
 }
 
-/** 输入：买家号 ID → 输出：日志与界面上显示的遮掩形式（前 4 位 + … + 后 2 位）；完整值只发给服务端。 */
+/** 输入：买家号 ID → 输出：**日志里**用的遮掩形式（前 4 位 + … + 后 2 位）。
+ *  面板、弹出页、设置页上显示完整的 ID 并可复制（所有者要拿它去控制台登记）；日志会被截图、转发，继续遮掩。 */
 export function maskCustomerId(id: string | null | undefined): string {
   if (!id) return "—";
   if (id.length <= 6) return id;
   return `${id.slice(0, 4)}…${id.slice(-2)}`;
 }
-
-/** 身份状态的中文说明（契约 §5.3：match / mismatch / signed_out / unknown）。 */
-export const IDENTITY_STATUS_TEXT: Record<IdentityStatus, { short: string; long: string; tone: "success" | "danger" | "warning" | "muted" }> = {
-  match: { short: "身份一致", long: "已登录绑定的买家账号", tone: "success" },
-  mismatch: { short: "身份不一致", long: "当前浏览器登录的亚马逊账号不是绑定账号，服务端不会下发任务", tone: "danger" },
-  signed_out: { short: "未登录亚马逊", long: "请在本浏览器登录绑定的买家账号", tone: "warning" },
-  unknown: { short: "身份未知", long: "账号还没有登记买家号 ID，或还没有收到身份上报；可在控制台「采用插件识别的 ID」", tone: "muted" },
-};
 
 /** 输入：页面路径 → 输出：是不是订单历史页（这些页面上默认展开面板）。 */
 export function isOrderHistoryPath(pathname: string | null | undefined): boolean {
@@ -104,11 +102,17 @@ export function isOrderHistoryPath(pathname: string | null | undefined): boolean
 //   · 比「谁更新」只看页面的加载时刻（loaded_at），不看重读的时刻（read_at）；
 //     较早加载的页面的读数永远不能覆盖较新加载的页面的读数；
 //   · 标签页关掉或离开那一页之后，它的读数不再代表一张开着的页面，但如果它是本浏览器**最新加载**的一份，
-//     仍然留作证据（例如：新标签页里登录了另一个买家号又关掉，旧标签页还显示绑定账号 —— 不能因此算一致）；
+//     仍然留作证据（例如：新标签页里登录了另一个买家号又关掉，旧标签页还显示原来的买家号 —— 不能因此算一致）；
 //   · 「已登录、但没读到买家号 ID」的读数是弱证据：它不制造分歧，也**不取代、不作废**读到 ID 或显示未登录的
 //     读数（强证据）—— 同一个标签页跳到一张读不出 ID 的新页面、或开了一张这样的新标签页，之前那份强证据照样留着；
-//   · 读数之间不一致时，**绝不报「是绑定账号」**：报加载最新、且不是绑定账号的那一份，
-//     服务端据此判为「身份不一致」或「未登录」，拒绝领取；刷新或关掉较早打开的标签页后分歧消除。
+//   · 读数之间不一致时，上报体带 conflict = true：服务端把登录状态记为 conflict，不解析账号、不让开始批次；
+//     插件自己也不开始。刷新或关掉较早打开的标签页后分歧消除。
+//   · 分歧时报哪一份，看有没有**基准**（本地有进行中的批次时 = 该批次账号的买家号 ID，开始批次时记下；否则没有）：
+//       - 有基准：**绝不报基准**。报加载最新、且不是基准的那一份 —— 即使服务端不看 conflict，
+//         这份读数也只会让进行中的批次在提交前中止，不会放行；
+//       - 没有基准：报加载最新的强证据。没有批次在跑，这份读数放行不了任何东西。
+//     基准**不是**「上一次上报解析出来的账号」：拿它当基准，两张标签页一新一旧时每次对账都避开上一次报的那个，
+//     上报会在两个买家号之间来回翻。
 
 /** 一个标签页里、一次页面加载读到的身份。 */
 export interface IdentityObservation {
@@ -223,16 +227,18 @@ function kindOf(o: { signed_in: boolean; customer_id: string | null }): ReadingK
   return o.customer_id ? `in:${o.customer_id}` : "in?";
 }
 
-/** 输入：仓库、绑定账号的买家号 ID（不知道为 null）、当前时刻 → 输出：要上报的身份；一份读数都没有为 null。
+/** 输入：仓库、基准（本地有进行中的批次时 = 该批次账号的买家号 ID，否则 null）、当前时刻
+ *  → 输出：要上报的身份；一份读数都没有为 null。
  *
  *  1. 候选 = 所有开着的页面的读数 + 留作证据的那一份已关闭页面的读数（比所有开着的强证据都新时），
  *     按加载时刻从新到旧；
  *  2. 「已登录、但没读到买家号 ID」的读数是弱证据：只要有读到 ID 的已登录读数，它不制造分歧；
  *     它也不取代、不作废读到 ID 或显示未登录的读数（见 observeIdentity / retireIdentityTab）；
  *  3. 候选一致 → 报加载最新的那一份（有 ID 的优先），新鲜度取候选里最近的一次读取；
- *  4. 不一致 → 报加载最新、且不是「已登录绑定账号」的那一份，conflict = true，新鲜度取当前时刻
- *     （这个结论只会让服务端拒绝，不会放行）。 */
-export function reconcileIdentity(store: IdentityStore, boundCustomerId: string | null | undefined, now: number): ReconciledIdentity | null {
+ *  4. 不一致 → conflict = true，新鲜度取当前时刻（这个结论只会让服务端拒绝，不会放行）：
+ *     有基准时报加载最新、且不是「已登录基准买家号」的那一份（绝不报基准）；
+ *     没有基准时报加载最新的强证据。 */
+export function reconcileIdentity(store: IdentityStore, baselineCustomerId: string | null | undefined, now: number): ReconciledIdentity | null {
   const live = Object.values(store.live);
   // 只和开着的**强证据**比：一张读不出 ID 的新页面不能让已关闭页面上的另一个买家号（或未登录）出局。
   const newestStrongLive = live.reduce((m, o) => (isStrong(o) ? Math.max(m, o.loaded_at) : m), -Infinity);
@@ -246,8 +252,9 @@ export function reconcileIdentity(store: IdentityStore, boundCustomerId: string 
   if (hasId) kinds.delete("in?");
   const conflict = kinds.size > 1;
 
+  const baseline = baselineCustomerId ? `in:${baselineCustomerId}` : null;
   const pick = conflict
-    ? cands.find((o) => { const k = kindOf(o); return k !== "in?" && k !== `in:${boundCustomerId ?? ""}`; }) ?? cands[0]!
+    ? cands.find((o) => { const k = kindOf(o); return k !== "in?" && k !== baseline; }) ?? cands[0]!
     : cands.find((o) => o.signed_in && !!o.customer_id) ?? cands[0]!;
   const at = conflict ? now : Math.max(...cands.map((o) => o.read_at));
   return {

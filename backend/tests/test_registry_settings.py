@@ -9,7 +9,8 @@ import pytest
 from registry import settings
 
 KEYS = ("PC_PORT", "PC_HOST", "PC_PG_DSN", "PC_WEB_DIST", "FEISHU_BASE_URL", "FEISHU_APP_ID", "FEISHU_APP_SECRET",
-        "PC_LEASE_TTL_S")
+        "PC_LEASE_TTL_S", "PC_MAX_DEVICES", "PC_DEVICE_RETENTION_DAYS", "PC_PLUGIN_EXTENSION_IDS", "PC_PAIRING_TTL_S",
+        "PC_PAIR_FAIL_LIMIT")
 
 
 @pytest.fixture()
@@ -76,3 +77,29 @@ def test_dotenv_quoted_value_with_trailing_comment_drops_the_quotes(clean_env, t
     assert s.feishu_app_id == "cli_demo_not_real"
     assert s.pg_dsn == "dbname=demo_db # 引号里原样保留"
     assert s.host == "\"127.0.0.1\"x"
+
+
+def test_browser_registration_settings_defaults_and_env(clean_env):
+    """执行入口改造后的参数：浏览器登记上限、闲置浏览器保留天数、允许调用 /plugin 的扩展 ID 名单。"""
+    s = settings.get()
+    assert s.max_devices == 500 and s.device_retention_days == 30 and s.plugin_extension_ids == ()
+    assert s.identity_fresh_s == 600
+    clean_env.setenv("PC_MAX_DEVICES", "40")
+    clean_env.setenv("PC_DEVICE_RETENTION_DAYS", "7")
+    clean_env.setenv("PC_PLUGIN_EXTENSION_IDS", " abcdefghijklmnopabcdefghijklmnop , ,PONMLKJIHGFEDCBAPONMLKJIHGFEDCBA ")
+    settings.reset_for_tests()
+    s = settings.get()
+    assert s.max_devices == 40 and s.device_retention_days == 7
+    assert s.plugin_extension_ids == ("abcdefghijklmnopabcdefghijklmnop", "ponmlkjihgfedcbaponmlkjihgfedcba")
+
+
+def test_pairing_settings_are_gone(clean_env):
+    """配对码相关的参数已删除：环境里留着旧变量也不会出现在设置里。"""
+    clean_env.setenv("PC_PAIRING_TTL_S", "900")
+    clean_env.setenv("PC_PAIR_FAIL_LIMIT", "5")
+    settings.reset_for_tests()
+    s = settings.get()
+    assert not hasattr(s, "pairing_ttl_s") and not hasattr(s, "pair_fail_limit")
+    assert "pairing_ttl_s" not in settings.Settings.__dataclass_fields__
+    assert "pair_fail_limit" not in settings.Settings.__dataclass_fields__
+

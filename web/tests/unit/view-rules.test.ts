@@ -4,6 +4,7 @@ import { ORDER_STATUSES } from '@/api/types'
 import { exceptionManual, preStartManual, uncoveredTitle } from '@/utils/overview'
 import type { Attempt, EventRecord, OrderConflict } from '@/api/types'
 import { isResultUnknownPause, resumeConfirmText, resumeNeedsCaution } from '@/utils/accounts'
+import { PLUGIN_ERROR_LABEL } from '@/utils/labels'
 import {
   STATUS_ALERT_TYPE,
   amazonOrderNoProblem,
@@ -99,7 +100,7 @@ function attempt(extra: Partial<Attempt> = {}): Attempt {
   }
 }
 function event(kind: string, detail: Record<string, unknown>, extra: Partial<EventRecord> = {}): EventRecord {
-  return { id: 1, entity: 'attempt', entity_id: 27, order_id: 7, at: '2026-11-05T02:00:00+00:00', actor_kind: 'device', actor_id: 7, actor_name: 'DEMO 设备', kind, detail, ...extra }
+  return { id: 1, entity: 'attempt', entity_id: 27, order_id: 7, at: '2026-11-05T02:00:00+00:00', actor_kind: 'device', actor_id: 7, actor_name: 'DEMO 浏览器', kind, detail, ...extra }
 }
 
 describe('事件摘要', () => {
@@ -111,7 +112,7 @@ describe('事件摘要', () => {
   })
   it('错误码、护栏拦截码显示中文；重复的文字只出现一次', () => {
     expect(eventSummary(event('attempt.aborted', { error_code: 'ABORTED_BY_SERVER', reason: '账号已暂停执行' }))).toBe(
-      '服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止 · 账号已暂停执行',
+      `${PLUGIN_ERROR_LABEL.ABORTED_BY_SERVER} · 账号已暂停执行`,
     )
     expect(eventSummary(event('attempt.guard_blocked', { code: 'PRICE_OVER_CAP', reasons: ['结算总额 $52.00 超过限价 $50.00'] }))).toBe('结算总额超过限价 · 结算总额 $52.00 超过限价 $50.00')
     expect(eventSummary(event('attempt.late_result', { amazon_order_no: 'SIM-20261105-27', reason: '插件迟到上报的结果：成功，亚马逊订单号 SIM-20261105-27，请据此核实' }))).toBe(

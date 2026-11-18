@@ -3,7 +3,7 @@
  * Playwright 截图脚本用 page.route() 把 /api/v1/** 交给 handleApi；评审阶段也可以直接复用。
  * 写操作只改内存里的一份 fixtures，刷新页面不保留。
  */
-import type { FeishuSyncResult, ImportCommitResult, OrderRow, OrderStatus, OrderView, SimulationResetResult, VerifyWritebackResult } from '../../src/api/types.ts'
+import type { Account, FeishuSyncResult, ImportCommitResult, OrderRow, OrderStatus, OrderView, SimulationResetResult, VerifyWritebackResult } from '../../src/api/types.ts'
 import { buildFixtures, type Fixtures } from './fixtures.ts'
 
 export interface MockOptions {
@@ -55,6 +55,44 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
   const state = { loggedIn: opts.loggedIn ?? true, needsSetup: opts.needsSetup ?? false }
   const feishuConfigured = opts.feishuConfigured ?? true
   fx.overview.feishu_configured = feishuConfigured
+
+  const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/
+  /** 输入：无 → 输出：无。按「账号上登记的 ID」「已忽略的 ID」重算每个浏览器的登录状态、账号的所在浏览器、待登记列表与概览计数 */
+  function syncBuyers(): void {
+    const registered = new Map(fx.accounts.filter((a) => a.amazon_customer_id).map((a) => [a.amazon_customer_id as string, a]))
+    const ignoredIds = new Set(fx.discovered.filter((x) => x.ignored).map((x) => x.customer_id))
+    for (const d of fx.devices) {
+      const id = d.login.customer_id
+      if (!id || !['ready', 'unregistered', 'ignored'].includes(d.login.state)) continue
+      const acc = registered.get(id)
+      d.login.state = acc ? 'ready' : ignoredIds.has(id) ? 'ignored' : 'unregistered'
+      d.account = acc ? { id: acc.id, name: acc.name } : null
+    }
+    const shown = fx.devices.filter((d) => !d.hidden_at)
+    const ref = (d: (typeof shown)[number]) => ({ id: d.id, name: d.name, online: d.online, last_seen_at: d.last_seen_at })
+    for (const a of fx.accounts) a.browsers = a.amazon_customer_id ? shown.filter((d) => d.login.customer_id === a.amazon_customer_id).map(ref) : []
+    const hints = new Map(fx.discovered.map((x) => [x.customer_id, x.name_hint]))
+    const open = [...new Set(shown.map((d) => d.login.customer_id).filter((id): id is string => !!id && !registered.has(id)))]
+    fx.discovered = open.map((id) => {
+      const on = shown.filter((d) => d.login.customer_id === id)
+      return {
+        customer_id: id,
+        ignored: ignoredIds.has(id),
+        browsers: on.map(ref),
+        last_reported_at: on.map((d) => d.login.at).filter((t): t is string => !!t).sort().at(-1) ?? null,
+        name_hint: hints.get(id) ?? null,
+      }
+    })
+    fx.overview.devices = { total: shown.length, online: shown.filter((d) => d.online).length }
+    fx.overview.discovered_buyers = fx.discovered.filter((x) => !x.ignored).length
+  }
+  /** 输入：请求体里的买家号 ID、当前账号 id → 输出：错误响应；可以写入时为 null */
+  function customerIdProblem(raw: unknown, selfId: number | null): MockResponse | null {
+    if (raw === null || raw === undefined || raw === '') return null
+    if (typeof raw !== 'string' || !CUSTOMER_ID_RE.test(raw)) return err(422, 'VALIDATION', '买家号 ID 以 A 开头，后面至少 8 位大写字母或数字', { field: 'amazon_customer_id' })
+    const other = fx.accounts.find((a) => a.amazon_customer_id === raw && a.id !== selfId)
+    return other ? err(409, 'CONFLICT', `买家号 ID ${raw} 已登记在账号「${other.name}」上`) : null
+  }
 
   function handle(method: string, url: URL, body: unknown): MockResponse {
     const path = url.pathname.replace(/^\/api\/v1/, '')
@@ -157,16 +195,63 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       return ok(d)
     }
 
-    // ── 账号与设备 ──
+    // ── 账号、待登记的买家号与浏览器 ──
     if (path === '/accounts' && m === 'GET') return ok(page(fx.accounts, q))
-    if (path === '/accounts' && m === 'POST') return ok({ ...fx.accounts[0], ...b, id: 99, quota_today: { limit: Number(b.daily_limit ?? 20), used: 0, planned: 0, available: Number(b.daily_limit ?? 20) }, devices: [], active_run: null })
+    if (path === '/accounts' && m === 'POST') {
+      // 登记 = 带 amazon_customer_id 的新建
+      const bad = customerIdProblem(b.amazon_customer_id, null)
+      if (bad) return bad
+      if (fx.accounts.some((a) => a.name === b.name)) return err(409, 'CONFLICT', `账号名称「${String(b.name)}」已存在`)
+      const limit = Number(b.daily_limit ?? 20)
+      const created: Account = {
+        ...fx.accounts[0],
+        amazon_customer_id: null,
+        execution_paused: false,
+        pause_reason: null,
+        paused_at: null,
+        pause_cause: null,
+        open_result_unknown: 0,
+        ...(b as Partial<Account>),
+        id: Math.max(98, ...fx.accounts.map((a) => a.id)) + 1,
+        effective_max_delivery_days: Number(b.max_delivery_days ?? fx.settings.default_max_delivery_days),
+        quota_today: { limit, used: 0, planned: 0, available: limit },
+        browsers: [],
+        active_run: null,
+        created_at: now.toISOString(),
+        updated_at: now.toISOString(),
+      }
+      fx.accounts.push(created)
+      syncBuyers()
+      return ok(created)
+    }
+    if (path === '/accounts/discovered' && m === 'GET') {
+      const all = q.get('include_ignored') === '1'
+      return ok({ items: fx.discovered.filter((x) => all || !x.ignored) })
+    }
+    if ((r = /^\/accounts\/discovered\/(ignore|unignore)$/.exec(path)) && m === 'POST') {
+      const id = String(b.customer_id ?? '')
+      if (!CUSTOMER_ID_RE.test(id)) return err(422, 'VALIDATION', '买家号 ID 以 A 开头，后面至少 8 位大写字母或数字', { field: 'customer_id' })
+      const item = fx.discovered.find((x) => x.customer_id === id)
+      if (item) item.ignored = r[1] === 'ignore'
+      syncBuyers()
+      return ok({ ok: true })
+    }
     if ((r = /^\/accounts\/(\d+)$/.exec(path))) {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
-      if (m === 'PATCH') Object.assign(a, b)
+      if (m === 'PATCH') {
+        if ('amazon_customer_id' in b && (b.amazon_customer_id ?? null) !== a.amazon_customer_id) {
+          // 填到已有账号 / 修改买家号 ID：执行中或有结果待核实时不允许
+          const bad = customerIdProblem(b.amazon_customer_id, a.id)
+          if (bad) return bad
+          if (a.active_run || (a.open_result_unknown ?? 0) > 0) return err(409, 'CONFLICT', '账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID')
+        }
+        Object.assign(a, b)
+        syncBuyers()
+      }
       return ok(a)
     }
-    if ((r = /^\/accounts\/(\d+)\/(pause|resume|adopt-customer-id)$/.exec(path)) && m === 'POST') {
+    if ((r = /^\/accounts\/(\d+)\/(pause|resume)$/.exec(path)) && m === 'POST') {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
       if (r[2] === 'pause') Object.assign(a, { execution_paused: true, pause_reason: String(b.reason ?? ''), paused_at: now.toISOString() })
@@ -174,18 +259,26 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       if (r[2] === 'resume') Object.assign(a, { execution_paused: false, pause_reason: null, paused_at: null, pause_cause: null })
       return ok(a)
     }
-    if (path === '/devices' && m === 'GET') return ok(page(fx.devices, q))
-    if (path === '/devices/pairing-codes' && m === 'POST') return ok({ code: 'DEMO7K2Q', expires_at: new Date(now.getTime() + 10 * 60_000).toISOString() })
-    if ((r = /^\/devices\/(\d+)(\/revoke)?$/.exec(path))) {
+    if (path === '/devices' && m === 'GET') {
+      const all = q.get('include_hidden') === '1'
+      // 没有移除的在前
+      const rows = fx.devices.filter((d) => all || !d.hidden_at).sort((x, y) => Number(!!x.hidden_at) - Number(!!y.hidden_at))
+      return ok(page(rows, q))
+    }
+    if ((r = /^\/devices\/(\d+)(\/remove)?$/.exec(path))) {
       const d = fx.devices.find((x) => x.id === Number(r![1]))
-      if (!d) return err(404, 'NOT_FOUND', '设备不存在')
-      if (r[2] && m === 'POST') Object.assign(d, { revoked_at: now.toISOString(), online: false })
+      if (!d) return err(404, 'NOT_FOUND', '浏览器不存在')
+      if (r[2] && m === 'POST') {
+        if (d.active_run) return err(409, 'CONFLICT', '这个浏览器正在执行，结束后才能移除')
+        d.hidden_at = now.toISOString()
+        syncBuyers()
+      }
       if (!r[2] && m === 'PATCH') {
-        if (typeof b.name === 'string') d.name = b.name
-        if ('bound_account_id' in b) {
-          const a = fx.accounts.find((x) => x.id === b.bound_account_id)
-          d.bound_account = a ? { id: a.id, name: a.name } : null
-        }
+        // 只能改名
+        const name = typeof b.name === 'string' ? b.name.trim() : ''
+        if (!name) return err(422, 'VALIDATION', '请填写浏览器名称', { field: 'name' })
+        d.name = name
+        syncBuyers()
       }
       return ok(d)
     }

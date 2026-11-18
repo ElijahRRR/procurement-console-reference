@@ -316,20 +316,33 @@ const scenes: Scene[] = [
     },
   },
   {
-    name: 'devices',
+    // 登记一个插件读到的买家号：账号对话框里 ID 已填、名称用来源里的名称预填
+    name: 'accounts-register',
+    fullPage: false,
+    themes: ['light'],
     run: async (page) => {
-      await page.goto(`${BASE}/accounts?tab=devices`)
-      await page.waitForSelector('#pane-devices .el-table__row')
+      await page.goto(`${BASE}/accounts?tab=accounts`)
+      await page.waitForSelector('[data-testid="discovered-buyers"]')
+      await page.getByRole('button', { name: '登记', exact: true }).first().click()
+      await page.waitForSelector('.el-dialog .el-form')
     },
   },
   {
-    name: 'devices-pairing',
-    fullPage: false,
+    name: 'browsers',
     run: async (page) => {
-      await page.goto(`${BASE}/accounts?tab=devices`)
-      await page.waitForSelector('#pane-devices .el-table__row')
-      await page.getByRole('button', { name: '生成配对码' }).first().click()
-      await page.waitForSelector('text=DEMO7K2Q')
+      await page.goto(`${BASE}/accounts?tab=browsers`)
+      await page.waitForSelector('#pane-browsers .el-table__row')
+    },
+  },
+  {
+    // 带上已从列表移除的浏览器
+    name: 'browsers-removed',
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/accounts?tab=browsers`)
+      await page.waitForSelector('#pane-browsers .el-table__row')
+      await page.getByText('显示已移除').click()
+      await page.waitForSelector('text=已移除')
     },
   },
   {
@@ -368,7 +381,7 @@ const scenes: Scene[] = [
       ['phone-sources-feishu', '/sources?tab=feishu', '.el-card'],
       ['phone-sources-file', '/sources?tab=file', '.el-upload-dragger'],
       ['phone-accounts', '/accounts?tab=accounts', '#pane-accounts .el-table__row'],
-      ['phone-devices', '/accounts?tab=devices', '#pane-devices .el-table__row'],
+      ['phone-browsers', '/accounts?tab=browsers', '#pane-browsers .el-table__row'],
       ['phone-settings', '/settings', '.el-card'],
     ] as const
   ).map(

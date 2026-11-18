@@ -39,7 +39,7 @@ def _err(fn, *a, **kw) -> DomainError:
 def _claimed(conn, workspace, no, *, guard=True):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.file_source(conn, ws, 2)
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no=no)
     run_id = fx.start(conn, dev)
@@ -161,7 +161,7 @@ def test_conflict_kept_before_claim_is_not_reported_again(conn, workspace):
     """另一种来源在领取前就与任务不同、人工选择「保留」：领取后它没再变，就不算变化。"""
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     order = f.ingest_ready_order(conn, ws, source=f.file_source(conn, ws, 2), upstream_order_no="PO-DEMO-KEEP")
     feishu = f.feishu_source(conn, ws, "recDEMO0001")
     orders.ingest(conn, ws, f.make_record(upstream_order_no="PO-DEMO-KEEP", asin="B0DEMO0X01"), feishu)
@@ -203,7 +203,7 @@ def test_guard_block_with_drift_records_conflict_on_exception(conn, workspace):
     _reingest(conn, e, asin="B0DEMO0X01")
     execution.progress(conn, e["dev"], e["a"]["attempt_id"], stage="checkout")
     verdict = execution.submit_guard(conn, e["dev"], e["a"]["attempt_id"],
-                                     fx.good_facts(fx.order_row(conn, e["order"]["id"]), total="99.00"))
+                                     fx.facts_for(conn, fx.order_row(conn, e["order"]["id"]), total="99.00"))
     assert verdict["code"] == "PRICE_OVER_CAP"
     o = fx.order_row(conn, e["order"]["id"])
     assert o["status"] == "exception" and o["conflict"]["incoming"] == {"asin": "B0DEMO0X01"}
@@ -404,7 +404,7 @@ def test_same_link_clearing_price_cap_is_still_drift(conn, workspace):
 def test_ship_days_change_mid_attempt_is_drift_and_accept_writes_the_new_date(conn, workspace):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.file_source(conn, ws, 2)
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no="PO-DEMO-SHIP",
                               suggested_purchase_date=None)        # 下单北京 10-27 + 6 − 4 = 10-29
@@ -470,7 +470,7 @@ def test_hold_plus_external_order_no_merges_into_one_conflict_and_accept_records
 def test_admission_hold_then_amz_no_from_the_same_feishu_record_keeps_both(conn, workspace):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     rec_id = "recDEMO0ADM"
     order = fx.assigned_order(conn, ws, acc, source=f.feishu_source(conn, ws, rec_id), upstream_order_no="PO-DEMO-ADM")
     a = fx.claim(conn, dev, fx.start(conn, dev))

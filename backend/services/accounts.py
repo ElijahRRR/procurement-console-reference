@@ -1,16 +1,21 @@
-"""买家账号：配置校验、列表与详情（含当天额度、绑定设备、当前执行批次）、暂停 / 恢复执行、采用插件识别的 ID。
+"""买家账号：配置校验、列表与详情（含当天额度、所在浏览器、当前执行批次）、暂停 / 恢复执行、待登记的买家号。
 
+- 账号由所有者在控制台登记；账号上登记的买家号 ID（亚马逊 customerId）就是它的执行身份：任何登录着这个买家号的
+  浏览器都能执行它的任务，与哪台电脑、哪个浏览器无关。插件不会自动创建账号。
+- **待登记的买家号**（discovered）：浏览器上报了、但还没有被任何未归档账号登记的买家号 ID。所有者可以登记
+  （新建账号或填到已有账号）或忽略（ignore_buyer_id / unignore_buyer_id）；登记某个 ID 时同时清掉它的忽略记录。
+- 修改或清空买家号 ID：账号有未结束批次、在途或结果待核实的尝试时拒绝（执行中的身份检查拿它当基准）。
 - 账号名在工作区内唯一（含已归档的，库里有唯一约束）；跨工作区访问一律 NOT_FOUND。
 - 影响分配的配置变化（金额区间、每日额度、优先级、采购开关、站点）以及新建、恢复执行、归档后，
   立即按今天重新分配（allocation.allocate(trigger='account_change')）。暂停执行不重新分配：
   暂停的账号不参与自动分配，已分配给它的任务保留。
-- 在线 = 3 分钟内有心跳。
+- 在线 = 3 分钟内有联系。
 """
 
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -18,19 +23,18 @@ import psycopg
 
 from services import clock, events, quota, settings_svc
 from services.errors import conflict, not_found, validation
-from services.models import ATTEMPT_INFLIGHT, money
+from services.models import ATTEMPT_INFLIGHT, CUSTOMER_ID_RE, money
 
-CUSTOMER_ID_RE = re.compile(r"^A[0-9A-Z]{8,}$")
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _CARD_RE = re.compile(r"^[0-9]{4}$")
 
 #: 前端可能整份回传的只读键，忽略
-_READONLY = frozenset({"id", "workspace_id", "created_at", "updated_at", "archived_at", "quota_today", "devices",
+_READONLY = frozenset({"id", "workspace_id", "created_at", "updated_at", "archived_at", "quota_today", "browsers",
                        "active_run", "effective_max_delivery_days", "execution_paused", "pause_reason", "paused_at",
                        "pause_cause", "open_result_unknown"})
 _EDITABLE = ("name", "amazon_customer_id", "site", "min_amount", "max_amount", "daily_limit", "priority",
              "max_delivery_days", "purchase_enabled", "sync_enabled", "purchase_mode", "schedule_times",
-             "default_device_id", "expected_card_last4", "notes")
+             "expected_card_last4", "notes")
 #: 这些字段变化会改变分配结果
 ALLOCATION_FIELDS = frozenset({"min_amount", "max_amount", "daily_limit", "priority", "purchase_enabled", "site"})
 #: 账号输出的 pause_cause 取值（未暂停为 None）
@@ -133,18 +137,6 @@ def _validate(conn, ws: int, data: dict[str, Any], current: dict[str, Any] | Non
             if len(times) > 24:
                 raise validation("执行时间最多 24 个", field=key)
             out[key] = times
-        elif key == "default_device_id":
-            if v is None:
-                out[key] = None
-            else:
-                did = _int_field(v, "默认执行设备", key, 1, 2 ** 62)
-                dev = conn.execute(
-                    "SELECT id FROM procure.devices WHERE id = %s AND workspace_id = %s AND revoked_at IS NULL",
-                    (did, ws),
-                ).fetchone()
-                if dev is None:
-                    raise validation("默认执行设备不存在或已撤销", field=key)
-                out[key] = did
         elif key == "expected_card_last4":
             s = _text_field(v, "期望卡尾号", key, 4)
             if s is not None and not _CARD_RE.match(s):
@@ -216,6 +208,18 @@ def get_row(conn, workspace_id: int, account_id: int, for_update: bool = False) 
     return row
 
 
+def find_by_customer_id(conn, workspace_id: int, customer_id: str | None) -> dict[str, Any] | None:
+    """输入：工作区、买家号 ID → 输出：本工作区登记了这个 ID 的未归档账号行；没有 → None。
+    浏览器登录状态的解析与开始批次都按它找账号（库里的唯一索引保证最多一行）。"""
+    if not customer_id:
+        return None
+    return conn.execute(
+        "SELECT * FROM procure.buyer_accounts WHERE workspace_id = %s AND amazon_customer_id = %s "
+        "AND archived_at IS NULL",
+        (workspace_id, customer_id),
+    ).fetchone()
+
+
 def effective_max_delivery_days(conn, workspace_id: int, account_row: dict[str, Any]) -> int:
     """输入：工作区、账号行 → 输出：有效最长配送天数（账号覆盖值，否则全局默认）。"""
     if account_row.get("max_delivery_days") is not None:
@@ -274,16 +278,19 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
     from services import devices        # 延迟导入：devices 也导入本模块
 
     now = clock.now()
-    online_window = timedelta(seconds=devices.ONLINE_WINDOW_S)
-    devs = conn.execute(
-        "SELECT id, name, last_seen_at, identity, identity_status FROM procure.devices "
-        "WHERE workspace_id = %s AND bound_account_id = %s AND revoked_at IS NULL ORDER BY name, id",
-        (ws, row["id"]),
-    ).fetchall()
+    # 所在浏览器：本工作区未移除、此刻上报的登录买家号就是这个账号的 ID 的浏览器（已归档的账号不列）
+    devs = []
+    if row["amazon_customer_id"] and row["archived_at"] is None:
+        devs = conn.execute(
+            "SELECT id, name, last_seen_at FROM procure.devices "
+            "WHERE workspace_id = %s AND login_customer_id = %s AND hidden_at IS NULL ORDER BY name, id",
+            (ws, row["amazon_customer_id"]),
+        ).fetchall()
     run = conn.execute(
         """
         SELECT r.id, r.device_id, d.name AS device_name, r.started_at
-        FROM procure.execution_runs r JOIN procure.devices d ON d.id = r.device_id
+        FROM procure.execution_runs r
+        JOIN procure.devices d ON d.id = r.device_id AND d.workspace_id = r.workspace_id
         WHERE r.workspace_id = %s AND r.account_id = %s AND r.ended_at IS NULL
         ORDER BY r.started_at DESC LIMIT 1
         """,
@@ -299,14 +306,10 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
         "execution_paused": row["execution_paused"], "pause_reason": row["pause_reason"],
         "paused_at": _iso(row["paused_at"]), "pause_cause": pause_cause(conn, ws, row),
         "open_result_unknown": open_result_unknown(conn, ws, row["id"]), "purchase_mode": row["purchase_mode"],
-        "schedule_times": list(row["schedule_times"] or []), "default_device_id": row["default_device_id"],
+        "schedule_times": list(row["schedule_times"] or []),
         "expected_card_last4": row["expected_card_last4"], "notes": row["notes"],
         "quota_today": quota.summary(conn, row, clock.bj_today(), simulated),
-        "devices": [{"id": d["id"], "name": d["name"],
-                     "online": d["last_seen_at"] is not None and now - d["last_seen_at"] <= online_window,
-                     # 与设备列表、执行检查同一个判定（按账号当前的买家号 ID 重算），不用存下的旧状态
-                     "identity_status": devices.effective_identity_status(d, row),
-                     "last_seen_at": _iso(d["last_seen_at"])} for d in devs],
+        "browsers": [devices.browser_brief(d, now) for d in devs],
         "active_run": ({"id": run["id"], "device_id": run["device_id"], "device_name": run["device_name"],
                         "started_at": _iso(run["started_at"])} if run else None),
         "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"]),
@@ -315,8 +318,8 @@ def _shape(conn, ws: int, row: dict[str, Any], *, simulated: bool, default_days:
 
 
 def get(conn, workspace_id: int, account_id: int) -> dict[str, Any]:
-    """输入：工作区、账号 id → 输出：契约 §10 账号形状（含 quota_today、devices、active_run、pause_cause、
-    open_result_unknown）。"""
+    """输入：工作区、账号 id → 输出：契约 §10 账号形状（含 quota_today、browsers、active_run、pause_cause、
+    open_result_unknown）。browsers = [{id, name, online, last_seen_at}]：此刻登录着这个买家号的浏览器。"""
     row = get_row(conn, workspace_id, account_id)
     st = settings_svc.get_row(conn, workspace_id)
     return _shape(conn, workspace_id, row, simulated=st["simulation_only"],
@@ -348,6 +351,25 @@ def _reallocate(conn, ws: int, actor_kind: str, actor_id: int | None) -> dict[st
     return allocation.allocate(conn, ws, trigger="account_change", actor_kind=actor_kind, actor_id=actor_id)
 
 
+def _busy_counts(conn, workspace_id: int, account_id: int) -> bool:
+    """输入：工作区、账号 → 输出：账号是否有未结束的执行批次，或在途 / 结果待核实的采购尝试。"""
+    busy = conn.execute(
+        "SELECT (SELECT count(*) FROM procure.execution_runs WHERE workspace_id = %s AND account_id = %s "
+        "        AND ended_at IS NULL) AS runs, "
+        "       (SELECT count(*) FROM procure.purchase_attempts WHERE workspace_id = %s AND account_id = %s "
+        "        AND status = ANY(%s)) AS attempts",
+        (workspace_id, account_id, workspace_id, account_id, sorted(ATTEMPT_INFLIGHT | {"unknown"})),
+    ).fetchone()
+    return bool(busy["runs"] or busy["attempts"])
+
+
+def _forget_ignored(conn, workspace_id: int, customer_id: str | None) -> None:
+    """输入：工作区、刚写进某个账号的买家号 ID（可空）→ 输出：无（登记即不再忽略：删掉这个 ID 的忽略记录）。"""
+    if customer_id:
+        conn.execute("DELETE FROM procure.ignored_buyer_ids WHERE workspace_id = %s AND customer_id = %s",
+                     (workspace_id, customer_id))
+
+
 def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | None) -> dict[str, Any]:
     """输入：工作区、账号字段、操作人 → 输出：账号（契约 §10）。新建后立即重新分配。"""
     vals = _validate(conn, workspace_id, data, None)
@@ -361,6 +383,7 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
         list(vals.values()),
     ).fetchone()
     ak, aid = _actor(actor_user_id)
+    _forget_ignored(conn, workspace_id, row["amazon_customer_id"])
     events.record(conn, workspace_id, "account", row["id"], "account.created", actor_kind=ak, actor_id=aid,
                   detail={k: v for k, v in vals.items() if k not in ("workspace_id", "created_at", "updated_at")})
     if row["purchase_enabled"]:
@@ -369,7 +392,12 @@ def create(conn, workspace_id: int, data: dict[str, Any], actor_user_id: int | N
 
 
 def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、账号、要改的字段、操作人 → 输出：改后的账号。影响分配的字段变化后立即重新分配。"""
+    """输入：工作区、账号、要改的字段、操作人 → 输出：改后的账号。影响分配的字段变化后立即重新分配。
+
+    修改或清空买家号 ID：账号有未结束批次、在途或结果待核实的尝试时 → CONFLICT（执行中的身份检查以它为基准，
+    待核实的结果也要对着原来的买家号去核实）；允许时 'account.updated' 事件的 changes 里记下旧值。
+    写入某个 ID 时同时清掉它的忽略记录。
+    """
     row = get_row(conn, workspace_id, account_id, for_update=True)
     if row["archived_at"] is not None:
         raise validation("账号已归档，不能修改")
@@ -378,12 +406,16 @@ def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], acto
         isinstance(v, list) and list(row[k] or []) == v)}
     if not changes:
         return get(conn, workspace_id, account_id)
+    if "amazon_customer_id" in changes and _busy_counts(conn, workspace_id, account_id):
+        raise conflict("账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID")
     sets = ", ".join(f"{k} = %s" for k in changes)
     _unique_write(
         conn,
         f"UPDATE procure.buyer_accounts SET {sets}, updated_at = %s WHERE id = %s AND workspace_id = %s",
         [*(v[1] for v in changes.values()), clock.now(), account_id, workspace_id],
     )
+    if "amazon_customer_id" in changes:
+        _forget_ignored(conn, workspace_id, changes["amazon_customer_id"][1])
     ak, aid = _actor(actor_user_id)
     events.record(conn, workspace_id, "account", account_id, "account.updated", actor_kind=ak, actor_id=aid,
                   detail={"changes": changes})
@@ -446,14 +478,7 @@ def archive(conn, workspace_id: int, account_id: int, actor_user_id: int | None)
     row = get_row(conn, workspace_id, account_id, for_update=True)
     if row["archived_at"] is not None:
         return get(conn, workspace_id, account_id)
-    busy = conn.execute(
-        "SELECT (SELECT count(*) FROM procure.execution_runs WHERE workspace_id = %s AND account_id = %s "
-        "        AND ended_at IS NULL) AS runs, "
-        "       (SELECT count(*) FROM procure.purchase_attempts WHERE workspace_id = %s AND account_id = %s "
-        "        AND status = ANY(%s)) AS attempts",
-        (workspace_id, account_id, workspace_id, account_id, sorted(ATTEMPT_INFLIGHT | {"unknown"})),
-    ).fetchone()
-    if busy["runs"] or busy["attempts"]:
+    if _busy_counts(conn, workspace_id, account_id):
         raise conflict("账号正在执行或有待核实的采购，不能归档")
     from services import orders
 
@@ -471,50 +496,134 @@ def archive(conn, workspace_id: int, account_id: int, actor_user_id: int | None)
         "WHERE id = %s AND workspace_id = %s",
         (now, now, account_id, workspace_id),
     )
-    conn.execute(
-        "UPDATE procure.devices SET bound_account_id = NULL WHERE workspace_id = %s AND bound_account_id = %s",
-        (workspace_id, account_id),
-    )
     events.record(conn, workspace_id, "account", account_id, "account.archived", actor_kind=ak, actor_id=aid)
     _reallocate(conn, workspace_id, ak, aid)
     return get(conn, workspace_id, account_id)
 
 
-def adopt_customer_id(conn, workspace_id: int, account_id: int, device_id: int,
-                      actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、账号、设备、操作人 → 输出：账号。把该设备最近识别到的 customer_id 写成账号的买家号 ID。
+# ── 待登记的买家号 ────────────────────────────────────────────────────────────
 
-    设备须属于同一工作区（否则 NOT_FOUND）、未撤销、已绑定该账号，且识别到的 ID 格式正确、未被其他账号占用。
-    采用后该设备的身份状态即为 match。
+
+def _customer_id_arg(customer_id: Any) -> str:
+    """输入：接口传来的买家号 ID → 输出：去空白、大写后的 ID；形状不对 → VALIDATION。"""
+    s = "".join(customer_id.split()).upper() if isinstance(customer_id, str) else ""
+    if not s or len(s) > 64 or not CUSTOMER_ID_RE.match(s):
+        raise validation("买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）", field="customer_id")
+    return s
+
+
+def _name_hints(conn, workspace_id: int, customer_ids: list[str]) -> dict[str, str]:
+    """输入：工作区、一组买家号 ID → 输出：{买家号 ID: 来源数据（飞书 / 文件）里同一「买家号 ID」最近出现的「买家号」}；
+    查不到的 ID 不在结果里。只读现成的来源关联（order_sources.normalized），一次查完。"""
+    if not customer_ids:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT DISTINCT ON (cid) cid, name FROM (
+            SELECT upper(btrim(normalized->>'external_buyer_customer_id')) AS cid,
+                   btrim(normalized->>'external_buyer_account') AS name, last_seen_at, id
+            FROM procure.order_sources
+            WHERE workspace_id = %s AND upper(btrim(normalized->>'external_buyer_customer_id')) = ANY(%s)
+              AND btrim(COALESCE(normalized->>'external_buyer_account', '')) <> ''
+        ) s ORDER BY cid, last_seen_at DESC, id DESC
+        """,
+        (workspace_id, customer_ids),
+    ).fetchall()
+    return {r["cid"]: r["name"][:64] for r in rows}
+
+
+def discovered(conn, workspace_id: int, include_ignored: bool = False) -> list[dict[str, Any]]:
+    """输入：工作区、是否含已忽略的 → 输出：待登记的买家号（按最近上报时间倒序）：
+    [{customer_id, ignored, browsers: [{id, name, online, last_seen_at}], last_reported_at, name_hint}]。
+
+    = 本工作区未移除的浏览器里，登录买家号 ID 非空、且没有被任何未归档账号登记的 ID，按 ID 聚合。
+    name_hint 是来源数据里同一买家号 ID 最近出现的买家号（给「登记」对话框预填账号名），查不到为 None。
     """
-    account = get_row(conn, workspace_id, account_id, for_update=True)
-    if account["archived_at"] is not None:
-        raise validation("账号已归档，不能修改")
-    try:
-        did = int(device_id)
-    except (TypeError, ValueError):
-        raise not_found("设备") from None
-    dev = conn.execute("SELECT * FROM procure.devices WHERE id = %s AND workspace_id = %s",
-                       (did, workspace_id)).fetchone()
-    if dev is None:
-        raise not_found("设备")
-    if dev["revoked_at"] is not None:
-        raise validation("设备已撤销")
-    if dev["bound_account_id"] != account_id:
-        raise validation("该设备没有绑定此账号，不能采用它识别的买家号 ID")
-    identity = dev["identity"] or {}
-    cid = identity.get("customer_id") if isinstance(identity, dict) else None
-    cid = cid.strip().upper() if isinstance(cid, str) else None
-    if not cid or not CUSTOMER_ID_RE.match(cid):
-        raise validation("插件没有识别到格式正确的买家号 ID")
-    _check_customer_id_unique(conn, workspace_id, cid, account_id)
+    from services import devices        # 延迟导入：devices 也导入本模块
+
+    rows = conn.execute(
+        """
+        SELECT d.id, d.name, d.last_seen_at, d.identity_at, d.login_customer_id AS customer_id,
+               (ig.customer_id IS NOT NULL) AS ignored
+        FROM procure.devices d
+        LEFT JOIN procure.ignored_buyer_ids ig
+               ON ig.workspace_id = d.workspace_id AND ig.customer_id = d.login_customer_id
+        WHERE d.workspace_id = %s AND d.hidden_at IS NULL AND d.login_customer_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM procure.buyer_accounts a
+                          WHERE a.workspace_id = d.workspace_id AND a.amazon_customer_id = d.login_customer_id
+                            AND a.archived_at IS NULL)
+        ORDER BY d.name, d.id
+        """,
+        (workspace_id,),
+    ).fetchall()
     now = clock.now()
-    _unique_write(conn, "UPDATE procure.buyer_accounts SET amazon_customer_id = %s, updated_at = %s "
-                  "WHERE id = %s AND workspace_id = %s", (cid, now, account_id, workspace_id))
-    conn.execute("UPDATE procure.devices SET identity_status = 'match' WHERE id = %s AND workspace_id = %s "
-                 "AND identity_status <> 'signed_out'", (did, workspace_id))
-    ak, aid = _actor(actor_user_id)
-    events.record(conn, workspace_id, "account", account_id, "account.customer_id_adopted", actor_kind=ak,
-                  actor_id=aid, detail={"device_id": did, "customer_id": cid,
-                                        "previous": account["amazon_customer_id"]})
-    return get(conn, workspace_id, account_id)
+    grouped: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r["ignored"] and not include_ignored:
+            continue
+        g = grouped.setdefault(r["customer_id"], {"customer_id": r["customer_id"], "ignored": bool(r["ignored"]),
+                                                  "browsers": [], "at": None})
+        g["browsers"].append(devices.browser_brief(r, now))
+        if r["identity_at"] is not None and (g["at"] is None or r["identity_at"] > g["at"]):
+            g["at"] = r["identity_at"]
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    items = sorted(grouped.values(), key=lambda g: g["customer_id"])
+    items.sort(key=lambda g: g["at"] or floor, reverse=True)
+    hints = _name_hints(conn, workspace_id, [g["customer_id"] for g in items])
+    return [{"customer_id": g["customer_id"], "ignored": g["ignored"], "browsers": g["browsers"],
+             "last_reported_at": _iso(g["at"]), "name_hint": hints.get(g["customer_id"])}
+            for g in items]
+
+
+def discovered_count(conn, workspace_id: int) -> int:
+    """输入：工作区 → 输出：未忽略的待登记买家号个数（与 discovered(include_ignored=False) 的条数相同；概览用）。"""
+    return int(conn.execute(
+        """
+        SELECT count(DISTINCT d.login_customer_id) AS n FROM procure.devices d
+        WHERE d.workspace_id = %s AND d.hidden_at IS NULL AND d.login_customer_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM procure.buyer_accounts a
+                          WHERE a.workspace_id = d.workspace_id AND a.amazon_customer_id = d.login_customer_id
+                            AND a.archived_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM procure.ignored_buyer_ids ig
+                          WHERE ig.workspace_id = d.workspace_id AND ig.customer_id = d.login_customer_id)
+        """,
+        (workspace_id,),
+    ).fetchone()["n"])
+
+
+def ignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: int | None) -> dict[str, Any]:
+    """输入：工作区、买家号 ID、操作人 → 输出：{customer_id, ignored: true}。幂等。
+
+    忽略后这个 ID 不再出现在待登记列表里，登录着它的浏览器显示「已忽略」、分不到任务。ID 形状不对 → VALIDATION；
+    已登记在未归档账号上的 ID 不能忽略（VALIDATION：要停用它应关掉账号的采购开关或归档账号）。
+    新忽略时写 'account.buyer_id_ignored' 事件。
+    """
+    cid = _customer_id_arg(customer_id)
+    owner = find_by_customer_id(conn, workspace_id, cid)
+    if owner is not None:
+        raise validation(f"买家号 ID {cid} 已登记在账号 {owner['name']}，不能忽略", field="customer_id")
+    row = conn.execute(
+        "INSERT INTO procure.ignored_buyer_ids (workspace_id, customer_id, created_by, created_at) "
+        "VALUES (%s, %s, %s, %s) ON CONFLICT (workspace_id, customer_id) DO NOTHING RETURNING customer_id",
+        (workspace_id, cid, actor_user_id, clock.now()),
+    ).fetchone()
+    if row is not None:
+        ak, aid = _actor(actor_user_id)
+        events.record(conn, workspace_id, "account", None, "account.buyer_id_ignored", actor_kind=ak, actor_id=aid,
+                      detail={"customer_id": cid})
+    return {"customer_id": cid, "ignored": True}
+
+
+def unignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: int | None) -> dict[str, Any]:
+    """输入：工作区、买家号 ID、操作人 → 输出：{customer_id, ignored: false}。幂等（没忽略过也成功）。
+    确实删掉了忽略记录时写 'account.buyer_id_unignored' 事件。"""
+    cid = _customer_id_arg(customer_id)
+    row = conn.execute(
+        "DELETE FROM procure.ignored_buyer_ids WHERE workspace_id = %s AND customer_id = %s RETURNING customer_id",
+        (workspace_id, cid),
+    ).fetchone()
+    if row is not None:
+        ak, aid = _actor(actor_user_id)
+        events.record(conn, workspace_id, "account", None, "account.buyer_id_unignored", actor_kind=ak, actor_id=aid,
+                      detail={"customer_id": cid})
+    return {"customer_id": cid, "ignored": False}

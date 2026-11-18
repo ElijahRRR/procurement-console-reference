@@ -39,7 +39,7 @@ def _unknown_after_sweep(conn, workspace, no, *, simulated):
     """领取 → 过护栏 → 登记提交 → 租约过期清扫 → 结果待核实。"""
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     order = fx.assigned_order(conn, ws, acc, upstream_order_no=no)
     run = f.make_run(conn, ws, acc["id"], dev["id"], simulated=simulated)
     a = fx.claim(conn, dev, run["id"])
@@ -159,7 +159,7 @@ def test_late_success_while_a_new_attempt_is_running_stops_it_before_submit(conn
 def test_different_result_for_an_aborted_attempt_is_still_a_plain_conflict(conn, workspace):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     fx.assigned_order(conn, ws, acc, upstream_order_no="PO-DEMO-L6")
     a = fx.claim(conn, dev, fx.start(conn, dev))
     execution.report_result(conn, dev, a["attempt_id"], fx.failure_payload("ABORTED_BY_USER", "DEMO"))

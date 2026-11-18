@@ -17,6 +17,9 @@
 - 每日分配：进程内记下已处理的北京日期（省得每拍查库）；真正的去重在库里（allocation.daily_done 查
   allocation_runs），所以 00:01 之后重启不会重做当天的每日分配；服务停过、当天还没做的工作区启动后补做一次。
 - 停止：uvicorn 退出（Ctrl+C / SIGTERM）后置停止事件并等待线程结束；线程是守护线程，不会挂住进程退出。
+- 启动检查：serve 在建应用、起调度之前先看库结构（workflows.db_init.schema_problem）：是旧版或还没建表就打印
+  「数据库结构是旧版：请先运行 python cli.py db_init」之类的说明并以非零码退出。升级顺序：停服务 → db_init → 启动
+  → 重新加载插件。
 """
 
 from __future__ import annotations
@@ -44,8 +47,9 @@ TICK_S = 1.0
 
 
 def run_sweep(now: datetime) -> dict[str, Any]:
-    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, revoked_runs, orphan_attempts, aborted, unknown}
-    （workflows.sweep.run(now=now)：租约按这个时刻判定是否过期）。"""
+    """输入：当前时刻 → 输出：清扫摘要 {expired_runs, orphan_attempts, removed_devices, aborted, unknown}
+    （workflows.sweep.run(now=now)：租约按这个时刻判定是否过期；removed_devices 是这次删掉的、长期没有联系
+    且没有任何批次 / 尝试引用的浏览器行）。"""
     from workflows import sweep
 
     return sweep.run(now=now)
@@ -216,9 +220,30 @@ def _flag(v: Any) -> bool:
     return str(v).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def check_schema() -> None:
+    """输入：无 → 输出：无；库结构不是当前版本（旧版、或还没建表）→ SystemExit（说明打印到标准错误输出，退出码 1）。
+
+    serve 启动时调用。连不上数据库同样退出并说明原因：服务起来了也只会每个请求都报错。
+    """
+    import psycopg
+
+    from workflows import db_init
+
+    try:
+        problem = db_init.schema_problem()
+    except psycopg.OperationalError as exc:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        raise SystemExit(f"启动失败：连不上数据库（{detail}）。库还不存在时请先运行 python cli.py db_init") from None
+    if problem is not None:
+        raise SystemExit(problem)
+
+
 def serve(host: str | None = None, port: int | str | None = None, jobs: Any = "1", log_level: str = "info",
           **unknown: Any) -> None:
     """输入：监听地址、端口、是否启动后台调度、uvicorn 日志级别 → 输出：无（阻塞运行 uvicorn，退出后停止后台调度）。
+
+    启动前先检查库结构（check_schema）：是旧版 → 打印「数据库结构是旧版：请先运行 python cli.py db_init」并以
+    非零码退出，不建应用、不起调度。
 
     地址与端口缺省取 settings（127.0.0.1:8790）；jobs=0 不启动后台调度（只跑 HTTP）。应用由
     server.app.create_app(allowed_hosts=(监听地址,)) 现建：`-p host=` 给的地址也在 Host 允许名单里（否则
@@ -227,6 +252,7 @@ def serve(host: str | None = None, port: int | str | None = None, jobs: Any = "1
     """
     if unknown:
         raise SystemExit(f"serve 不认识的参数：{'、'.join(sorted(unknown))}（可用 host、port、jobs、log_level）")
+    check_schema()
     import uvicorn
 
     from server.app import create_app

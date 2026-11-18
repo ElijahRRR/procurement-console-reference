@@ -485,7 +485,7 @@ def test_list_orders_needs_attention_filter_counts_total(conn, workspace):
 def test_detail_attempts_carry_account_device_and_resolver_names(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     acc = f.make_account(conn, ws, name="环境-DEMO-N")
-    dev = f.make_device(conn, ws, name="Mac-DEMO-N", bound_account_id=acc["id"])
+    dev = f.make_device(conn, ws, name="Mac-DEMO-N")
     o = f.ingest_ready_order(conn, ws)
     att = f.make_attempt(conn, ws, o["id"], acc["id"], status="unknown", submitted=True)
     conn.execute("UPDATE procure.purchase_attempts SET device_id = %s WHERE id = %s", (dev["id"], att["id"]))

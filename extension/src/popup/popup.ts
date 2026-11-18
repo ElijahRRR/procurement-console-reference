@@ -1,9 +1,12 @@
-/** 工具栏弹出页：一眼看状态（服务端、设备、账号、身份、执行），按钮「打开设置」「立即同步」。 */
+/** 工具栏弹出页：一眼看状态（服务端、本浏览器、当前买家号与账号、执行），外加这个状态带的按钮
+ *  （规格 §5：重试、打开订单页、重新读取、复制买家号 ID、打开控制台）与「打开设置」「立即同步」。
+ *  「开始执行（模拟）」不在这里：它要在亚马逊页面的面板上点（开始时要读那一页的买家号 ID）。 */
 
-import type { StateSnapshot } from "../core/messages.js";
-import { fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
+import type { RefreshIdentityReply, StateSnapshot } from "../core/messages.js";
+import type { StatusAction } from "../core/status.js";
+import { copyText, fetchState, keepFresh, onStateChange, toSw } from "../ui/bridge.js";
 import { LOGO_SVG, themeCss } from "../ui/theme.js";
-import { accountText, connectionText, h, identityText, quotaText, receiptLines, runActive, scheduleText } from "../ui/view.js";
+import { TONE_DOT, accountText, connectionText, h, receiptLines, runActive, scheduleText, statusBlock, statusOf } from "../ui/view.js";
 
 const POPUP_CSS = `
 body { margin: 0; width: 340px; background: var(--pc-bg-page); color: var(--pc-text-body); font: 400 14px/20px var(--pc-font-sans); -webkit-font-smoothing: antialiased; }
@@ -12,6 +15,7 @@ body { margin: 0; width: 340px; background: var(--pc-bg-page); color: var(--pc-t
 .btns { display: flex; gap: 8px; margin-top: 14px; }
 .btns .pc-btn { flex: 1; }
 .pc-kv { grid-template-columns: 64px 1fr; }
+.gap { margin-top: 12px; }
 `;
 
 const app = document.getElementById("app")!;
@@ -20,13 +24,57 @@ style.textContent = themeCss(":root") + POPUP_CSS;
 document.head.append(style);
 
 let state: StateSnapshot | null = null;
-let syncing = false;
+let busy = false;
+let note: string | null = null;
 
 function logo(): HTMLElement {
   const el = h("span", { class: "pc-logo" });
   el.innerHTML = LOGO_SVG; // 静态图标
   return el;
 }
+
+async function refresh(): Promise<void> {
+  state = await fetchState();
+  render();
+}
+
+/** 发一条消息给后台、等它做完、再取一次状态。done：连上了服务端时显示的一句（没连上时状态区自己会说原因）。 */
+async function act(msg: Parameters<typeof toSw>[0], done: string | null = null): Promise<void> {
+  busy = true;
+  note = null;
+  render();
+  await toSw(msg, 60_000).catch(() => undefined);
+  busy = false;
+  state = await fetchState();
+  note = done !== null && state?.connection?.ok ? done : null;
+  render();
+}
+
+async function reread(): Promise<void> {
+  busy = true;
+  render();
+  const r = await toSw<RefreshIdentityReply>({ type: "pc.refreshIdentity" }, 30_000).catch(() => null);
+  if (!r?.reported) await toSw({ type: "pc.sync", reason: "重新读取", minAgeMs: 0 }, 60_000).catch(() => undefined);
+  busy = false;
+  note = r ? "已重新读取" : "重新读取失败：插件后台没有响应";
+  await refresh();
+}
+
+async function copyId(): Promise<void> {
+  const id = state ? statusOf(state).customer_id : null;
+  if (!id) return;
+  note = (await copyText(id, document.body)) ? "已复制买家号 ID" : "复制失败：请选中上面的买家号 ID 手动复制";
+  render();
+}
+
+const actions: Record<StatusAction, () => void> = {
+  retry: () => void act({ type: "pc.retry" }),
+  open_options: () => void chrome.runtime.openOptionsPage(),
+  open_orders: () => void toSw({ type: "pc.openOrders" }).catch(() => undefined),
+  reread: () => void reread(),
+  copy_id: () => void copyId(),
+  open_console: () => void toSw({ type: "pc.openConsole" }).catch(() => undefined),
+};
 
 function render(): void {
   app.replaceChildren();
@@ -37,7 +85,7 @@ function render(): void {
       "div",
       { class: "pc-card-hd" },
       logo(),
-      h("div", { class: "grow" }, h("div", { class: "pc-title" }, "采购助手"), h("div", { class: "pc-sub" }, s?.device.device_name ?? "未配对")),
+      h("div", { class: "grow" }, h("div", { class: "pc-title" }, "采购助手"), h("div", { class: "pc-sub" }, s?.device.device_name ?? (s?.device.registered ? "本浏览器" : "还没有连上服务端"))),
       h("span", { class: "pc-tag pc-tag-brand" }, "模拟模式"),
     ),
   );
@@ -45,53 +93,39 @@ function render(): void {
   card.append(body);
   if (!s) {
     body.append(h("div", { class: "pc-notice pc-notice-danger" }, "插件后台没有响应"));
-  } else if (!s.device.paired) {
-    body.append(h("div", { class: "pc-notice pc-notice-brand" }, "尚未配对。打开设置页，填写控制台生成的 8 位配对码。"));
   } else {
     const conn = connectionText(s, Date.now());
-    const ident = identityText(s);
-    const dot = conn.tone === "success" ? "pc-dot pc-dot-green" : conn.tone === "danger" ? "pc-dot pc-dot-red" : conn.tone === "warning" ? "pc-dot pc-dot-yellow" : "pc-dot";
     const run = runActive(s) ? s.run?.view ?? null : null;
     const receipts = receiptLines(s).length;
     body.append(
       h(
         "dl",
         { class: "pc-kv" },
-        h("dt", {}, "服务端"), h("dd", {}, h("span", { class: "pc-row" }, h("span", { class: dot }), conn.text)),
+        h("dt", {}, "服务端"), h("dd", {}, h("span", { class: "pc-row" }, h("span", { class: TONE_DOT[conn.tone] }), conn.text)),
+        h("dt", {}, "浏览器"), h("dd", {}, s.device.device_name ?? "—"),
         h("dt", {}, "账号"), h("dd", {}, accountText(s)),
-        h("dt", {}, "身份"), h("dd", {}, h("span", { class: `pc-tag pc-tag-${ident.tone}` }, ident.short)),
-        h("dt", {}, "额度"), h("dd", {}, quotaText(s)),
         h("dt", {}, "执行"), h("dd", {}, run ? `执行中：批次 #${run.run_id ?? "—"} · ${run.stage_label ?? run.message ?? "—"}` : scheduleText(s)),
         receipts ? h("dt", {}, "回执") : null,
         receipts ? h("dd", {}, `${receipts} 条结果回执待补交（服务端恢复后自动补交）`) : null,
       ),
     );
+    // 「打开设置」在下面常驻，状态区里不重复画。
+    const { open_options: _oo, ...blockActions } = actions;
+    void _oo;
+    const block = statusBlock(statusOf(s), blockActions, busy);
+    block.classList.add("gap");
+    body.append(block);
+    if (note) body.append(h("div", { class: "pc-caption gap" }, note));
   }
   body.append(
     h(
       "div",
       { class: "btns" },
       h("button", { class: "pc-btn pc-btn-primary", type: "button", onclick: () => void chrome.runtime.openOptionsPage() }, "打开设置"),
-      s?.device.paired
-        ? h("button", { class: "pc-btn", type: "button", disabled: syncing, onclick: () => void sync() }, syncing ? "正在同步" : "立即同步")
-        : null,
+      h("button", { class: "pc-btn", type: "button", disabled: busy, onclick: () => void act({ type: "pc.heartbeatNow" }, "已同步") }, busy ? "正在同步" : "立即同步"),
     ),
   );
   app.append(h("div", { class: "wrap" }, card));
-}
-
-async function sync(): Promise<void> {
-  syncing = true;
-  render();
-  await toSw({ type: "pc.heartbeatNow" }, 60_000).catch(() => undefined);
-  syncing = false;
-  state = await fetchState();
-  render();
-}
-
-async function refresh(): Promise<void> {
-  state = await fetchState();
-  render();
 }
 
 onStateChange(() => void refresh());

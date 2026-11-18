@@ -19,9 +19,11 @@ scripts/gen-design-tokens.mjs   tokens.json → src/design-system/generated/{tok
 src/api/                        fetch 客户端（ApiError、401 → 登录、needs_setup → 首次设置）与按领域分的接口模块
 src/router/                     路由表（meta.title / subtitle）与守卫判断（guard.ts 为纯函数）
 src/components/                 外壳（layout/）、AppIcon、PageHeader、StatCard、EmptyState、StatusDot 与各页面部件
-src/views/                      概览、待采购、采购记录、异常处理、订单来源、账号与设备、设置、登录、首次设置
+src/views/                      概览、待采购、采购记录、异常处理、订单来源、账号与浏览器、设置、登录、首次设置
 src/utils/                      format（金额、日期、中文排版）、labels（枚举 → 中文与 el-tag 类型）、feedback、guard（护栏逐项）、
-                                results（动作返回 → 提示文案）、admission、feishuMap、importWizard、overview、orderDetail、accounts
+                                results（动作返回 → 提示文案）、admission、feishuMap、importWizard、overview、orderDetail、
+                                accounts（恢复执行文案、待登记的买家号整理）、browsers（浏览器登录状态 → 文字与颜色）、clipboard
+src/composables/                useTheme（明暗主题）、useVisiblePolling（页面可见时定时刷新）
 tests/unit/                     vitest 单测
 tests/mocks/                    虚构的接口数据与模拟后端（截图与评审复用）
 tests/visual/screenshots.ts     截图脚本（Node 直接运行 .ts）
@@ -34,6 +36,8 @@ tests/visual/screenshots.ts     截图脚本（Node 直接运行 .ts）
 - 任务详情的操作按钮只由后端返回的 `allowed_actions` 决定；冲突的两个按钮按 `conflict.kind` 写明接受意味着什么（`utils/orderDetail.conflictView`）。
 - 核实结果对话框按待核实尝试上已有的单号与金额（插件迟到上报的回执）预填，并显示最近一条 `attempt.late_result` 的说明；模拟尝试只认 `SIM-` 开头的单号。
 - 恢复账号执行前重新读一次账号，按 `pause_cause` 与 `open_result_unknown` 提醒结果待核实。
+- 用词：「买家号」是一个亚马逊买家登录，「买家号 ID」是 customerId，「账号」是控制台里登记的买家号，「浏览器」是一个装了插件的浏览器环境（接口与类型里仍叫 device）。浏览器由插件自动登记，控制台只能改名与移除；插件读到、还没登记的买家号列在「账号」页签顶部的「待登记的买家号」，页面可见时每 10 秒刷新。
+- 浏览器「当前登录」一栏的文字由 `utils/browsers.browserLoginView` 按登录状态给出，与插件面板的状态用词一致。
 - 列表筛选全部交给服务端（视图 + `needs_attention` 等条件），total 按全部条件计数，前端不再二次过滤。
 - 下载（模板、导出、问题行）先 fetch 看状态：失败提示「动作失败：原因」，401 跳登录。
 - 顶栏显示页面名（路由 meta），页面标题（PageHeader）放本页自己的内容，不重复顶栏。

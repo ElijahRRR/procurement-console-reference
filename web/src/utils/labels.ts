@@ -15,8 +15,9 @@ import type {
   FeishuVerdict,
   GuardCheckKey,
   GuardCode,
-  IdentityStatus,
   ImportVerdict,
+  LegacyRunEndReason,
+  LoginState,
   MemberRole,
   OrderAction,
   OrderStatus,
@@ -149,6 +150,7 @@ export const GUARD_CHECK_LABEL: Record<GuardCheckKey | 'fulfillment', string> = 
   delivery: '配送时长',
   data: '数据可靠',
   card: '卡尾号',
+  buyer: '买家号',
   fulfillment: '配送方式',
 }
 
@@ -164,12 +166,12 @@ export const PLUGIN_ERROR_LABEL: Record<PluginErrorCode, string> = {
   ACCOUNT_RESTRICTED: '买家账号受限',
   CARD_DECLINED: '银行卡被拒付',
   CAPTCHA_ENCOUNTERED: '遇到验证码或风控验证，需要人工处理',
-  IDENTITY_MISMATCH: '浏览器登录的买家账号与绑定不符',
+  IDENTITY_MISMATCH: '执行中途浏览器登录的买家号变了',
   ABORTED_UPSTREAM_CANCELLED: '上游已取消，已中止',
   ABORTED_BY_USER: '插件端人工中止',
   SUBMIT_REJECTED: '服务端拒绝了提交登记',
   PLUGIN_SIMULATION_ONLY: '插件只执行模拟任务，却领到了真实任务',
-  ABORTED_BY_SERVER: '服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止',
+  ABORTED_BY_SERVER: '服务端要求中止（账号暂停或归档、浏览器登录的买家号变了或登录状态过期、来源有变化），未提交前中止',
 }
 
 /** 进度上报被服务端叫停的原因（attempt.progress 的 cancel_code，services/execution.CANCEL_CODES） */
@@ -177,8 +179,8 @@ export const PROGRESS_CANCEL_LABEL: Record<ProgressCancelCode, string> = {
   UPSTREAM_CANCELLED: '上游已取消',
   ACCOUNT_ARCHIVED: '账号已归档',
   ACCOUNT_PAUSED: '账号已暂停执行',
-  IDENTITY_MISMATCH: '浏览器登录的买家账号与绑定不符',
-  IDENTITY_STALE: '设备身份超过 10 分钟没有上报',
+  IDENTITY_MISMATCH: '浏览器登录的买家号变了',
+  IDENTITY_STALE: '浏览器太久没有上报登录状态',
   SOURCE_HOLD: '来源要求暂停采购',
   SOURCE_CHANGED: '领取后来源有变化',
   ATTEMPT_FINISHED: '这次采购尝试已结束',
@@ -192,6 +194,17 @@ export function errorCodeLabel(code: string | null | undefined): string {
   )
 }
 
+/**
+ * 输入：护栏裁决的拦截码（guard_verdict.code、attempt.guard_blocked 的 code）→ 输出：中文说明。
+ * 买家号一项（buyer）不通过时用的是 IDENTITY_MISMATCH，这里按护栏的说法写；其余未知码按错误码表或原样返回。
+ */
+export function guardCodeLabel(code: string | null | undefined): string {
+  if (!code) return '—'
+  if (code in GUARD_CODE_LABEL) return (GUARD_CODE_LABEL as Record<string, string>)[code]
+  if (code === 'IDENTITY_MISMATCH') return '结算页登录的买家号不是这个批次的买家号'
+  return errorCodeLabel(code)
+}
+
 // ── 统一错误码（§8） ──────────────────────────────────────────────────────────
 
 export const API_ERROR_LABEL: Record<ApiErrorCode, string> = {
@@ -200,13 +213,17 @@ export const API_ERROR_LABEL: Record<ApiErrorCode, string> = {
   NOT_FOUND: '记录不存在',
   VALIDATION: '提交的内容不符合要求',
   CONFLICT: '与当前状态冲突',
-  ACCOUNT_BUSY: '账号正在别处执行',
+  ACCOUNT_BUSY: '这个买家号正在别的浏览器里执行',
+  DEVICE_BUSY: '这个浏览器上一个批次还没有结束',
   ATTEMPT_IN_FLIGHT: '已有在途的采购尝试',
-  IDENTITY_MISMATCH: '浏览器登录的买家账号与绑定不符',
-  NOT_BOUND: '设备未绑定账号',
+  IDENTITY_MISMATCH: '浏览器登录的买家号与要执行的账号不一致',
+  ACCOUNT_NOT_REGISTERED: '这个买家号还没有登记',
   ACCOUNT_PAUSED: '账号已暂停执行',
   REAL_PURCHASE_DISABLED: '本阶段只允许模拟执行',
   LEASE_LOST: '执行权已失效',
+  SLOT_DONE: '这个时间点今天已经执行过',
+  WORKSPACE_REQUIRED: '系统里有多个工作区，插件设置里要填工作区 ID',
+  PLUGIN_OUTDATED: '插件版本过旧，需要重新构建并加载新版插件',
   FEISHU_NOT_CONFIGURED: '未配置飞书应用',
   FEISHU_ERROR: '飞书接口出错',
   INVALID_TRANSITION: '当前状态不允许此操作',
@@ -269,32 +286,45 @@ export const ALLOCATION_TRIGGER_LABEL: Record<AllocationTrigger, string> = {
   daily: '每日 00:01',
 }
 
-// ── 账号与设备 ────────────────────────────────────────────────────────────────
+// ── 账号与浏览器 ──────────────────────────────────────────────────────────────
 
 export const PURCHASE_MODE_LABEL: Record<PurchaseMode, string> = {
   manual: '手动执行',
   scheduled: '定时执行',
 }
 
-export const IDENTITY_STATUS_LABEL: Record<IdentityStatus, string> = {
-  match: '身份一致',
-  mismatch: '身份不符',
+/**
+ * 浏览器的登录状态 → 「浏览器」页签「当前登录」一栏的基本说法（与插件面板的状态用词一致）。
+ * 带买家号 ID、账号名的完整文字见 utils/browsers.browserLoginText。
+ */
+export const LOGIN_STATE_LABEL: Record<LoginState, string> = {
+  unknown: '还没有上报',
   signed_out: '未登录亚马逊',
-  unknown: '身份未知',
+  no_id: '已登录，没读到买家号 ID',
+  conflict: '登录状态不一致',
+  unregistered: '未登记的买家号',
+  ignored: '已忽略的买家号',
+  ready: '已登记的买家号',
 }
 
-export const IDENTITY_STATUS_TAG: Record<IdentityStatus, TagType> = {
-  match: 'success',
-  mismatch: 'danger',
-  signed_out: 'warning',
+export const LOGIN_STATE_TAG: Record<LoginState, TagType> = {
   unknown: 'info',
+  signed_out: 'warning',
+  no_id: 'warning',
+  conflict: 'danger',
+  unregistered: 'warning',
+  ignored: 'info',
+  ready: 'success',
 }
 
-export const IDENTITY_STATUS_DOT: Record<IdentityStatus, DotColor> = {
-  match: 'green',
-  mismatch: 'red',
-  signed_out: 'yellow',
+export const LOGIN_STATE_DOT: Record<LoginState, DotColor> = {
   unknown: 'gray',
+  signed_out: 'yellow',
+  no_id: 'yellow',
+  conflict: 'red',
+  unregistered: 'yellow',
+  ignored: 'gray',
+  ready: 'green',
 }
 
 /** 账号暂停的起因（pause_cause） */
@@ -309,11 +339,12 @@ export const RUN_TRIGGER_LABEL: Record<RunTrigger, string> = {
   scheduled: '定时触发',
 }
 
-export const RUN_END_REASON_LABEL: Record<RunEndReason, string> = {
+/** 执行批次的结束原因；device_revoked 现在不再产生，历史批次上还有 */
+export const RUN_END_REASON_LABEL: Record<RunEndReason | LegacyRunEndReason, string> = {
   finished: '正常结束',
   lease_expired: '执行权超时',
-  device_revoked: '设备已撤销',
   simulation_reset: '已清除模拟结果',
+  device_revoked: '浏览器的授权已撤销（旧版）',
 }
 
 export const MEMBER_ROLE_LABEL: Record<MemberRole, string> = {
@@ -414,7 +445,7 @@ export const EVENT_ENTITY_LABEL: Record<EventEntity, string> = {
   order: '任务',
   attempt: '采购尝试',
   account: '账号',
-  device: '设备',
+  device: '浏览器',
   connection: '飞书连接',
   batch: '导入批次',
   settings: '设置',
@@ -490,14 +521,20 @@ export const EVENT_KIND_LABEL: Record<string, string> = {
   'account.paused': '暂停执行',
   'account.paused_by_execution': '执行结果触发暂停',
   'account.resumed': '恢复执行',
-  'account.customer_id_adopted': '采用插件识别的买家号 ID',
-  // 设备
-  'device.pairing_code_created': '生成配对码',
-  'device.paired': '设备配对',
-  'device.updated': '修改设备',
-  'device.revoked': '撤销设备',
-  'device.identity_changed': '身份状态变化',
+  'account.buyer_id_ignored': '忽略买家号',
+  'account.buyer_id_unignored': '恢复已忽略的买家号',
+  // 账号（历史事件：升级时按原来的记录补登记买家号 ID；旧版由人工点选）
+  'account.customer_id_adopted': '按旧版记录登记买家号 ID',
+  // 浏览器（接口与事件里叫 device）
+  'device.registered': '浏览器登记',
+  'device.updated': '修改浏览器名称',
+  'device.removed': '移除浏览器',
+  'device.identity_changed': '登录状态变化',
   'device.ext_version_changed': '插件版本变化',
+  // 浏览器（历史事件：旧版的配对码与授权，现在不再产生，旧记录还要显示）
+  'device.pairing_code_created': '生成配对码（旧版）',
+  'device.paired': '配对浏览器（旧版）',
+  'device.revoked': '撤销浏览器授权（旧版）',
   // 执行批次
   'run.started': '开始执行批次',
   'run.ended': '结束执行批次',

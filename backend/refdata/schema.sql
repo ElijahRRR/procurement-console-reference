@@ -1,5 +1,9 @@
 -- 采购控制台建表脚本（幂等，db_init 执行）。契约见 docs/development/开发契约-v2.md。
 -- PostgreSQL 16 / 17。所有时间为 timestamptz（UTC）；业务日期为北京日期，由应用层计算后写入 date 列。
+--
+-- 新库：CREATE TABLE 直接是当前形状。旧库：CREATE TABLE IF NOT EXISTS 不动已有的表，靠文件后面各段
+-- 「追加（幂等）」的 ALTER / DO 块升级；整份脚本可以在新库、旧库上反复执行。
+-- 升级顺序：停服务 → python cli.py db_init → 启动 → 重新加载插件。
 
 CREATE SCHEMA IF NOT EXISTS procure;
 
@@ -47,7 +51,9 @@ CREATE TABLE IF NOT EXISTS procure.workspace_settings (
     updated_by                 bigint REFERENCES procure.users(id)
 );
 
--- ── 买家账号与设备 ────────────────────────────────────────────────────────────
+-- ── 买家账号与浏览器（设备）──────────────────────────────────────────────────────
+-- 买家号的身份 = 亚马逊 customerId（买家号 ID）。账号由所有者在控制台登记；浏览器（devices 行）由插件自动登记，
+-- 记下它最近上报的登录状态。任何登录着某个买家号的浏览器都能执行登记了这个 ID 的账号的任务，两者之间没有绑定。
 
 CREATE TABLE IF NOT EXISTS procure.buyer_accounts (
     id                   bigserial PRIMARY KEY,
@@ -67,7 +73,6 @@ CREATE TABLE IF NOT EXISTS procure.buyer_accounts (
     paused_at            timestamptz,
     purchase_mode        text NOT NULL DEFAULT 'manual' CHECK (purchase_mode IN ('manual', 'scheduled')),
     schedule_times       text[] NOT NULL DEFAULT '{}',        -- 北京时间 'HH:MM'
-    default_device_id    bigint,                              -- 定时执行的默认设备（FK 见下）
     expected_card_last4  text CHECK (expected_card_last4 IS NULL OR expected_card_last4 ~ '^[0-9]{4}$'),
     notes                text,
     created_at           timestamptz NOT NULL DEFAULT now(),
@@ -77,36 +82,28 @@ CREATE TABLE IF NOT EXISTS procure.buyer_accounts (
 );
 
 CREATE TABLE IF NOT EXISTS procure.devices (
-    id                bigserial PRIMARY KEY,
-    workspace_id      bigint NOT NULL REFERENCES procure.workspaces(id),
-    name              text NOT NULL,
-    browser           text,                                   -- chrome / adspower / other（插件上报）
-    token_hash        text UNIQUE,                            -- sha256(device_token) hex；撤销后置 NULL
-    bound_account_id  bigint REFERENCES procure.buyer_accounts(id),
-    ext_version       text,
-    user_agent        text,
-    last_seen_at      timestamptz,
-    identity          jsonb,                                  -- {signed_in, customer_id, site, page_url, at}
-    identity_status   text NOT NULL DEFAULT 'unknown' CHECK (identity_status IN ('unknown', 'match', 'mismatch', 'signed_out')),
-    identity_at       timestamptz,
-    created_at        timestamptz NOT NULL DEFAULT now(),
-    revoked_at        timestamptz
+    id                 bigserial PRIMARY KEY,
+    workspace_id       bigint NOT NULL REFERENCES procure.workspaces(id),  -- 登记时确定，之后不变
+    name               text NOT NULL,                         -- 「浏览器 <id>」，之后只能在控制台改名
+    browser            text,                                  -- 历史列（旧版插件上报的 chrome / adspower / other），不再写入
+    token_hash         text UNIQUE,                           -- sha256(device_token) hex；令牌只是会话标识，不代表身份
+    ext_version        text,
+    user_agent         text,
+    last_seen_at       timestamptz,
+    identity           jsonb,                                 -- {signed_in, customer_id, site, page_url, conflict, at}
+    identity_at        timestamptz,
+    login_customer_id  text,                                  -- 已登录、读到合格 ID 且各标签页读数一致时的买家号 ID，否则 NULL
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    hidden_at          timestamptz                            -- 控制台「移除」的时间；浏览器再次联系时清空
 );
 
-DO $$ BEGIN
-    ALTER TABLE procure.buyer_accounts
-        ADD CONSTRAINT buyer_accounts_default_device_fk
-        FOREIGN KEY (default_device_id) REFERENCES procure.devices(id);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
-CREATE TABLE IF NOT EXISTS procure.device_pairings (
-    code_hash     text PRIMARY KEY,                           -- sha256(code) hex
+-- 所有者选择忽略的买家号 ID（不出现在「待登记的买家号」里；登记成账号时删掉对应的行）
+CREATE TABLE IF NOT EXISTS procure.ignored_buyer_ids (
     workspace_id  bigint NOT NULL REFERENCES procure.workspaces(id),
+    customer_id   text NOT NULL,
     created_by    bigint REFERENCES procure.users(id),
     created_at    timestamptz NOT NULL DEFAULT now(),
-    expires_at    timestamptz NOT NULL,
-    used_at       timestamptz,
-    device_id     bigint REFERENCES procure.devices(id)
+    PRIMARY KEY (workspace_id, customer_id)
 );
 
 -- ── 订单来源 ──────────────────────────────────────────────────────────────────
@@ -301,8 +298,11 @@ CREATE TABLE IF NOT EXISTS procure.execution_runs (
     heartbeat_at      timestamptz NOT NULL DEFAULT now(),
     lease_expires_at  timestamptz NOT NULL,
     ended_at          timestamptz,
-    end_reason        text,                                   -- finished / lease_expired / device_revoked / simulation_reset
-    stats             jsonb NOT NULL DEFAULT '{}'
+    end_reason        text,                                   -- finished / lease_expired / simulation_reset（历史行可能有 device_revoked）
+    stats             jsonb NOT NULL DEFAULT '{}',
+    bj_date           date NOT NULL,                          -- 开始批次时的北京日期（定时时间点按它去重）
+    scheduled_slot    text CHECK (scheduled_slot IS NULL OR scheduled_slot ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$')
+                                                              -- 定时批次对应的时间点（北京时间 'HH:MM'）；手动批次为 NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_one_active_per_account
@@ -476,3 +476,102 @@ WHERE c.enabled AND EXISTS (SELECT 1 FROM procure.feishu_base_grants g
 CREATE UNIQUE INDEX IF NOT EXISTS buyer_accounts_customer_id_uq
     ON procure.buyer_accounts (workspace_id, amazon_customer_id)
     WHERE amazon_customer_id IS NOT NULL AND archived_at IS NULL;
+
+-- ── 追加（幂等）：执行入口改造——去掉配对码与「设备绑定账号」，插件按当前登录的买家号 ID 领任务 ────────────
+-- 旧库升级，顺序不能变：① 趁旧列还在，把原来的绑定回填成账号的买家号 ID；② devices 增删列；③ buyer_accounts 删
+-- default_device_id；④ 删 device_pairings；⑤ execution_runs 加 bj_date / scheduled_slot 与两个唯一索引。
+-- 新库上这些语句都是空操作（列已是新形状），索引在这里统一创建。
+
+-- ① 旧绑定回填。对每个未归档、还没登记买家号 ID 的账号：取绑定到它、未撤销的设备里「已登录且 ID 合格」的 ID 集合；
+--    集合恰好一个值、这个 ID 没被同工作区其他未归档账号登记、也没有另一个账号在这次回填里要拿同一个 ID → 写进账号，
+--    并记 account.customer_id_adopted 事件（via = legacy_binding）。拿不准的一律不动，由所有者在控制台登记。
+--    旧列不存在（新库、已升级的库）时整段跳过；引用旧列的语句放在 EXECUTE 里，新库上不会被解析。
+DO $$
+DECLARE
+    r record;
+BEGIN
+    IF (SELECT count(*) FROM information_schema.columns
+        WHERE table_schema = 'procure' AND table_name = 'devices'
+          AND column_name IN ('bound_account_id', 'revoked_at')) < 2 THEN
+        RETURN;
+    END IF;
+    FOR r IN EXECUTE $q$
+        WITH cand AS (
+            SELECT a.id AS account_id, a.workspace_id,
+                   upper(btrim(d.identity->>'customer_id')) AS customer_id, min(d.id) AS device_id
+            FROM procure.buyer_accounts a
+            JOIN procure.devices d ON d.bound_account_id = a.id AND d.workspace_id = a.workspace_id
+            WHERE a.archived_at IS NULL AND a.amazon_customer_id IS NULL AND d.revoked_at IS NULL
+              AND d.identity->'signed_in' = 'true'::jsonb
+              AND upper(btrim(d.identity->>'customer_id')) ~ '^A[0-9A-Z]{8,}$'
+            GROUP BY a.id, a.workspace_id, upper(btrim(d.identity->>'customer_id'))
+        ), single AS (
+            SELECT c.* FROM cand c
+            WHERE (SELECT count(*) FROM cand c2 WHERE c2.account_id = c.account_id) = 1
+        )
+        SELECT s.* FROM single s
+        WHERE NOT EXISTS (SELECT 1 FROM procure.buyer_accounts x
+                          WHERE x.workspace_id = s.workspace_id AND x.amazon_customer_id = s.customer_id
+                            AND x.archived_at IS NULL)
+          AND (SELECT count(*) FROM single s2
+               WHERE s2.workspace_id = s.workspace_id AND s2.customer_id = s.customer_id) = 1
+        ORDER BY s.account_id
+    $q$ LOOP
+        UPDATE procure.buyer_accounts SET amazon_customer_id = r.customer_id, updated_at = now()
+        WHERE id = r.account_id AND workspace_id = r.workspace_id;
+        INSERT INTO procure.events (workspace_id, entity, entity_id, actor_kind, kind, detail)
+        VALUES (r.workspace_id, 'account', r.account_id, 'system', 'account.customer_id_adopted',
+                jsonb_build_object('customer_id', r.customer_id, 'device_id', r.device_id, 'via', 'legacy_binding'));
+    END LOOP;
+END $$;
+
+-- ② devices：新列 → 用存下的身份回填 → 删旧列。回填只在旧列还在时做一次（之后 login_customer_id 由服务端在每次
+--    身份上报时维护，重复执行本脚本不得覆盖它）。已撤销的设备变成「已移除」（hidden_at）；它们的令牌哈希早已清空。
+ALTER TABLE procure.devices ADD COLUMN IF NOT EXISTS login_customer_id text;
+ALTER TABLE procure.devices ADD COLUMN IF NOT EXISTS hidden_at timestamptz;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'procure' AND table_name = 'devices' AND column_name = 'revoked_at') THEN
+        RETURN;
+    END IF;
+    EXECUTE $q$
+        UPDATE procure.devices SET login_customer_id = upper(btrim(identity->>'customer_id'))
+        WHERE login_customer_id IS NULL AND identity->'signed_in' = 'true'::jsonb
+          AND upper(btrim(identity->>'customer_id')) ~ '^A[0-9A-Z]{8,}$'
+    $q$;
+    EXECUTE 'UPDATE procure.devices SET hidden_at = revoked_at WHERE revoked_at IS NOT NULL AND hidden_at IS NULL';
+END $$;
+ALTER TABLE procure.devices
+    DROP COLUMN IF EXISTS bound_account_id,
+    DROP COLUMN IF EXISTS identity_status,
+    DROP COLUMN IF EXISTS revoked_at;
+CREATE INDEX IF NOT EXISTS devices_login_customer_idx
+    ON procure.devices (workspace_id, login_customer_id) WHERE login_customer_id IS NOT NULL;
+
+-- ③ buyer_accounts：不再有「定时执行的默认设备」。
+ALTER TABLE procure.buyer_accounts DROP CONSTRAINT IF EXISTS buyer_accounts_default_device_fk;
+ALTER TABLE procure.buyer_accounts DROP COLUMN IF EXISTS default_device_id;
+
+-- ④ 配对码表整张删除。
+DROP TABLE IF EXISTS procure.device_pairings;
+
+-- ⑤ execution_runs：北京日期与定时时间点。旧行的日期按开始时刻回填。
+ALTER TABLE procure.execution_runs ADD COLUMN IF NOT EXISTS bj_date date;
+ALTER TABLE procure.execution_runs ADD COLUMN IF NOT EXISTS scheduled_slot text
+    CHECK (scheduled_slot IS NULL OR scheduled_slot ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$');
+UPDATE procure.execution_runs SET bj_date = (started_at AT TIME ZONE 'Asia/Shanghai')::date WHERE bj_date IS NULL;
+ALTER TABLE procure.execution_runs ALTER COLUMN bj_date SET NOT NULL;
+-- 一台浏览器同时只有一个未结束的批次。旧结构没有这条约束：万一同一台设备留着多个未结束的批次，只留最新的一个，
+-- 其余按租约过期结束（它们的在途尝试由下一轮清扫按「所属批次已结束」收尾），否则建索引会失败、整次升级回滚。
+UPDATE procure.execution_runs r SET ended_at = now(), end_reason = 'lease_expired'
+WHERE r.ended_at IS NULL
+  AND EXISTS (SELECT 1 FROM procure.execution_runs n
+              WHERE n.device_id = r.device_id AND n.ended_at IS NULL AND n.id > r.id);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_one_active_per_device
+    ON procure.execution_runs (device_id) WHERE ended_at IS NULL;
+-- 一个账号的一个定时时间点一天只执行一次：未结束的、或正常结束（finished）的定时批次占着这个时间点；
+-- 租约过期、被清除模拟结果结束的不占，可以再来一次。
+CREATE UNIQUE INDEX IF NOT EXISTS execution_runs_slot_once
+    ON procure.execution_runs (account_id, bj_date, scheduled_slot)
+    WHERE trigger = 'scheduled' AND scheduled_slot IS NOT NULL AND (ended_at IS NULL OR end_reason = 'finished');

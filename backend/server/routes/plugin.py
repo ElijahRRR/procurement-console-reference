@@ -1,8 +1,12 @@
-"""插件执行协议（契约 §5，前缀 /plugin/v1）：配对、心跳、身份、执行批次、领取、进度、护栏、提交登记、等待验证、结果、结束。
+"""插件执行协议（契约 §5，前缀 /plugin/v1）：登记、心跳、身份、执行批次、领取、进度、护栏、提交登记、等待验证、结果、结束。
 
-- 除 /pair 外都要 `Authorization: Bearer <设备令牌>`（缺失、未知或已撤销 → 401 UNAUTHORIZED）。
-- 不要求控制台的防跨站请求头（插件从扩展的 service worker 带令牌调用）。
-- 工作区由设备决定，请求不能指定；批次 / 尝试不属于这台设备 → 404。
+- 整个前缀先过入口闸（server/limits.PluginGateMiddleware）：只接受本机对端、本机 Host、非网页来源，POST 必须是 JSON。
+- /register 不需要令牌（插件自己生成令牌来登记，没有任何人工步骤）；其余接口都要
+  `Authorization: Bearer <浏览器令牌>`，缺失或没登记过 → 401 UNAUTHORIZED，插件收到后用同一个令牌重新登记。
+- 令牌只是会话标识（把批次、尝试、回执归到同一个浏览器），不代表身份。买家号的身份是插件从亚马逊页面读到并上报的
+  买家号 ID（customerId）；开始批次时按它找账号，浏览器与账号之间没有绑定。
+- 不要求控制台的防跨站请求头。
+- 工作区是浏览器登记时确定的，之后的请求不能指定；批次 / 尝试不属于这个浏览器 → 404。
 - 业务判断全部在 services/devices 与 services/execution；这里只做参数解析与事务边界。
 """
 
@@ -24,11 +28,10 @@ class _Body(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
-class PairBody(_Body):
-    code: Any = None
-    device_name: Any = None
-    browser: Any = None
+class RegisterBody(_Body):
+    device_token: Any = None
     ext_version: Any = None
+    workspace_id: Any = None
 
 
 class HeartbeatBody(_Body):
@@ -36,17 +39,26 @@ class HeartbeatBody(_Body):
     identity: Any = None
 
 
+#: 身份上报体里交给服务层的键（契约 §5；服务层清洗，买家号 ID 形状不对当作没读到）
+IDENTITY_KEYS = ("signed_in", "customer_id", "site", "page_url", "conflict")
+
+
 class IdentityBody(_Body):
     signed_in: Any = None
     customer_id: Any = None
     site: Any = None
     page_url: Any = None
+    conflict: Any = None
     ext_version: Any = None
 
 
 class StartRunBody(_Body):
+    """customer_id 在这里是可选的：旧版插件不带它，由服务层回「插件版本过旧，请更新插件」，而不是通用的参数错误。"""
+
+    customer_id: Any = None
     trigger: Any = "manual"
     simulated: Any = None
+    slot: Any = None
 
 
 class FinishBody(_Body):
@@ -80,40 +92,61 @@ class ResultBody(_Body):
     error_detail: Any = None
 
 
-@router.post("/pair")
-def pair(body: PairBody, request: Request, conn=Depends(deps.db_conn)):
-    """输入：{code, device_name, browser, ext_version}（不需要令牌）→ 输出：{device_id, device_token, workspace_name}。"""
-    return respond(devices.pair(conn, body.code, device_name=body.device_name, browser=body.browser,
-                                ext_version=body.ext_version, user_agent=request.headers.get("user-agent")))
+@router.post("/register")
+def register(request: Request, body: RegisterBody | None = None, conn=Depends(deps.db_conn)):
+    """输入：{device_token, ext_version?, workspace_id?}（不需要令牌头；令牌由插件自己生成，放在请求体里）
+    → 输出：{device_id, device_name, workspace_id, workspace_name, created}。同一个令牌重复登记是幂等的（created=false）。
+
+    令牌格式不对 → 422 VALIDATION（detail.field = device_token）；服务端还没有任何工作区 → 409 CONFLICT；有多个
+    工作区而没带存在的 workspace_id → 409 WORKSPACE_REQUIRED；插件版本低于 0.2.0 → 409 PLUGIN_OUTDATED；工作区里
+    登记的浏览器已到上限 → 429 RATE_LIMITED。
+    """
+    b = body or RegisterBody()
+    return respond(devices.register(conn, b.device_token, ext_version=b.ext_version, workspace_id=b.workspace_id,
+                                    user_agent=request.headers.get("user-agent")))
 
 
 @router.post("/heartbeat")
 def heartbeat(body: HeartbeatBody | None = None, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：{ext_version, identity?} → 输出：{device, account, identity_status, server_time, bj_date, simulation_only,
-    active_run}（契约 §10「插件心跳 / 配置」）。"""
+    """输入：{ext_version?, identity?} → 输出：{device: {id, name}, login: {state, customer_id, at, stale}, account,
+    device_run, server_time, bj_date, simulation_only}（契约 §10「插件心跳」）。
+
+    login.state：unknown / signed_out / no_id / conflict / unregistered / ignored / ready；account 只在 ready 时非空。
+    插件版本低于 0.2.0 → 409 PLUGIN_OUTDATED。
+    """
     b = body or HeartbeatBody()
     return respond(devices.heartbeat(ctx.conn, ctx.device, ext_version=b.ext_version, identity=b.identity))
 
 
 @router.post("/identity")
 def identity(body: IdentityBody, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：{signed_in, customer_id, site, page_url, ext_version?} → 输出：{identity_status}（单独上报身份；
-    契约 §5 第 3 步；等价于心跳捎带 identity）。"""
-    ident = body.model_dump(include={"signed_in", "customer_id", "site", "page_url"})
-    return respond({"identity_status": devices.report_identity(ctx.conn, ctx.device, ident)})
+    """输入：{signed_in, customer_id, site, page_url, conflict?, ext_version?} → 输出：与 /heartbeat 完全相同的形状
+    （单独上报身份；等价于心跳捎带 identity）。买家号 ID 形状不对时当作没读到，不报错。"""
+    return respond(devices.report_identity(ctx.conn, ctx.device, body.model_dump(include=set(IDENTITY_KEYS)),
+                                           ext_version=body.ext_version))
 
 
 @router.post("/runs")
 def start_run(body: StartRunBody | None = None, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：{trigger: manual | scheduled, simulated: true} → 输出：{run_id, lease_ttl_s, lease_expires_at}；
-    账号已有未结束批次 → 409 ACCOUNT_BUSY（detail 为持有者）；非模拟 → 403 REAL_PURCHASE_DISABLED。"""
+    """输入：{customer_id, trigger: manual | scheduled, slot?: "HH:MM", simulated: true}
+    → 输出：{run_id, lease_ttl_s, lease_expires_at, account: {id, name}}。customer_id 是插件在当前页面读到的买家号 ID。
+
+    拒绝：缺 customer_id → 422 VALIDATION「插件版本过旧，请更新插件」；这个浏览器上一个批次没结束 → 409 DEVICE_BUSY；
+    浏览器最近上报的登录状态与 customer_id 不符或已过期 → 403 IDENTITY_MISMATCH；没有账号登记这个 ID → 403
+    ACCOUNT_NOT_REGISTERED；账号已暂停 → 403 ACCOUNT_PAUSED；非模拟 → 403 REAL_PURCHASE_DISABLED；定时批次的
+    slot 不对 → 422，这个时间点今天已执行过 → 409 SLOT_DONE；账号已有未结束批次 → 409 ACCOUNT_BUSY（detail 为持有者）。
+    """
     b = body or StartRunBody()
-    return respond(execution.start_run(ctx.conn, ctx.device, trigger=b.trigger, simulated=b.simulated))
+    return respond(execution.start_run(ctx.conn, ctx.device, customer_id=b.customer_id, trigger=b.trigger,
+                                       simulated=b.simulated, slot=b.slot))
 
 
 @router.post("/runs/{run_id}/heartbeat")
 def run_heartbeat(run_id: int, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：批次 id → 输出：{lease_expires_at, stop, stop_reason}（续租）；批次已失效 → 409 LEASE_LOST。"""
+    """输入：批次 id → 输出：{lease_expires_at, stop, stop_reason}（续租）；批次已失效 → 409 LEASE_LOST。
+
+    stop_reason：account_paused / account_archived / identity_mismatch（浏览器登录的买家号不再是批次账号登记的那个）。
+    """
     return respond(execution.run_heartbeat(ctx.conn, ctx.device, run_id))
 
 
@@ -148,7 +181,8 @@ def progress(attempt_id: int, body: ProgressBody | None = None, ctx: deps.Plugin
 
 @router.post("/attempts/{attempt_id}/guard")
 def guard(attempt_id: int, body: GuardFacts | None = None, ctx: deps.Plugin = Depends(deps.plugin)):
-    """输入：尝试 id、结算页事实 → 输出：{verdict: pass | block, code, reasons, checks, …}（服务端护栏裁决）。"""
+    """输入：尝试 id、结算页事实（含取事实那一刻页面上读到的 customer_id）→ 输出：{verdict: pass | block, code,
+    reasons, checks, …}（服务端护栏裁决）。"""
     facts = body.model_dump() if body is not None else {}
     return respond(execution.submit_guard(ctx.conn, ctx.device, attempt_id, facts))
 

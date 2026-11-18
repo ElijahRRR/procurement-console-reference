@@ -40,7 +40,7 @@ def calls(monkeypatch):
 @pytest.fixture()
 def env(conn, workspace):
     acc = fx.exec_account(conn, workspace["id"])
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     return {"ws": workspace["id"], "acc": acc, "dev": dev, "uid": workspace["user_id"]}
 
 
@@ -203,8 +203,27 @@ def test_page_load_failed_retried_once_then_exception(conn, env, calls):
     assert not _paused(conn, env)
 
 
+def test_identity_mismatch_is_an_abort_code_not_an_account_error(conn, env, calls):
+    """执行中途换了买家号不是账号的问题：未提交的那一笔中止，任务回已分配，不暂停账号、不占额度。"""
+    from services.models import ERROR_CODES
+
+    assert ERROR_CODES["IDENTITY_MISMATCH"].category == "abort"
+    assert ERROR_CODES["IDENTITY_MISMATCH"].zh == "执行中途浏览器登录的买家号变了"
+    order, a = _claimed(conn, env)
+    res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload("IDENTITY_MISMATCH", "DEMO"))
+    assert res == {"attempt_status": "aborted", "order_status": "assigned"}
+    o = fx.order_row(conn, order["id"])
+    assert o["assigned_account_id"] == env["acc"]["id"] and o["current_attempt_id"] is None
+    assert "执行中途浏览器登录的买家号变了" in o["status_reason"]
+    assert not _paused(conn, env)
+    assert f.count(conn, "events", "kind = %s", (execution.PAUSE_MARKER_KIND,)) == 0
+    assert quota.used(conn, env["acc"]["id"], TODAY, True) == 0
+    assert execution.run_heartbeat(conn, env["dev"], env["run_id"])["stop"] is False
+    assert fx.claim(conn, env["dev"], env["run_id"])["order_id"] == order["id"]      # 同一批次里还能再领
+
+
 @pytest.mark.parametrize("code", ["LOGIN_REQUIRED", "ACCOUNT_RESTRICTED", "CARD_DECLINED", "CAPTCHA_ENCOUNTERED",
-                                  "IDENTITY_MISMATCH", "PLUGIN_SIMULATION_ONLY"])
+                                  "PLUGIN_SIMULATION_ONLY"])
 def test_account_level_codes_pause_account_and_keep_task_assigned(conn, env, calls, code):
     order, a = _claimed(conn, env)
     res = execution.report_result(conn, env["dev"], a["attempt_id"], fx.failure_payload(code, "DEMO"))

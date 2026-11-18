@@ -29,7 +29,7 @@ const sections: NavSection[] = [
     title: '配置',
     items: [
       { to: '/sources', label: '订单来源', icon: 'database' },
-      { to: '/accounts', label: '账号与设备', icon: 'users' },
+      { to: '/accounts', label: '账号与浏览器', icon: 'users' },
       { to: '/settings', label: '设置', icon: 'cog' },
     ],
   },

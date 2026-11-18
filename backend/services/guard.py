@@ -7,16 +7,20 @@
 
 |检查|规则|拦截码|
 |---|---|---|
+|buyer|customer_id（插件取事实那一刻从结算页读到的买家号 ID）与批次账号登记的 ID 相同|IDENTITY_MISMATCH|
 |item|items 恰好一项，ASIN 与有效 ASIN 相同，数量与有效数量相同|ITEM_MISMATCH|
 |zip|ship_to.postal_code 前 5 位与任务邮编前 5 位相同|ZIP_MISMATCH|
 |subtotal|商品小计在账号区间内（端点含；上限为空 = 不限）|SUBTOTAL_OUT_OF_RANGE|
 |price_cap|total + 礼品卡抵扣额 ≤ 有效限价（相等放行）|PRICE_OVER_CAP|
 |delivery|配送天数 = delivery.date − 站点今天（无日期时用 delivery.days）≤ 有效配送上限（相等放行）|DELIVERY_TOO_LONG|
-|data|total、subtotal 可解析，配送天数可得，币种为 USD|DATA_UNRELIABLE|
+|data|total、subtotal 可解析，配送天数可得，币种为 USD，结算页读到了买家号 ID|DATA_UNRELIABLE|
 |card|账号设置了期望卡尾号时必须相同|CARD_MISMATCH|
 
 要点：
 
+- **buyer 把「谁在下单」钉在下单那一页**：浏览器的登录状态是各标签页对账后上报的，结算页自己读到的买家号 ID
+  才是这一单真正的下单人。它与批次账号登记的 ID 不同 → 拦截（IDENTITY_MISMATCH，排在最前）；没读到或形状不对 →
+  记为「无法判定」，由 data 检查拦截为 DATA_UNRELIABLE，绝不因为缺失而放行。
 - **NULL 不是 0**：读不到的小计、总额、配送天数不会被当作 0 放行。依赖它们的检查记为「无法判定」
   （ok=None，不单独拦截），由 data 检查统一拦截为 DATA_UNRELIABLE。
 - 礼品卡：结算页显示的 total 已扣掉礼品卡，限价比的是「本单真实价格」，所以把抵扣额加回去
@@ -34,10 +38,11 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from services.models import money, money_cap
+from services.models import CUSTOMER_ID_RE, money, money_cap
 
 #: 检查名与拦截码，顺序即契约 §4 的判定顺序
 CHECK_ORDER: tuple[tuple[str, str], ...] = (
+    ("buyer", "IDENTITY_MISMATCH"),
     ("item", "ITEM_MISMATCH"),
     ("zip", "ZIP_MISMATCH"),
     ("subtotal", "SUBTOTAL_OUT_OF_RANGE"),
@@ -52,7 +57,7 @@ _ABSENT = object()
 #: 结算页事实里会被保存与判定的键（契约 §4）；其余键一律丢弃
 FACT_KEYS: tuple[str, ...] = (
     "items", "subtotal", "shipping", "tax", "total_before_tax", "total", "gift_card_amount", "currency",
-    "delivery", "ship_to", "card_last4", "fulfillment",
+    "delivery", "ship_to", "card_last4", "fulfillment", "customer_id",
 )
 _AMOUNT_FACTS = ("subtotal", "shipping", "tax", "total_before_tax", "total", "gift_card_amount")
 #: 类型不对的值的替身：护栏照样判为格式不对，库里不留原值
@@ -130,6 +135,14 @@ def _card4(v: Any) -> str | None:
     return digits[-4:] if len(digits) >= 4 else (digits or None)
 
 
+def _buyer_id(v: Any) -> str | None:
+    """输入：上报的买家号 ID → 输出：去空白、大写后形状合格的 ID；缺失、类型不对、形状不对 → None（按没读到）。"""
+    if not isinstance(v, str):
+        return None
+    s = "".join(v.split()).upper()
+    return s if len(s) <= 64 and CUSTOMER_ID_RE.match(s) else None
+
+
 def _scalar(v: Any, n: int) -> Any:
     """输入：金额 / 数量一类的标量 → 输出：None、绝对值小于 10^12 的有限数字或不超过 n 个字符的字符串；
     其他（布尔、对象、数组、NaN、超长、超大）→ INVALID。"""
@@ -170,7 +183,8 @@ def sanitize_facts(facts: Any) -> dict[str, Any]:
     """输入：插件上报的结算页事实（任意 JSON）→ 输出：只含 FACT_KEYS 的规范化事实（可入库）。
 
     卡号只留后 4 位（与 evaluate 的比对口径相同）；delivery 只留 text（≤200 字）/ date / days，ship_to 只留
-    postal_code，items 每项只留 asin / quantity / unit_price（最多 20 项）；缺的键为 None。
+    postal_code，items 每项只留 asin / quantity / unit_price（最多 20 项）；customer_id 去空白、转大写（形状不对
+    或类型不对 → INVALID，判定时按没读到）；缺的键为 None。
     evaluate(sanitize_facts(x)) 与 evaluate(x) 的裁决相同。
     """
     raw = facts if isinstance(facts, dict) else {}
@@ -196,13 +210,17 @@ def sanitize_facts(facts: Any) -> dict[str, Any]:
         out["ship_to"] = {"postal_code": _short(ship_to.get("postal_code"), 16)}
     out["card_last4"] = _card4(raw.get("card_last4"))
     out["fulfillment"] = _short(raw.get("fulfillment"), 32)
+    buyer = raw.get("customer_id")
+    if buyer is not None and not (isinstance(buyer, str) and not buyer.strip()):
+        out["customer_id"] = _buyer_id(buyer) or INVALID
     return out
 
 
 def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, postal_code: str | None,
              price_cap: Decimal | None, amount_min: Decimal, amount_max: Decimal | None,
-             max_delivery_days: int | None, expected_card_last4: str | None, site_today: date) -> dict[str, Any]:
-    """输入：结算页事实、任务与账号的有效值、站点今天 → 输出：护栏裁决
+             max_delivery_days: int | None, expected_card_last4: str | None, site_today: date,
+             expected_customer_id: str | None) -> dict[str, Any]:
+    """输入：结算页事实、任务与账号的有效值（含批次账号登记的买家号 ID）、站点今天 → 输出：护栏裁决
     {verdict: 'pass'|'block', code, reasons, checks: {检查名: {ok, expected, actual}}, delivery_days, total_for_cap,
     fulfillment}。
 
@@ -215,6 +233,22 @@ def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, p
     checks: dict[str, dict[str, Any]] = {}
     reasons: dict[str, str] = {}
     exp_asin = asin.strip().upper() if isinstance(asin, str) and asin.strip() else None
+    problems: list[str] = []
+
+    # ── 买家号（谁在下单）──
+    exp_buyer = _buyer_id(expected_customer_id)
+    act_buyer = _buyer_id(facts.get("customer_id"))
+    if act_buyer is None:
+        checks["buyer"] = {"ok": None, "expected": exp_buyer, "actual": None}
+        problems.append("结算页没有读到买家号 ID")
+    elif exp_buyer is None:
+        checks["buyer"] = {"ok": False, "expected": None, "actual": act_buyer}
+        reasons["buyer"] = "这个批次的账号没有登记买家号 ID，不能放行"
+    else:
+        ok = act_buyer == exp_buyer
+        checks["buyer"] = {"ok": ok, "expected": exp_buyer, "actual": act_buyer}
+        if not ok:
+            reasons["buyer"] = f"结算页登录的买家号（{act_buyer}）不是这个批次的买家号（{exp_buyer}）"
 
     # ── 商品 ──
     items = facts.get("items")
@@ -246,7 +280,6 @@ def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, p
         reasons["zip"] = f"收货邮编 {act_zip or '读取不到'} 与任务邮编 {exp_zip or '—'} 不一致"
 
     # ── 数据可读性（先解析，后面几项依赖它）──
-    problems: list[str] = []
     sub = _amount(facts.get("subtotal"))
     total = _amount(facts.get("total"))
     gift = _amount(facts.get("gift_card_amount"), signed=True)
@@ -315,7 +348,8 @@ def evaluate(facts: dict[str, Any], *, asin: str | None, quantity: int | None, p
     currency = _text(facts.get("currency"))
     if currency is None or currency.upper() != "USD":
         problems.append(f"币种不是 USD（{currency or '读取不到'}）")
-    checks["data"] = {"ok": not problems, "expected": "USD；小计、总额可解析；配送天数可得", "actual": problems}
+    checks["data"] = {"ok": not problems, "expected": "USD；小计、总额可解析；配送天数可得；读到买家号 ID",
+                      "actual": problems}
     if problems:
         reasons["data"] = "结算数据不可靠：" + "；".join(problems)
 

@@ -149,7 +149,7 @@ def test_kept_admission_conflict_survives_a_reupload_of_the_same_file(conn, work
 def test_kept_admission_conflict_does_not_abort_a_claimed_attempt_on_reupload(conn, workspace):
     ws, uid = workspace["id"], workspace["user_id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     o = _file_ingest(conn, ws, "PO-DEMO-AK2")
     _file_ingest(conn, ws, "PO-DEMO-AK2", purchase_status_value="已拍单")
     orders.resolve_conflict(conn, ws, o.order_id, "keep", None, uid)
