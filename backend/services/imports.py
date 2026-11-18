@@ -401,6 +401,7 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
     if b["status"] != "previewed":
         raise validation("请先预览再提交")
     ak, aid = _actor(actor_user_id)
+    allocation.lock_workspace(conn, workspace_id)       # 加锁顺序：分配锁先于任务行（契约 §3.2），最后的分配可重入
     adm_row = conn.execute("SELECT admission FROM procure.import_batches WHERE id = %s AND workspace_id = %s",
                            (b["id"], workspace_id)).fetchone()
     adm = adm_row["admission"] if adm_row and adm_row["admission"] else _file_admission(conn, workspace_id, None)

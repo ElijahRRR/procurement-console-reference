@@ -236,6 +236,7 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
     admission = feishu_connections.clean_admission(row["admission"])
     skip = {row["writeback_test_record"]} if row.get("writeback_test_record") else set()
     buyer_problem = buyer_columns_problem(field_map, types)
+    allocation.lock_workspace(conn, workspace_id)       # 飞书已读完才取：分配锁先于任务行（契约 §3.2），不占着锁等网络
     try:
         with conn.transaction():
             results = evaluate_records(conn, workspace_id, cid, records, field_map, types, admission, dry_run=False,

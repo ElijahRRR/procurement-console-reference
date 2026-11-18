@@ -89,6 +89,16 @@ def plan_date(order_row: dict[str, Any], today: date) -> date:
     return today if d is None or d < today else d
 
 
+
+def lock_workspace(conn, workspace_id: int) -> None:
+    """输入：连接、工作区 → 输出：无。取这个工作区的分配咨询锁（事务级，同一事务里可重入，事务结束自动放开）。
+
+    加锁顺序（契约 §3.2）：账号行 → 本锁 → 任务行。凡是「先锁任务行、最后触发分配」的事务（文件提交、飞书接收、
+    归档账号）都要在锁第一行任务之前先取本锁，否则会和别的分配互相等待成死锁。
+    """
+    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
+
+
 def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str, actor_kind: str = "system",
              actor_id: int | None = None) -> dict[str, Any]:
     """输入：工作区、今天（缺省北京今天）、触发方式、操作者 → 输出：分配摘要（契约 §10，并写 allocation_runs）。
@@ -100,7 +110,7 @@ def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str
     if trigger not in TRIGGERS:
         raise validation(f"未知的分配触发方式：{trigger}", field="trigger")
     today = today or clock.bj_today()
-    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
+    lock_workspace(conn, workspace_id)
     simulated = settings_svc.simulation_only(conn, workspace_id)
 
     ctx = designation.load_context(conn, workspace_id)          # 全部账号（含已归档）与忽略名单：解析来源指定用
@@ -314,7 +324,7 @@ def allocate_daily(conn, workspace_id: int, *, today: date | None = None) -> dic
     补跑当天的一次；不会补跑更早的日子（计划日期本来就按 max(建议日期, 今天) 算）。
     """
     today = today or clock.bj_today()
-    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
+    lock_workspace(conn, workspace_id)
     if daily_done(conn, workspace_id, today):
         return None
     return allocate(conn, workspace_id, today=today, trigger="daily")
