@@ -3,11 +3,13 @@
 reset 依次做：
 
 0. 取本工作区的执行闸门（execution.execution_gate 独占锁）：等进行中的开始批次 / 领取提交，清除期间不会冒出
-   新的批次或尝试。随后按契约 §3.2 的加锁顺序（账号行 → 工作区分配锁 → 任务行）先锁住此刻只因模拟结果暂停、
-   第 4 步要恢复的账号行（FOR NO KEY UPDATE），再取工作区分配锁（allocation.lock_workspace），然后才锁批次与任务行：
-   第 4 步恢复账号要改账号行并重新分配，如果先锁了任务行再去等账号行 / 分配锁，会与同时进行的分配、改账号互相等待
-   成死锁。人工暂停等不会被恢复的账号不预先锁：插件对它在途尝试的结果上报是「批次 → 任务 → 尝试 → 账号」，
-   预先锁住它会与上报互相等待。
+   新的批次或尝试。接着按 id 顺序锁住本工作区未结束的模拟批次：插件上报结果、结束批次、清扫都按「批次 → 任务 →
+   尝试 → 账号」加锁、不取分配锁，清除先在批次行上与它们排队——它们要么已经提交（暂停的账号随后被判断），要么等
+   清除结束；清除绝不在持有分配锁时去等批次行（否则「上报等账号行、改账号等分配锁、清除等批次行」成环）。
+   然后按契约 §3.2 的加锁顺序（账号行 → 工作区分配锁 → 任务行）锁住此刻只因模拟结果暂停、第 4 步要恢复的账号行
+   （FOR NO KEY UPDATE），再取工作区分配锁（allocation.lock_workspace），最后才锁任务行：第 4 步恢复账号要改账号行
+   并重新分配，如果先锁了任务行再去等账号行 / 分配锁，会与同时进行的分配、改账号互相等待成死锁。人工暂停等不会被
+   恢复的账号不预先锁。
 1. 结束本工作区未结束的模拟批次（end_reason='simulation_reset'；在途尝试不按超时处理，下一步统一清除）。
 2. 这些任务的模拟尝试（尚未清除过的）→ aborted，resolution='simulation_reset'，说明「已清除模拟结果」。
    它们不再占额度（额度只数非 failed / aborted 的尝试）。
@@ -80,9 +82,9 @@ def _lock_before_tasks(conn, workspace_id: int) -> None:
     """输入：连接、工作区（调用方已持有独占执行闸门）→ 输出：无。锁住此刻只因模拟结果暂停的账号行（按 id 顺序，
     FOR NO KEY UPDATE），再取工作区分配锁。见模块说明第 0 步。
 
+    调用方已锁住未结束的模拟批次，模拟结果造成的暂停（上报、结束批次、清扫都先锁批次行）不会再在这之后发生。
     在锁上之前判断「只因模拟结果暂停」：锁上之后这些账号的暂停 / 恢复都要等本事务结束，判断不会再变；判断与加锁
-    之间才被人工恢复或暂停的账号多锁一行也无妨，第 4 步按当时的状态重新判断。清除期间才被模拟结果暂停的账号
-    （上报先于清除提交）不在这里，第 4 步照常恢复它。
+    之间才被人工恢复或暂停的账号多锁一行也无妨，第 4 步按当时的状态重新判断。
     """
     paused = conn.execute(
         "SELECT id FROM procure.buyer_accounts WHERE workspace_id = %s AND execution_paused AND archived_at IS NULL "
@@ -107,14 +109,14 @@ def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
     ws = workspace_id
     ak, aid = _actor(actor_user_id)
     execution.execution_gate(conn, ws, exclusive=True)
-    _lock_before_tasks(conn, ws)
-    now = clock.now()
-
-    runs = conn.execute(
+    runs = conn.execute(    # 先锁批次，再锁账号与分配锁（见模块说明第 0 步）
         "SELECT * FROM procure.execution_runs WHERE workspace_id = %s AND simulated AND ended_at IS NULL "
         "ORDER BY id FOR UPDATE",
         (ws,),
     ).fetchall()
+    _lock_before_tasks(conn, ws)
+    now = clock.now()
+
     for run in runs:
         execution.end_run(conn, run, "simulation_reset", actor_kind=ak, actor_id=aid, settle=False)
 

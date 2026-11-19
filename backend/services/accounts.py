@@ -84,17 +84,17 @@ def _money_field(v: Any, label: str, field: str, *, nullable: bool) -> Decimal |
 def _text_field(v: Any, label: str, field: str, max_len: int, *, single_line: bool = False) -> str | None:
     """输入：提交的值、中文名、字段名、最长字数、是否单行 → 输出：去掉首尾空白的文本（空为 None）。
 
-    非文本、超长 → VALIDATION。含 PostgreSQL 存不了的字符（NUL、不成对的代理项）→ VALIDATION，不替所有者悄悄删掉；
-    单行字段（账号名称）另外不收换行、制表符等控制字符（与浏览器名称同一条规则）。
+    非文本、超长 → VALIDATION。含 PostgreSQL 存不了的字符（NUL、不成对的代理项）→ VALIDATION「…不能包含无法保存的
+    字符」，不替所有者悄悄删掉；单行字段（账号名称）另外不收换行、制表符等其他控制字符（与浏览器名称同一条规则）。
     """
     if v is None:
         return None
     if not isinstance(v, str):
         raise validation(f"{label}必须是文本", field=field)
-    if single_line and any(unicodedata.category(ch) in ("Cc", "Cs") for ch in v.strip()):
-        raise validation(f"{label}不能包含换行、制表符等控制字符", field=field)
     if any(ch == "\x00" or unicodedata.category(ch) == "Cs" for ch in v):
         raise validation(f"{label}不能包含无法保存的字符", field=field)
+    if single_line and any(unicodedata.category(ch) == "Cc" for ch in v.strip()):
+        raise validation(f"{label}不能包含换行、制表符等控制字符", field=field)
     s = v.strip()
     if len(s) > max_len:
         raise validation(f"{label}不能超过 {max_len} 个字", field=field)
@@ -112,7 +112,9 @@ def _validate(conn, ws: int, data: dict[str, Any], current: dict[str, Any] | Non
         if key not in _EDITABLE:
             raise validation(f"未知的账号字段：{key}", field=key)
         if key == "name":
-            name = _text_field(v, "账号名称", key, 64, single_line=True)
+            # 单行规则只管新写进来的名称：早先存下的名称（规则之前可能带制表符）原样回传时不挡别的字段的修改
+            unchanged = current is not None and isinstance(v, str) and v.strip() == current.get("name")
+            name = _text_field(v, "账号名称", key, 64, single_line=not unchanged)
             if not name:
                 raise validation("账号名称不能为空", field=key)
             out[key] = name

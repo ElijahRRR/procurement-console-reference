@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from registry import db
+
 from tests.api_helpers import (IMPORT_HEADERS, api, bearer, create_account, err, find_order,  # noqa: F401
                                identity, import_orders, import_row, ok, owner, plugin_client, register_device,
                                run_body, xlsx_bytes)
@@ -68,13 +70,14 @@ def test_account_name_with_control_or_unstorable_characters_is_422_not_500(owner
     但同样不收存不了的字符。请求体按纯 ASCII 的 JSON 发（httpx 的 json= 编码不了代理项）。"""
     headers = {"Content-Type": "application/json"}
     body = json.dumps({"name": bad}).encode("ascii")
+    message = "账号名称不能包含换行、制表符等控制字符" if bad == "a\nb" else "账号名称不能包含无法保存的字符"
     e = err(owner.post("/api/v1/accounts", content=body, headers=headers), 422, "VALIDATION")
-    assert e["detail"]["field"] == "name"
+    assert e["detail"]["field"] == "name" and e["message"] == message
     assert ok(owner.get("/api/v1/accounts"))["total"] == 0
 
     acc = create_account(owner, name="环境-DEMO-A")
     e = err(owner.patch(f"/api/v1/accounts/{acc['id']}", content=body, headers=headers), 422, "VALIDATION")
-    assert e["detail"]["field"] == "name"
+    assert e["detail"]["field"] == "name" and e["message"] == message
     assert ok(owner.get(f"/api/v1/accounts/{acc['id']}"))["name"] == "环境-DEMO-A"
 
     if bad != "a\nb":
@@ -83,6 +86,18 @@ def test_account_name_with_control_or_unstorable_characters_is_422_not_500(owner
         assert e["detail"]["field"] == "notes"
     else:
         assert ok(owner.patch(f"/api/v1/accounts/{acc['id']}", json={"notes": "第一行\n第二行"}))["notes"] == "第一行\n第二行"
+
+
+def test_legacy_account_name_with_a_tab_does_not_block_other_edits(owner, api, clean_db):
+    """规则之前存下的账号名称带制表符：控制台整份回传（名称原样）时照常保存别的字段；改成另一个带制表符的名称才 422。"""
+    acc = create_account(owner, name="环境-DEMO-A")
+    with db.pg_conn(clean_db) as c:
+        c.execute("UPDATE procure.buyer_accounts SET name = %s WHERE id = %s", ("环境\tDEMO-A", acc["id"]))
+    got = ok(owner.get(f"/api/v1/accounts/{acc['id']}"))
+    patched = ok(owner.patch(f"/api/v1/accounts/{acc['id']}", json={**got, "priority": 5}))
+    assert patched["priority"] == 5 and patched["name"] == "环境\tDEMO-A"
+    e = err(owner.patch(f"/api/v1/accounts/{acc['id']}", json={"name": "环境\tDEMO-B"}), 422, "VALIDATION")
+    assert e["detail"]["field"] == "name"
 
 
 def test_browser_list_rename_remove_and_auto_restore(owner, api):

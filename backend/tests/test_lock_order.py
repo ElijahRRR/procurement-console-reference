@@ -345,6 +345,7 @@ def test_f_simulation_reset_vs_allocation_or_account_edit(clean_db, conn, worksp
     got = fx.order_row(conn, o["id"])
     assert (got["status"], got["assigned_account_id"], got["assignment_kind"]) == ("assigned", a["id"], "source")
 
+
 def test_g_result_report_vs_simulation_reset(clean_db, conn, workspace, monkeypatch):
     """(g) 账号 A 有在途的模拟尝试时被人工暂停；插件上报这笔「遇到验证码」（锁住批次、任务、尝试，随后要再暂停 A），
     在暂停 A 之前停住；这时清除模拟结果。A 是人工暂停、不会被恢复，清除不预先锁它，等上报提交后照常清除。"""
@@ -373,5 +374,57 @@ def test_g_result_report_vs_simulation_reset(clean_db, conn, workspace, monkeypa
     assert result == {"report": "ok", "reset": "ok"}
     assert summary["accounts_resumed"] == [] and summary["orders_restored"] == [o["id"]]
     assert _account(conn, a["id"])["execution_paused"] is True                    # 人工暂停不被自动恢复
+    got = fx.attempt_row(conn, att["attempt_id"])
+    assert (got["status"], got["resolution"]) == ("aborted", "simulation_reset")
+
+
+@pytest.mark.parametrize("third", ["priority", "resume"])
+def test_h_result_report_vs_simulation_reset_vs_account_edit(clean_db, conn, workspace, monkeypatch, third):
+    """(h) 三方：插件上报这笔「遇到验证码」（锁住批次、任务、尝试），在暂停账号 A 之前停住；这时清除模拟结果，
+    再改 A 的优先级或恢复 A（锁 A 行、随后取分配锁重新分配）。清除先在批次行上排队、不先拿分配锁，改账号能做完，
+    上报随后暂停 A、提交，清除最后把只因模拟结果暂停的 A 恢复。清除如果先取了分配锁再等批次行，就是
+    「上报等 A 行 → 改账号等分配锁 → 清除等批次行」的环。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    a = fx.exec_account(conn, ws, name="环境-DEMO-A")
+    dev = fx.logged_in_device(conn, workspace, account=a)
+    o = fx.assigned_order(conn, ws, a)
+    att = fx.claim(conn, dev, fx.start(conn, dev))
+    if third == "resume":
+        accounts.pause(conn, ws, a["id"], "DEMO 人工暂停", actor_kind="user", actor_id=uid)
+    conn.commit()
+
+    gate = Gate()
+    real = accounts.pause
+
+    def paused(c, w, account_id, reason, **kw):
+        if threading.current_thread().name == "lock-order-report" and not gate.reached.is_set():
+            gate.hold()                                     # 批次、任务、尝试已锁，A 还没暂停
+        return real(c, w, account_id, reason, **kw)
+
+    monkeypatch.setattr(accounts, "pause", paused)
+    edit = ((lambda c: accounts.update(c, ws, a["id"], {"priority": 7}, uid)) if third == "priority"
+            else (lambda c: accounts.resume(c, ws, a["id"], actor_kind="user", actor_id=uid)))
+    summary: dict[str, Any] = {}
+    race = Race(clean_db)
+    try:
+        race.start("report", lambda c: execution.report_result(c, dev, att["attempt_id"],
+                                                                 fx.failure_payload("CAPTCHA_ENCOUNTERED")))
+        assert gate.reached.wait(BLOCK_WAIT_S), f"report 没有走到停住的位置：{race.result}"
+        race.start("reset", lambda c: summary.update(simulation.reset(c, ws, uid)))
+        assert race.wait_blocked("reset"), f"reset 没有在等 report 的锁：{race.result}"
+        race.start(third, edit)
+        end = time.monotonic() + BLOCK_WAIT_S               # 改账号要么做完，要么停在锁上（修复前停在分配锁上）
+        while race.threads[third].is_alive() and time.monotonic() < end:
+            if race.wait_blocked(third):
+                break
+    finally:
+        gate.go.set()
+        result = race.finish()
+    assert result == {"report": "ok", "reset": "ok", third: "ok"}
+    assert summary["orders_restored"] == [o["id"]] and summary["accounts_resumed"] == [a["id"]]
+    row = _account(conn, a["id"])
+    assert row["execution_paused"] is False                 # 上报的暂停起因是模拟结果，清除时恢复
+    if third == "priority":
+        assert row["priority"] == 7
     got = fx.attempt_row(conn, att["attempt_id"])
     assert (got["status"], got["resolution"]) == ("aborted", "simulation_reset")
