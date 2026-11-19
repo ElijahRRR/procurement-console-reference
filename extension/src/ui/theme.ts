@@ -170,6 +170,14 @@ ${scope} {
 .pc-notice-warning { background: var(--pc-warning-soft); color: var(--pc-warning); }
 .pc-notice-danger { background: var(--pc-danger-soft); color: var(--pc-danger); }
 .pc-notice-brand { background: var(--pc-brand-soft); color: var(--pc-brand-strong); }
+.pc-notice-success { background: var(--pc-success-soft); color: var(--pc-success); }
+.pc-notice-muted { background: var(--pc-bg-muted); color: var(--pc-text-body); }
+.pc-status-extra { margin-top: 6px; }
+.pc-status-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.pc-status .pc-btn { background: var(--pc-bg-surface); color: var(--pc-text-body); }
+.pc-idline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.pc-idline-k { font-size: 12px; line-height: 16px; opacity: 0.85; }
+.pc-id { font-size: 13px; line-height: 20px; user-select: all; -webkit-user-select: all; overflow-wrap: anywhere; }
 `;
 }
 

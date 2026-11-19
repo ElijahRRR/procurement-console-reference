@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /**
- * 设置：全局默认配送上限、模拟模式（本阶段只读）、物流同步时间（第二个 PR 启用）、文件导入的准入规则、清除模拟结果。
+ * 设置：本工作区 ID（多个工作区时插件设置里要填）、全局默认配送上限、模拟模式（本阶段只读）、物流同步时间（第二个 PR 启用）、
+ * 文件导入的准入规则、清除模拟结果。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import type { FeishuAdmission, Settings } from '@/api/types'
@@ -10,8 +11,10 @@ import AppIcon from '@/components/AppIcon.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { ADMISSION_FIELDS, FILE_ADMISSION_DEFAULTS, admissionEquals, defaultsHint, fullAdmission } from '@/utils/admission'
 import { resetSummary } from '@/utils/results'
-import { confirmAction, notifyFailure, notifySuccess, notifySummary } from '@/utils/feedback'
+import { confirmAction, notifyFailure, notifySuccess, notifySummary, toast } from '@/utils/feedback'
+import { copyText } from '@/utils/clipboard'
 import { loadAppFlags } from '@/stores/app'
+import { session } from '@/stores/session'
 
 const settings = ref<Settings | null>(null)
 const loading = ref(false)
@@ -20,6 +23,15 @@ const resetting = ref(false)
 const savingAdmission = ref(false)
 const maxDays = ref<number | undefined>(10)
 const fileAdmission = reactive<FeishuAdmission>(fullAdmission(null, FILE_ADMISSION_DEFAULTS))
+
+/** 当前登录的工作区（/auth/me） */
+const workspace = computed(() => session.me?.workspace ?? null)
+
+async function copyWorkspaceId() {
+  if (!workspace.value) return
+  if (await copyText(String(workspace.value.id))) toast('工作区 ID 已复制')
+  else notifyFailure('复制工作区 ID', '浏览器不允许访问剪贴板，请手动选中后复制')
+}
 
 /** 服务端当前生效的文件准入规则（缺省 + 工作区改过的项） */
 const savedAdmission = computed(() => fullAdmission(settings.value?.file_admission, FILE_ADMISSION_DEFAULTS))
@@ -123,6 +135,22 @@ async function resetSimulation() {
     <PageHeader title="全局设置" description="设置项的修改以服务端为准，插件在下一次心跳拿到最新的有效配置。" />
 
     <div v-loading="loading" class="grid max-w-4xl grid-cols-1 gap-6">
+      <el-card v-if="workspace" shadow="always" data-testid="workspace-card">
+        <template #header><h3 class="text-base font-semibold text-gray-900 dark:text-white">工作区</h3></template>
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div class="min-w-0 max-w-xl">
+            <p class="text-sm font-medium text-gray-900 dark:text-white">本工作区 ID</p>
+            <p class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">
+              当前工作区是「{{ workspace.name }}」。系统里有多个工作区时，插件设置里要填它；只有一个工作区时不用填。
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="code select-all" data-testid="workspace-id">{{ workspace.id }}</span>
+            <el-button size="small" @click="copyWorkspaceId"><AppIcon name="copy" size="sm" class="mr-1.5" />复制</el-button>
+          </div>
+        </div>
+      </el-card>
+
       <el-card shadow="always">
         <template #header><h3 class="text-base font-semibold text-gray-900 dark:text-white">执行</h3></template>
         <div class="divide-y divide-gray-100 dark:divide-dark-700">

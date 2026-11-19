@@ -4,13 +4,13 @@
  * 导航栏夹具离线验证（夹具里塞满了隐藏模板副本、页脚 signin 链接、标题里的 "sign in"
  * 等干扰项，选择器写松了当场露馅）。
  *
- * 本 PR 只移植身份识别需要的部分；购物车、结算、下单那一套页面流程随真实驱动在后续 PR 迁入。
+ * 只移植了身份识别需要的部分；购物车、结算、下单那一套页面流程随真实驱动在后续 PR 迁入。
  */
 
 /** 导航栏选择器。登录状态只能从页面上看出来（插件不申请 cookies 权限），判据按可信度排：
  *    1. URL 落在 /ap/signin —— 对**这一页**最硬，不需要解析任何 DOM。已登录时的重新验证页也落在这里，
  *       所以它只说明「这一页要求登录」；多个标签页之间谁说了算由后台按页面加载先后对账
- *       （core/identity.reconcileIdentity），有分歧时往安全的一侧（不报「是绑定账号」）；
+ *       （core/identity.reconcileIdentity），有分歧时上报 conflict，服务端不解析账号；
  *    2. #nav-item-signout 在不在 —— 结构判据，只有签入的页面才发这个节点；
  *    3. #nav-link-accountList 的 href 指向哪 —— 结构判据；
  *    4. 问候语文案 —— **只做辅助**，只能把结论往「已登出」推，从不用来断定「已登录」。 */
@@ -26,8 +26,9 @@ export const NAV = {
   signInPath: "/ap/signin",
 } as const;
 
-/** `ok` 已登录 / `signed_out` 已登出 / `unknown` 读不出来。**unknown 不是 ok。** */
-export type LoginState = "ok" | "signed_out" | "unknown";
+/** 这一页上读到的登录状态：`ok` 已登录 / `signed_out` 已登出 / `unknown` 读不出来。**unknown 不是 ok。**
+ *  （服务端解析后的登录状态全集是另一回事，见 core/types.LoginStateName。） */
+export type PageLogin = "ok" | "signed_out" | "unknown";
 
 const text = (el: Element | null | undefined): string => (el?.textContent ?? "").replace(/\s+/g, " ").trim();
 
@@ -66,7 +67,7 @@ export function isSignInUrl(url: string | null | undefined): boolean {
 /** 输入：一张亚马逊页面与它的地址（默认取 doc.URL）→ 输出：这个浏览器此刻的登录状态。
  *
  *  三个信号一个都读不到 → `unknown`。**不许兜底成 ok**：判不出来时放行，这道闸就等于不存在。 */
-export function readLoginState(doc: Document, url?: string | null): LoginState {
+export function readLoginState(doc: Document, url?: string | null): PageLogin {
   let href = url ?? "";
   if (url === undefined) {
     try {
@@ -100,33 +101,44 @@ export function readLoginState(doc: Document, url?: string | null): LoginState {
   return "unknown";
 }
 
-/** 买家号 ID 的形态：`A` 开头 + 至少 8 位大写字母或数字。形状不对就当没读到 ——
- *  一个空串或半截值送上去，会被当成「这个浏览器登着谁」。 */
-const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/;
+/** 买家号 ID 的形态：`A` 开头 + 至少 8 位大写字母或数字（与服务端 accounts.CUSTOMER_ID_RE 同一条）。
+ *  形状不对就当没读到 —— 一个空串或半截值送上去，会被当成「这个浏览器登着谁」。 */
+export const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/;
 
-/** 页面 HTML 里那一处 `customerId`。`customerId: "A…"`、`'customerId': 'A…'`、
- *  `"customerId": "A…"` 都认。`g` 标志是关键：要扫全部匹配，不是只取第一个。 */
+/** 内联脚本里那一处 `customerId`。参考项目的两种写法 `customerId: "A…"`、`customerId: 'A…'`，
+ *  外加键上带引号的 `'customerId': 'A…'`、`"customerId": "A…"` 都认。
+ *  `g` 标志是关键：要扫全部匹配，不是只取第一个。 */
 const CUSTOMER_ID_SCAN = /['"]?customerId['"]?\s*:\s*['"]([^'"]*)['"]/g;
 
-/** 输入：一张亚马逊页面 → 输出：这个浏览器登着的买家号 ID；抠不到返回 undefined。
+/** 输入：一张亚马逊页面 → 输出：这个浏览器登着的买家号 ID；抠不到（或读数自相矛盾）返回 undefined。
  *
- *  它是内联脚本里的一个字段，没有稳定的 DOM 节点带着它，只能在整页 HTML 上跑正则。
- *  比参考插件紧的两处：
- *    1. 扫全部匹配，取第一个**形状对得上**的 —— 页面上先出现的 `customerId: ""`
- *       （未登录模板、埋点占位）不能把结论废掉；
- *    2. 形状不对就当没读到，不把空串、"0"、半截值送上去。 */
+ *  买家号 ID 现在是「领谁的任务」的钥匙，读错不再是被拒绝，而是去执行别的账号。所以：
+ *    1. **只在内联脚本的文本里找**（`script:not([src])`）。不扫标题、属性、正文：搜索词会被回显进
+ *       `<title>` 与搜索框的 value，商品标题是卖家写的 —— 在整页 HTML 上跑正则，任何人都能往里塞一个
+ *       `customerId: 'A…'`；
+ *    2. **所有形状合格的匹配必须是同一个值**。出现第二个值（页面组件里别人的 ID、被回显进脚本的文本）
+ *       就当没读到，不猜哪个是真的；
+ *    3. 形状不对的（空串、"0"、半截值）跳过，不让未登录模板、埋点占位把结论废掉。
+ *  读不到时登录状态是「已登录，没读到买家号 ID」：不登记、不领任务，面板提示打开订单页。 */
 export function readCustomerId(doc: Document): string | undefined {
-  let html = "";
+  let scripts: Element[];
   try {
-    html = doc.documentElement?.innerHTML ?? "";
+    scripts = Array.from(doc.querySelectorAll("script:not([src])"));
   } catch {
     return undefined;
   }
-  // lastIndex 是有状态的：正则是模块级常量，每次都从头扫。
-  CUSTOMER_ID_SCAN.lastIndex = 0;
-  for (let m = CUSTOMER_ID_SCAN.exec(html); m; m = CUSTOMER_ID_SCAN.exec(html)) {
-    const v = (m[1] ?? "").trim();
-    if (CUSTOMER_ID_RE.test(v)) return v;
+  let found: string | undefined;
+  for (const el of scripts) {
+    const code = el.textContent ?? "";
+    if (!code.includes("customerId")) continue;
+    // lastIndex 是有状态的：正则是模块级常量，每段脚本都从头扫。
+    CUSTOMER_ID_SCAN.lastIndex = 0;
+    for (let m = CUSTOMER_ID_SCAN.exec(code); m; m = CUSTOMER_ID_SCAN.exec(code)) {
+      const v = (m[1] ?? "").trim();
+      if (!CUSTOMER_ID_RE.test(v)) continue;
+      if (found === undefined) found = v;
+      else if (found !== v) return undefined; // 两个不同的值：谁也不信
+    }
   }
-  return undefined;
+  return found;
 }

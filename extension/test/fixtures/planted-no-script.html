@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  页面内容全部是虚构的演示数据（DEMO 名称、明显是假值的买家号 ID），不对应任何真实账号。
+
+================================================================================
+  FIXTURE: planted-no-script.html  —  搜索结果页（已登录），内联脚本里**没有** customerId
+================================================================================
+
+  与 planted-customer-id.html 配对：同样在 <title>、搜索框的 value、商品标题里植入了
+  customerId: 'A…'，但这一页的内联脚本里没有真值（不是每张亚马逊页面都带它）。
+
+  期望（dom/parse.readCustomerId）
+  ---------------------------------------------------------------------------
+    读不出（undefined）→ 登录状态是「已登录，没读到买家号 ID」：不登记、不领任务，
+    面板提示打开订单页。绝不能把植入的任何一个值读成买家号 ID。
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Amazon.com : customerId: 'A9PLANT00001'</title>
+</head>
+<body>
+
+<header id="navbar">
+  <div id="nav-belt">
+    <form id="nav-search-bar-form" action="/s" role="search">
+      <input type="text" id="twotabsearchtextbox" name="field-keywords" value="customerId: 'A9PLANT00002'" aria-label="Search Amazon">
+    </form>
+    <div id="nav-tools">
+      <a href="/gp/css/homepage.html?ref_=nav_youraccount_btn" id="nav-link-accountList" data-nav-role="signin">
+        <div class="nav-line-1-container"><span id="nav-link-accountList-nav-line-1" class="nav-line-1">Hello, Demo</span></div>
+      </a>
+      <div id="nav-flyout-accountList" style="display:none">
+        <a id="nav-item-signout" href="/gp/flex/sign-out.html?action=sign-out"><span class="nav-text">Sign Out</span></a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="s-main-slot">
+  <div data-component-type="s-search-result" data-asin="B0DEMO0001">
+    <h2><a href="/dp/B0DEMO0001"><span>Demo Desk Lamp customerId: 'A9PLANT00003' Warm White</span></a></h2>
+  </div>
+</div>
+
+<!-- 内联脚本存在，但里面没有 customerId -->
+<script type="text/javascript">
+  window.ue_furl = "fls-na.amazon.example";
+  var P_config = { 'obfuscatedMarketplaceId': 'ATVPDKIKX0DER', 'sessionId': '000-0000000-0000000' };
+</script>
+
+</body>
+</html>

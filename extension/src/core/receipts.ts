@@ -4,7 +4,8 @@
  *   · 后台在把一笔结果发给服务端**之前**先存一份回执（chrome.storage.local，后台重启、浏览器重启都在）；
  *   · 送达（200，含服务端认出是重复上报的 duplicate）或服务端明确不收（4xx）之后删掉；
  *     尝试已是「结果待核实」时送到的不同结果，服务端记成迟到回执（409，detail.late_receipt_recorded）—— 也算送达；
- *   · 没说上话（断网、超时、后台被回收）或服务端 5xx：留着补交，最多保留 24 小时。补交的时机：
+ *   · 没说上话（断网、超时、后台被回收）、服务端 5xx、或服务端暂时不认识这个浏览器（401，后台会重新登记）：
+ *     留着补交，最多保留 24 小时。补交的时机：
  *     后台启动时、每一次心跳成功时（服务端连得上：不等退避，立即补交）、以及回执闹钟（30 秒一次，按退避节奏）。
  *     发起上报的那一路（引擎）还在自己重发的回执（还没被后台补交过、补交时间未到）不抢着发。
  * 提交登记（/submitting）永远不进回执、永远不补发：登记即「可能已下单」。
@@ -47,10 +48,14 @@ export function isLateReceipt(e: ApiError): boolean {
   return e.kind === "http" && e.status === 409 && isObj(e.detail) && e.detail.late_receipt_recorded === true;
 }
 
-/** 输入：结果上报的失败 → 输出：值不值得原样再发一次（没说上话、服务端 5xx）。 */
+/** 输入：结果上报的失败 → 输出：值不值得原样再发一次（没说上话、服务端 5xx、服务端暂时不认识这个浏览器）。
+ *
+ *  401 也留着再发：令牌不会被撤销（没有配对与撤销了），401 只表示「服务端这会儿不认识这个浏览器」——
+ *  后台会带着同一个令牌重新登记再发一次；重新登记没成功（服务端正在重启）时回执不能就此丢掉。
+ *  服务端换了库的话，重新登记之后这一笔会得到 404，那才是「明确不收」。 */
 export function isRetryableResultError(e: ApiError): boolean {
   if (e.kind !== "http") return true; // network / bad_response：不知道服务端收没收到，同一份再发一次无害
-  return e.status !== null && e.status >= 500;
+  return e.status !== null && (e.status >= 500 || e.status === 401);
 }
 
 export type ReplyVerdict = "delivered" | "retry" | "drop";
@@ -60,7 +65,7 @@ export function classifyResultReply(r: ApiResult<unknown>): ReplyVerdict {
   if (r.ok) return "delivered";
   if (isLateReceipt(r.error)) return "delivered";
   if (isRetryableResultError(r.error)) return "retry";
-  return "drop"; // 服务端明确不收（尝试不存在、结果与已登记的不一致、令牌已撤销……），再发答案也一样
+  return "drop"; // 服务端明确不收（尝试不存在、结果与已登记的不一致……），再发答案也一样
 }
 
 const sameBody = (a: ResultIn, b: ResultIn): boolean => JSON.stringify(a) === JSON.stringify(b);

@@ -2,6 +2,7 @@
 
 import { withTimeout } from "../core/gates.js";
 import type { Msg, StateSnapshot } from "../core/messages.js";
+import { fastSyncWanted } from "../core/status.js";
 
 /** 输入：消息、超时 → 输出：后台的答复；后台没有响应时抛错（调用方按「没说上话」处理）。 */
 export async function toSw<T>(msg: Msg, timeoutMs = 30_000): Promise<T> {
@@ -29,11 +30,13 @@ export function syncNow(reason: string, minAgeMs = 5_000): void {
   void toSw({ type: "pc.sync", reason, minAgeMs }, 60_000).catch(() => undefined);
 }
 
-/** 已配对、还没绑定账号时，看得见的页面多久同步一次。 */
-export const UNBOUND_SYNC_MS = 10_000;
+/** 买家号还没有登记时，看得见的页面多久同步一次。 */
+export const FAST_SYNC_MS = 10_000;
 
-/** 输入：取当前状态的函数 → 输出：无。界面打开、回到前台时同步一次；已配对还没绑定账号、页面又看得见时，
- *  每 10 秒同步一次（控制台里一绑定，这里马上显示账号、「开始执行」可以点）。 */
+/** 输入：触发原因、取当前状态的函数 → 输出：无。界面打开、回到前台时同步一次（还没连上服务端时，
+ *  这一次同步也会让后台再试一次登记）。登录状态是「买家号还没有登记」、页面又看得见时每 10 秒同步一次，
+ *  自这个状态出现起最多 10 分钟（core/status.fastSyncWanted）：所有者在控制台点了「登记」，
+ *  这里几秒内显示账号、「开始执行」可以点。其余状态只靠后台 60 秒一次的心跳。 */
 export function keepFresh(reason: string, getState: () => StateSnapshot | null): void {
   syncNow(reason);
   document.addEventListener("visibilitychange", () => {
@@ -41,9 +44,34 @@ export function keepFresh(reason: string, getState: () => StateSnapshot | null):
   });
   setInterval(() => {
     const s = getState();
-    if (document.visibilityState !== "visible" || !s?.device.paired || s.config?.heartbeat.account) return;
-    syncNow("等待绑定账号", UNBOUND_SYNC_MS - 2_000);
-  }, UNBOUND_SYNC_MS);
+    if (document.visibilityState !== "visible" || !s || !fastSyncWanted(s.config, Date.now())) return;
+    syncNow("等待登记买家号", FAST_SYNC_MS - 2_000);
+  }, FAST_SYNC_MS);
+}
+
+/** 输入：要复制的文本、临时节点挂在哪（面板的 Shadow DOM 根或页面的 body）→ 输出：复制成没成。
+ *  先用 navigator.clipboard（要页面有焦点、在点击里调用；不需要 clipboardWrite 权限）；
+ *  不行再退回「选中临时文本框 + 复制命令」。临时节点只挂在我们自己的容器里，用完就摘掉。 */
+export async function copyText(text: string, mount: ParentNode): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // 落到下面的退路
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    mount.append(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 /** 输入：变化回调 → 输出：取消订阅的函数。chrome.storage.local 里任何插件键变化都会触发（合并 150 毫秒）。 */

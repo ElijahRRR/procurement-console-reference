@@ -1,10 +1,11 @@
-"""进程内的失败次数限速（本机部署，单进程）：登录与插件配对的暴力尝试。
+"""进程内的失败次数限速（本机部署，单进程）：登录的暴力尝试。
 
 - POST /api/v1/auth/login：键 = 客户端 IP + 用户名（去空白、小写）；窗口内失败满 settings.login_fail_limit 次 → 429。
-- POST /plugin/v1/pair：键 = 客户端 IP；窗口内失败满 settings.pair_fail_limit 次 → 429。
 - 失败 = 响应状态 401 / 404 / 409 / 422；登录成功清掉该键的失败记录。窗口 = settings.rate_window_s（默认 600 秒）。
-- 被限速时不调用后面的应用（不验证密码、不消耗配对码），返回
+- 被限速时不调用后面的应用（不验证密码），返回
   ``429 {code: 'RATE_LIMITED', message: '尝试次数过多，请稍后再试', detail: {retry_after_s}}`` 与 Retry-After 头。
+- 插件接口不在这里限速：/plugin 只接受本机对端（server/limits.PluginGateMiddleware），浏览器登记的数量由
+  settings.max_devices 封顶（services/devices.register，满了同样回 429 RATE_LIMITED）。
 
 纯 ASGI 中间件：要读登录请求体里的用户名，先把请求体读进来再原样交给后面的应用（请求体大小由外层的
 bodylimit 中间件限制）。时间取 services.clock（测试可冻结）。
@@ -75,11 +76,9 @@ class FailureLimiter:
             self._fails.pop(key, None)
 
 
-def default_rules(login_path: str, pair_path: str) -> tuple[Rule, ...]:
-    """输入：登录与配对的完整路径 → 输出：按 registry.settings 的上限生成的两条规则。"""
-    s = settings.get()
-    return (Rule("POST", login_path, int(s.login_fail_limit), True),
-            Rule("POST", pair_path, int(s.pair_fail_limit), False))
+def default_rules(login_path: str) -> tuple[Rule, ...]:
+    """输入：登录接口的完整路径 → 输出：按 registry.settings 的上限生成的规则（只有登录一条）。"""
+    return (Rule("POST", login_path, int(settings.get().login_fail_limit), True),)
 
 
 class RateLimitMiddleware:

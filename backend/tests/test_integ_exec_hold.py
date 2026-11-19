@@ -23,7 +23,7 @@ from services import clock, execution, orders
 from tests import factories as f
 from tests import factories_exec as fx
 from tests.api_helpers import (api, bearer, create_account, err, find_order, good_facts, import_orders,  # noqa: F401
-                               import_row, ok, owner, pair_device, plugin_client, view_nos)
+                               import_row, ok, owner, plugin_client, register_device, run_body, view_nos)
 
 NOW = datetime(2026, 10, 31, 2, 0, tzinfo=timezone.utc)   # 北京 2026-10-31 10:00
 
@@ -44,9 +44,9 @@ def _executing_over_http(owner, api, no: str, *, console_review: bool = False):
         import_orders(owner, [import_row(no)])
     assert find_order(owner, no)["status"] == "assigned"
     plugin = plugin_client(api)
-    dev = pair_device(owner, plugin, account=acc)
+    dev = register_device(plugin, acc)
     h = bearer(dev["token"])
-    run = ok(plugin.post("/plugin/v1/runs", json={"trigger": "manual", "simulated": True}, headers=h))
+    run = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h))
     att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h))["attempt"]
     assert att is not None and att["upstream_order_no"] == no
     pr = ok(plugin.post(f"/plugin/v1/attempts/{att['attempt_id']}/progress", json={"stage": "checkout"}, headers=h))
@@ -122,7 +122,7 @@ def _frozen(clean_db):
 def test_feishu_primary_revokes_review_mid_attempt(_frozen, conn, workspace, review, value):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = f.feishu_source(conn, ws, "recDEMOHOLD01")
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no="PO-DEMO-FSREV")
     assert order["status"] == "assigned" and order["primary_source_kind"] == "feishu"
@@ -152,7 +152,7 @@ def test_console_approved_sim_purchase_then_new_batch_rejects_reset_lands_in_rev
 
     ws, uid = workspace["id"], workspace["user_id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     o = f.ingest_ready_order(conn, ws, source=f.file_source(conn, ws, 2), upstream_order_no="PO-DEMO-CRST",
                              review="unknown", review_value=None)
     assert o["status"] == "pending_review"

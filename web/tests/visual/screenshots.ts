@@ -133,6 +133,44 @@ async function shot(page: Page, name: string, fullPage = true, viewport = DESKTO
   console.log(`  ${file}`)
 }
 
+// ── 几个场景共用的步骤（桌面与手机宽度各截一次）──
+
+/** 订单来源 → 飞书：打开「补充订单表（DEMO）」的读取记录（最近一次读取找不到买家号列：连接级提醒 + 暂不接收的新记录） */
+async function openFeishuRuns(page: Page) {
+  await page.goto(`${BASE}/sources?tab=feishu`)
+  await page.waitForSelector('[data-testid="connection-problem"]')
+  const card = page.locator('.el-card', { hasText: '补充订单表（DEMO）' })
+  await card.getByRole('button', { name: '查看读取记录' }).click()
+  await page.waitForSelector('.el-dialog [data-testid="run-problems"]')
+}
+
+/** 浏览器页签里点「浏览器 11」那一行的「登记」：来源里的名称与一个还没登记 ID 的账号同名，对话框里提示可以直接填到它上面 */
+async function registerFromBrowsersTab(page: Page) {
+  await page.goto(`${BASE}/accounts?tab=browsers`)
+  await page.waitForSelector('#pane-browsers .el-table__row')
+  await page.locator('#pane-browsers .el-table__body .el-table__row', { hasText: '浏览器 11' }).getByRole('button', { name: '登记', exact: true }).click()
+  await page.waitForSelector('[data-testid="register-same-name"]')
+}
+
+/** 来源指定了买家号、人工改派到别的账号的任务：点「解除分配」，看确认框 */
+async function openUnassignConfirm(page: Page) {
+  await page.goto(`${BASE}/orders?view=today&q=SKU26`)
+  await page.waitForSelector('.el-table__row')
+  await page.locator('.el-table__row').first().click()
+  await page.waitForSelector('[data-testid="designated-buyer"]')
+  await page.getByRole('button', { name: '解除分配' }).click()
+  await page.waitForSelector('.el-message-box')
+}
+
+/** 文件导入：上传后停在字段对应一步（买家号两列的说明在这一步） */
+async function openFileMapping(page: Page) {
+  await page.goto(`${BASE}/sources?tab=file`)
+  await page.waitForSelector('.el-upload-dragger')
+  await page.locator('input[type=file]').setInputFiles({ name: 'orders-demo-today.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from('PK demo') })
+  await page.waitForSelector('[data-testid="designation-help"]')
+  await page.locator('[data-testid="designation-help"]').scrollIntoViewIfNeeded()
+}
+
 interface Scene {
   name: string
   run: (page: Page) => Promise<void>
@@ -162,6 +200,61 @@ const scenes: Scene[] = [
     run: async (page) => {
       await page.goto(`${BASE}/orders?view=needs_info`)
       await page.waitForSelector('.el-table__row')
+    },
+  },
+  {
+    // 待分配：来源指定了买家号而分不出去的任务，说明列写明原因
+    name: 'orders-unassigned',
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=unassigned`)
+      await page.waitForSelector('.el-table__row')
+    },
+  },
+  {
+    // 来源指定了 环境-DEMO-01、人工改派到 环境-DEMO-02 的任务：「分配」区多一行「来源指定的买家号」，带「已人工改派到」
+    name: 'order-drawer-designated',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=today&q=SKU26`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('[data-testid="designated-buyer"]')
+    },
+  },
+  {
+    // 来源指定的买家号还没登记的任务：改派对话框在原说明前说明改派与来源指定的关系
+    name: 'order-drawer-designated-assign',
+    fullPage: false,
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=unassigned`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row', { hasText: '还没有登记为账号' }).first().click()
+      await page.waitForSelector('[data-testid="designated-buyer"]')
+      await page.getByRole('button', { name: '改派账号' }).click()
+      await page.waitForSelector('[data-testid="assign-designation-note"]')
+    },
+  },
+  {
+    // 解除分配的确认框：来源指定了买家号时说明下次分配仍按来源指定（接得了分给它，接不了停在待分配），引用「名称（ID）」
+    name: 'order-drawer-designated-unassign',
+    fullPage: false,
+    themes: ['light'],
+    run: openUnassignConfirm,
+  },
+  {
+    // 时间线：文件来源写的买家号没被采用（来源指定未采用）
+    name: 'order-drawer-designated-events',
+    fullPage: false,
+    themes: ['light', 'dark'],
+    run: async (page) => {
+      await page.goto(`${BASE}/orders?view=today&q=SKU26`)
+      await page.waitForSelector('.el-table__row')
+      await page.locator('.el-table__row').first().click()
+      await page.waitForSelector('text=来源指定未采用')
+      await page.getByText('来源指定未采用').first().scrollIntoViewIfNeeded()
     },
   },
   {
@@ -238,6 +331,12 @@ const scenes: Scene[] = [
     },
   },
   {
+    // 读取记录：连接级问题作为提醒行，记录级问题与立即同步的提示同一格式
+    name: 'sources-feishu-runs',
+    fullPage: false,
+    run: openFeishuRuns,
+  },
+  {
     name: 'sources-feishu-unconfigured',
     opts: { feishuConfigured: false },
     themes: ['light'],
@@ -280,6 +379,13 @@ const scenes: Scene[] = [
     },
   },
   {
+    // 字段对应一步：买家号两列的说明（文件导入多一句「空着重新上传不会清除指定」）
+    name: 'sources-file-mapping',
+    fullPage: false,
+    themes: ['light'],
+    run: openFileMapping,
+  },
+  {
     name: 'sources-file-preview',
     run: async (page) => {
       await page.goto(`${BASE}/sources?tab=file`)
@@ -316,20 +422,40 @@ const scenes: Scene[] = [
     },
   },
   {
-    name: 'devices',
+    // 登记一个插件读到的买家号：账号对话框里 ID 已填、名称用来源里的名称预填
+    name: 'accounts-register',
+    fullPage: false,
+    themes: ['light'],
     run: async (page) => {
-      await page.goto(`${BASE}/accounts?tab=devices`)
-      await page.waitForSelector('#pane-devices .el-table__row')
+      await page.goto(`${BASE}/accounts?tab=accounts`)
+      await page.waitForSelector('[data-testid="discovered-buyers"]')
+      await page.getByRole('button', { name: '登记', exact: true }).first().click()
+      await page.waitForSelector('.el-dialog .el-form')
     },
   },
   {
-    name: 'devices-pairing',
+    // 浏览器页签里登记：与待登记列表的「登记」一样带来源里的名称；已有同名、没登记 ID 的账号时提示可以直接填到它上面
+    name: 'accounts-register-from-browser',
     fullPage: false,
+    themes: ['light', 'dark'],
+    run: registerFromBrowsersTab,
+  },
+  {
+    name: 'browsers',
     run: async (page) => {
-      await page.goto(`${BASE}/accounts?tab=devices`)
-      await page.waitForSelector('#pane-devices .el-table__row')
-      await page.getByRole('button', { name: '生成配对码' }).first().click()
-      await page.waitForSelector('text=DEMO7K2Q')
+      await page.goto(`${BASE}/accounts?tab=browsers`)
+      await page.waitForSelector('#pane-browsers .el-table__row')
+    },
+  },
+  {
+    // 带上已从列表移除的浏览器
+    name: 'browsers-removed',
+    themes: ['light'],
+    run: async (page) => {
+      await page.goto(`${BASE}/accounts?tab=browsers`)
+      await page.waitForSelector('#pane-browsers .el-table__row')
+      await page.getByText('显示已移除').click()
+      await page.waitForSelector('text=已移除')
     },
   },
   {
@@ -363,12 +489,13 @@ const scenes: Scene[] = [
     [
       ['phone-overview', '/', '.stat-card'],
       ['phone-orders', '/orders?view=today', '.el-table__row'],
+      ['phone-orders-unassigned', '/orders?view=unassigned', '.el-table__row'],
       ['phone-exceptions', '/exceptions?view=needs_attention', '.el-table__row'],
       ['phone-records', '/records?view=purchased', '.el-table__row'],
       ['phone-sources-feishu', '/sources?tab=feishu', '.el-card'],
       ['phone-sources-file', '/sources?tab=file', '.el-upload-dragger'],
       ['phone-accounts', '/accounts?tab=accounts', '#pane-accounts .el-table__row'],
-      ['phone-devices', '/accounts?tab=devices', '#pane-devices .el-table__row'],
+      ['phone-browsers', '/accounts?tab=browsers', '#pane-browsers .el-table__row'],
       ['phone-settings', '/settings', '.el-card'],
     ] as const
   ).map(
@@ -381,6 +508,23 @@ const scenes: Scene[] = [
       },
     }),
   ),
+  // 本轮改过的弹窗与对话框在手机宽度下（不出现横向滚动）
+  { name: 'phone-sources-feishu-runs', themes: ['light'], fullPage: false, run: openFeishuRuns },
+  { name: 'phone-accounts-register-from-browser', themes: ['light'], fullPage: false, run: registerFromBrowsersTab },
+  { name: 'phone-order-drawer-designated-unassign', themes: ['light'], fullPage: false, run: openUnassignConfirm },
+  { name: 'phone-sources-file-mapping', themes: ['light'], fullPage: false, run: openFileMapping },
+  {
+    // 账号对话框：每段说明紧跟在自己的输入框下面（单列时名称的说明不会跑到买家号 ID 下面）
+    name: 'phone-accounts-dialog',
+    themes: ['light'],
+    fullPage: false,
+    run: async (page) => {
+      await page.goto(`${BASE}/accounts?tab=accounts`)
+      await page.waitForSelector('#pane-accounts .el-table__row')
+      await page.getByRole('button', { name: '新建账号' }).first().click()
+      await page.waitForSelector('[data-testid="account-name-help"]')
+    },
+  },
   {
     name: 'phone-order-drawer',
     themes: ['light'],

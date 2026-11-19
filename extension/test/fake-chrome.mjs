@@ -5,7 +5,8 @@
  *   const env = installFakeChrome({ fetch: srv.fetch });
  *   await env.startWorker();              // 加载（或「重启」）后台：清掉旧监听器、重新 import 一个新实例
  *   env.addTab(3, "https://www.amazon.com/gp/css/order-history", (msg) => ({ ... }));  // 内容脚本的答复
- *   await env.fromTab(3, { type: "pc.hello", ... });   // 内容脚本发给后台的消息
+ *   await env.fromTab(3, { type: "pc.hello", ... });   // 内容脚本发给后台的消息（sender.tab 有值）
+ *   await env.fromPage({ type: "pc.saveSettings", ... }); // 扩展自己的页面发给后台的消息（sender.url 在扩展源下）
  *   await env.fireAlarm("pc.runBeat");
  *   await env.settle();                   // 等后台的后续动作（void 掉的异步）跑完
  *
@@ -114,7 +115,10 @@ function fakeIndexedDB() {
 }
 
 /** 输入：{fetch, manifestVersion} → 输出：测试驱动用的环境对象；同时把 chrome、fetch、indexedDB 装到 globalThis。 */
-export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
+export const EXT_ROOT = "chrome-extension://pcdemoextensionid0000000000000000/";
+export const EXT_ORIGIN = EXT_ROOT.replace(/\/$/, "");
+
+export function installFakeChrome({ fetch, manifestVersion = "0.2.0" } = {}) {
   const local = area();
   const session = area();
   const alarms = new Map();
@@ -127,10 +131,13 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
     tabRemoved: new Event(),
   };
   const sentToTabs = [];
+  const createdTabs = [];
   let openedOptions = 0;
 
   const chrome = {
     runtime: {
+      id: "pcdemoextensionid0000000000000000",
+      getURL: (path = "") => EXT_ROOT + String(path).replace(/^\//, ""),
       getManifest: () => ({ version: manifestVersion }),
       onMessage: events.message,
       onInstalled: events.installed,
@@ -168,6 +175,11 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
           .filter((t) => !re || re.test(t.url))
           .map((t) => ({ id: t.id, active: t.active, discarded: t.discarded, lastAccessed: t.lastAccessed }));
       },
+      /** 不需要 tabs 权限：只记下开了哪个地址。 */
+      async create(info) {
+        createdTabs.push(info?.url ?? null);
+        return { id: 9000 + createdTabs.length };
+      },
       async sendMessage(id, msg) {
         sentToTabs.push({ tabId: id, msg });
         const t = tabs.get(id);
@@ -193,6 +205,7 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
     alarms,
     tabs,
     sentToTabs,
+    createdTabs,
     get openedOptions() {
       return openedOptions;
     },
@@ -211,6 +224,10 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
       for (const fn of events.installed.listeners) fn({ reason });
       await settle();
     },
+    async fireStartup() {
+      for (const fn of events.startup.listeners) fn();
+      await settle();
+    },
     async fireAlarm(name) {
       for (const fn of events.alarm.listeners) fn({ name, scheduledTime: Date.now() });
       await settle();
@@ -226,10 +243,15 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
       for (const fn of events.tabRemoved.listeners) fn(id, { windowId: 1, isWindowClosing: false });
       await settle();
     },
-    /** 内容脚本（标签页 tabId）或扩展页面（tabId 为 null）发给后台的一条消息；返回后台的答复。 */
-    send(tabId, msg) {
+    /** 内容脚本（标签页 tabId）或扩展页面（tabId 为 null）发给后台的一条消息；返回后台的答复。
+     *  sender 照浏览器的样子给：内容脚本带 tab、所在网页的地址与源；扩展页面带扩展源下的地址与源，
+     *  没开在标签页里的（弹出页）没有 tab。第三个参数可以整个替换 sender（测特权消息的来源检查）。 */
+    send(tabId, msg, senderOverride = null) {
       return new Promise((resolve, reject) => {
-        const sender = tabId === null ? {} : { tab: { id: tabId } };
+        const pageUrl = tabId === null ? null : tabs.get(tabId)?.url ?? "https://www.amazon.com/";
+        const sender = senderOverride ?? (tabId === null
+          ? { id: chrome.runtime.id, url: EXT_ROOT + "popup.html", origin: EXT_ORIGIN }
+          : { id: chrome.runtime.id, tab: { id: tabId }, url: pageUrl, origin: new URL(pageUrl).origin, frameId: 0 });
         let answered = false;
         const respond = (v) => {
           answered = true;
@@ -246,8 +268,13 @@ export function installFakeChrome({ fetch, manifestVersion = "0.1.0" } = {}) {
     fromTab(tabId, msg) {
       return this.send(tabId, msg);
     },
+    /** 扩展自己的、没开在标签页里的页面（弹出页）。 */
     fromPage(msg) {
       return this.send(null, msg);
+    },
+    /** 设置页：清单里 options_ui.open_in_tab = true，它是开在标签页里的扩展页面，消息带着 sender.tab。 */
+    fromOptionsTab(msg, tabId = 900) {
+      return this.send(null, msg, { id: chrome.runtime.id, tab: { id: tabId }, url: EXT_ROOT + "options.html", origin: EXT_ORIGIN, frameId: 0 });
     },
     logs() {
       return (local._all()["pc.logs"] ?? []).map((l) => l.text);

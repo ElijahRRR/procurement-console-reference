@@ -19,7 +19,7 @@ ROW_KEYS = {
     "subtotal_eff", "price_cap", "price_cap_eff", "has_override", "suggested_purchase_date", "order_time",
     "recipient_name", "state", "postal_code", "status", "status_zh", "status_reason", "missing_fields",
     "review_status", "needs_attention", "attention_note", "assigned_account", "assignment_kind", "assignment_note",
-    "primary_source_kind", "source_kinds", "latest_attempt", "updated_at",
+    "designated_buyer", "primary_source_kind", "source_kinds", "latest_attempt", "updated_at",
 }
 
 

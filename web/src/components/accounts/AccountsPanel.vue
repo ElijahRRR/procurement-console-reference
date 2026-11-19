@@ -1,36 +1,43 @@
 <script setup lang="ts">
 /**
- * 买家账号列表：金额区间、今日额度（已用 / 计划 / 上限）、优先级、配送上限（继承标记）、采购与同步开关（行内确认）、
- * 暂停 / 恢复执行（与采购开关分开呈现）、执行模式与时间、绑定设备在线状态、当前执行批次。
+ * 账号页签：顶部「待登记的买家号」（插件读到的或来源指定的、还没登记的买家号 ID），下面是买家账号列表：买家号 ID、金额区间、
+ * 今日额度（已用 / 计划 / 上限）、优先级、配送上限（继承标记）、采购与同步开关（行内确认）、暂停 / 恢复执行（与采购开关分开呈现）、
+ * 执行模式与时间、所在浏览器（当前登录着这个买家号的浏览器）、当前执行批次。
  */
 import { computed, onMounted, ref } from 'vue'
-import type { Account, Device } from '@/api/types'
+import type { Account, DiscoveredBuyer } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
-import * as devicesApi from '@/api/devices'
 import * as settingsApi from '@/api/settings'
 import AppIcon from '@/components/AppIcon.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import StatusDot from '@/components/StatusDot.vue'
-import AccountDialog from './AccountDialog.vue'
+import AccountDialog, { type AccountPreset } from './AccountDialog.vue'
+import DiscoveredBuyers from './DiscoveredBuyers.vue'
 import { formatAmountRange, formatDateTime, formatNumber, formatRelative } from '@/utils/format'
-import { IDENTITY_STATUS_DOT, IDENTITY_STATUS_LABEL, PAUSE_CAUSE_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
-import { resumeConfirmText, resumeNeedsCaution } from '@/utils/accounts'
+import { PAUSE_CAUSE_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
+import { normalizeCustomerId, resumeConfirmText, resumeNeedsCaution, suggestedFillTarget } from '@/utils/accounts'
+import { browserOnlineText } from '@/utils/browsers'
 import { confirmAction, notifyFailure, notifySuccess, promptText, toast } from '@/utils/feedback'
 
+const props = withDefaults(defineProps<{ /** 「账号」页签是否激活：没激活时待登记列表不自动刷新 */ active?: boolean }>(), { active: true })
+/** 账号或待登记的买家号有变化（登记、填到已有账号）：上层据此刷新「浏览器」页签 */
+const emit = defineEmits<{ changed: [] }>()
+
 const accounts = ref<Account[]>([])
-const devices = ref<Device[]>([])
 const defaultMaxDays = ref<number | null>(null)
 const loading = ref(false)
 const busy = ref<string | null>(null)
 const dialogOpen = ref(false)
 const editing = ref<Account | null>(null)
+const preset = ref<AccountPreset | null>(null)
+/** 正在登记的待登记项（对话框里选「填到同名账号」时交给待登记区走填到已有账号）；不是从待登记项打开的为 null */
+const registering = ref<DiscoveredBuyer | null>(null)
+const discovered = ref<InstanceType<typeof DiscoveredBuyers>>()
 
 async function load() {
   loading.value = true
   try {
-    const [a, d] = await Promise.all([accountsApi.listAccounts(), devicesApi.listDevices().catch(() => ({ total: 0, rows: [] as Device[] }))])
-    accounts.value = a.rows
-    devices.value = d.rows
+    accounts.value = (await accountsApi.listAccounts()).rows
   } catch (e) {
     notifyFailure('读取账号', e)
   } finally {
@@ -43,7 +50,6 @@ async function load() {
   }
 }
 onMounted(load)
-defineExpose({ reload: load })
 
 const summary = computed(() => {
   const list = accounts.value
@@ -51,17 +57,83 @@ const summary = computed(() => {
     total: list.length,
     enabled: list.filter((a) => a.purchase_enabled).length,
     paused: list.filter((a) => a.execution_paused).length,
+    noId: list.filter((a) => !a.amazon_customer_id).length,
   }
 })
 
 function openCreate() {
   editing.value = null
+  preset.value = null
+  registering.value = null
   dialogOpen.value = true
 }
 function openEdit(a: Account) {
   editing.value = a
+  preset.value = null
+  registering.value = null
   dialogOpen.value = true
 }
+/**
+ * 输入：要登记的买家号 ID、来源里的名称、这个买家号从哪里来（来源指定了几笔任务、有没有浏览器登录着）
+ * → 输出：无（打开账号对话框，ID 与名称已填；提交走新建接口）
+ */
+function openRegister(customerId: string, nameHint: string | null = null, source: Pick<AccountPreset, 'sourceOrders' | 'hasBrowser' | 'fillTarget'> = {}) {
+  editing.value = null
+  preset.value = { customerId, name: nameHint, ...source }
+  registering.value = null
+  dialogOpen.value = true
+}
+/**
+ * 输入：待登记的买家号 → 输出：无（打开登记对话框：ID 与来源里的名称已填，写明来源指定了几笔任务；
+ * 已有同名、还没登记 ID 的账号时对话框提示可以直接填到它上面）
+ */
+function registerDiscovered(item: DiscoveredBuyer) {
+  const same = suggestedFillTarget(accounts.value, item)
+  openRegister(item.customer_id, item.name_hint, {
+    sourceOrders: item.source_orders ?? 0,
+    hasBrowser: !!item.browsers?.length,
+    fillTarget: same ? { id: same.id, name: same.name } : null,
+  })
+  registering.value = item
+}
+
+/**
+ * 输入：别处（「浏览器」页签）要登记的买家号 ID → 输出：无。先在待登记的买家号里找到它，按与待登记列表的「登记」
+ * 相同的方式打开对话框（来源里的名称、来源指定了几笔任务、同名账号提示）；找不到或读取失败时只带 ID 打开。
+ */
+async function registerBuyer(customerId: string) {
+  const id = normalizeCustomerId(customerId)
+  let item: DiscoveredBuyer | undefined
+  try {
+    item = (await accountsApi.listDiscovered(true)).find((x) => normalizeCustomerId(x.customer_id) === id)
+  } catch {
+    item = undefined
+  }
+  if (item) return registerDiscovered({ ...item, browsers: item.browsers ?? [] })
+  openRegister(id ?? customerId)
+}
+
+/** 登记对话框里选了「填到同名账号」：交给待登记区（重新读目标账号、确认后 PATCH） */
+async function onDialogFill(accountId: number) {
+  const item = registering.value
+  if (item) await discovered.value?.fill(item, accountId)
+}
+
+/** 输入：无 → 输出：无（重新读账号与待登记的买家号） */
+async function reloadAll() {
+  await Promise.all([load(), discovered.value?.reload()])
+}
+/** 账号对话框保存后：账号、待登记列表都要重读；浏览器页签里的账号归属也变了 */
+async function onSaved() {
+  emit('changed')
+  await reloadAll()
+}
+/** 待登记区把 ID 填到了已有账号上 */
+function onDiscoveredChanged() {
+  emit('changed')
+  void load()
+}
+defineExpose({ reload: reloadAll, openRegister, registerBuyer })
 
 function replace(updated: Account | null | undefined) {
   if (!updated || typeof updated !== 'object' || !('id' in updated)) return void load()
@@ -166,42 +238,47 @@ function quotaStatus(a: Account): '' | 'warning' {
 
 <template>
   <div>
+    <DiscoveredBuyers ref="discovered" :accounts="accounts" :active="props.active" @register="registerDiscovered" @changed="onDiscoveredChanged" />
+
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <p class="text-sm text-gray-500 dark:text-dark-400">
-        共 {{ formatNumber(summary.total) }} 个账号，{{ formatNumber(summary.enabled) }} 个开启采购<template v-if="summary.paused">，{{ formatNumber(summary.paused) }} 个暂停执行</template>。<!--
-        -->账号配置以服务端为准，插件显示的是服务端已确认的有效设置。
+        共 {{ formatNumber(summary.total) }} 个账号，{{ formatNumber(summary.enabled) }} 个开启采购<template v-if="summary.paused">，{{ formatNumber(summary.paused) }} 个暂停执行</template><template v-if="summary.noId">，{{ formatNumber(summary.noId) }} 个还没登记买家号 ID</template>。<!--
+        -->登录着某个账号的买家号的浏览器才能执行它的任务；账号配置以服务端为准。
       </p>
       <div class="flex gap-2">
-        <el-button @click="load"><AppIcon name="refresh" size="sm" class="mr-1.5" />刷新</el-button>
+        <el-button @click="reloadAll"><AppIcon name="refresh" size="sm" class="mr-1.5" />刷新</el-button>
         <el-button type="primary" @click="openCreate"><AppIcon name="plus" size="sm" class="mr-1.5" />新建账号</el-button>
       </div>
     </div>
 
     <el-card class="eq-table-card" shadow="always">
       <el-table v-loading="loading" :data="accounts" row-key="id">
-        <el-table-column label="账号" min-width="170">
+        <el-table-column label="账号" min-width="136">
           <template #default="{ row }">
             <div class="whitespace-nowrap font-medium text-gray-900 dark:text-white">{{ row.name }}</div>
-            <div class="mt-0.5 whitespace-nowrap text-xs text-gray-500 dark:text-dark-400">
-              <span v-if="row.amazon_customer_id" class="font-mono">{{ row.amazon_customer_id }}</span>
-              <span v-else>未登记买家号 ID</span>
-              · {{ row.site }}
-            </div>
             <div class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">
-              {{ labelOf(PURCHASE_MODE_LABEL, row.purchase_mode) }}<template v-if="row.purchase_mode === 'scheduled'"> · {{ row.schedule_times?.length ? row.schedule_times.join('、') : '未设置时间' }}</template>
+              {{ row.site }} · {{ labelOf(PURCHASE_MODE_LABEL, row.purchase_mode) }}<template v-if="row.purchase_mode === 'scheduled'"> · {{ row.schedule_times?.length ? row.schedule_times.join('、') : '未设置时间' }}</template>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="金额与规则" min-width="150">
+        <el-table-column label="买家号 ID" width="128">
+          <template #default="{ row }">
+            <span v-if="row.amazon_customer_id" class="break-all font-mono text-xs text-gray-900 dark:text-gray-100">{{ row.amazon_customer_id }}</span>
+            <el-tooltip v-else content="没有登记买家号 ID 的账号没有浏览器能执行。在待登记列表里把 ID 填到这个账号上，或编辑账号时填写。" placement="top">
+              <el-tag size="small" type="warning" disable-transitions>未登记</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="金额与规则" min-width="168">
           <template #default="{ row }">
             <div class="whitespace-nowrap text-gray-900 dark:text-gray-100">{{ formatAmountRange(row.min_amount, row.max_amount) }}</div>
             <div class="mt-0.5 whitespace-nowrap text-xs text-gray-500 dark:text-dark-400">优先级 {{ row.priority }}</div>
-            <div class="whitespace-nowrap text-xs text-gray-500 dark:text-dark-400">
+            <div class="text-xs text-gray-500 dark:text-dark-400">
               配送上限 {{ formatNumber(row.effective_max_delivery_days) }} 天<span v-if="row.max_delivery_days === null">（继承）</span><span v-else class="text-amber-700 dark:text-amber-400">（单独设置）</span>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="今日额度" width="160">
+        <el-table-column label="今日额度" width="150">
           <template #default="{ row }">
             <div class="mb-1.5 flex items-center justify-between gap-2 text-xs">
               <span class="whitespace-nowrap text-gray-700 dark:text-gray-300">已用 {{ formatNumber(row.quota_today?.used) }} · 计划 {{ formatNumber(row.quota_today?.planned) }}</span>
@@ -233,7 +310,7 @@ function quotaStatus(a: Account): '' | 'warning' {
             />
           </template>
         </el-table-column>
-        <el-table-column label="执行" min-width="170">
+        <el-table-column label="执行" min-width="160">
           <template #default="{ row }">
             <div class="flex flex-col items-start gap-1">
               <template v-if="row.execution_paused">
@@ -254,18 +331,20 @@ function quotaStatus(a: Account): '' | 'warning' {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="绑定设备" min-width="170">
+        <el-table-column label="所在浏览器" min-width="140">
           <template #default="{ row }">
-            <div v-if="!row.devices?.length" class="text-sm text-gray-400 dark:text-dark-500">未绑定</div>
-            <div v-for="d in row.devices" :key="d.id" class="mb-1 last:mb-0">
-              <StatusDot :color="!d.online ? 'gray' : IDENTITY_STATUS_DOT[d.identity_status as 'match']" :label="d.name" />
-              <div class="ml-3.5 text-xs text-gray-500 dark:text-dark-400">
-                {{ d.online ? labelOf(IDENTITY_STATUS_LABEL, d.identity_status) : `离线 · ${formatRelative(d.last_seen_at)}` }}
+            <div v-if="!row.browsers?.length" class="text-sm text-gray-400 dark:text-dark-500">—</div>
+            <div v-for="b in row.browsers" :key="b.id" class="mb-1 last:mb-0">
+              <!-- 名称完整显示（可折行）：同一批环境的名称往往只差结尾几个字，截断了就分不清 -->
+              <div class="flex items-start gap-1.5">
+                <StatusDot :color="b.online ? 'green' : 'gray'" class="mt-1.5" />
+                <span class="min-w-0 break-all text-sm text-gray-700 dark:text-gray-300">{{ b.name }}</span>
               </div>
+              <div class="ml-3.5 text-xs text-gray-500 dark:text-dark-400">{{ browserOnlineText(b) }}</div>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="64" align="right">
+        <el-table-column label="操作" width="60" align="right">
           <template #default="{ row }">
             <el-tooltip content="编辑账号" placement="top">
               <el-button text size="small" aria-label="编辑账号" @click="openEdit(row as Account)"><AppIcon name="edit" size="sm" /></el-button>
@@ -273,13 +352,13 @@ function quotaStatus(a: Account): '' | 'warning' {
           </template>
         </el-table-column>
         <template #empty>
-          <EmptyState title="还没有买家账号" description="新建账号并设置金额区间与每日额度，分配才会把任务分给它。" icon="users" compact>
+          <EmptyState title="还没有买家账号" description="新建账号并设置金额区间与每日额度，分配才会把任务分给它。在装了插件的浏览器里登录买家号后，也可以从待登记列表直接登记。" icon="users" compact>
             <template #actions><el-button type="primary" @click="openCreate">新建账号</el-button></template>
           </EmptyState>
         </template>
       </el-table>
     </el-card>
 
-    <AccountDialog v-model="dialogOpen" :account="editing" :devices="devices" :default-max-days="defaultMaxDays" @saved="load" />
+    <AccountDialog v-model="dialogOpen" :account="editing" :preset="preset" :default-max-days="defaultMaxDays" @saved="onSaved" @fill="onDialogFill" />
   </div>
 </template>

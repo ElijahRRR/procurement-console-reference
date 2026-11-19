@@ -6,16 +6,20 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
+  bookDay,
+  bookPut,
   dayState,
   dueSlots,
   markSlots,
   nextFirePlan,
   nextFireTimes,
+  normalizeBook,
   normalizeSlots,
   parseSlot,
   slotEpoch,
+  slotToClaim,
 } from "../build/core/schedule.js";
-import { addDays, bjClock, bjCompact, bjDate, bjShort, laDate } from "../build/core/time.js";
+import { addDays, bjClock, bjCompact, bjDate, bjHm, bjShort, laDate } from "../build/core/time.js";
 
 const iso = (ms) => new Date(ms).toISOString();
 const at = (s) => Date.parse(s);
@@ -130,10 +134,56 @@ test("markSlots 不修改入参，另记「等待环境」只记一次", () => {
   assert.deepEqual(a.done, []);
 });
 
+// ── 当天记录按买家号 ID 分键 ─────────────────────────────────────────────
+
+const CID_A = "A1DEMO00000";
+const CID_B = "A2TEST00000";
+
+test("当天记录按买家号 ID 分键：同一个浏览器当天换了买家号，一个账号处理过的时间点不算到另一个账号头上", () => {
+  const now = at("2026-11-05T07:20:00Z"); // 北京 15:20
+  let book = {};
+  // 上午登着 A，跑了账号 A 的 14:00
+  book = bookPut(book, CID_A, markSlots(bookDay(book, CID_A, now), ["14:00"], now), now);
+  assert.deepEqual(dueSlots(["14:00"], now, bookDay(book, CID_A, now)), [], "A 今天处理过了");
+  // 换登 B，账号 B 也是 14:00：照常到期
+  assert.deepEqual(dueSlots(["14:00"], now, bookDay(book, CID_B, now)), ["14:00"], "B 的 14:00 还没处理");
+  book = bookPut(book, CID_B, markSlots(bookDay(book, CID_B, now), ["14:00"], now, "waiting_logged"), now);
+  assert.deepEqual(Object.keys(book).sort(), [CID_A, CID_B]);
+  assert.deepEqual(book[CID_A].done, ["14:00"], "写 B 的记录不动 A 的");
+  assert.deepEqual(book[CID_B], { bj_date: "2026-11-05", done: [], waiting_logged: ["14:00"] });
+  // 换回 A：记录还在
+  assert.deepEqual(dueSlots(["14:00"], now, bookDay(book, CID_A, now)), []);
+});
+
+test("记录本：跨天的记录作废并被清掉；bookPut 不修改入参；旧版不分买家号的单份记录整份作废", () => {
+  const day1 = at("2026-11-05T07:00:00Z");
+  const day2 = at("2026-11-06T07:00:00Z");
+  const b1 = bookPut({}, CID_A, markSlots(null, ["14:00"], day1), day1);
+  assert.deepEqual(bookDay(b1, CID_A, day2), { bj_date: "2026-11-06", done: [], waiting_logged: [] }, "跨天不补：昨天的记录不算");
+  const b2 = bookPut(b1, CID_B, bookDay(b1, CID_B, day2), day2);
+  assert.deepEqual(Object.keys(b2), [CID_B], "写今天的记录时顺手丢掉别的买家号昨天的记录");
+  assert.deepEqual(Object.keys(b1), [CID_A], "不修改入参");
+  // 旧版（0.1.0）存的是不分买家号的单份记录：不知道它是谁的，整份作废（宁可多问服务端一次）
+  const legacy = { bj_date: "2026-11-05", done: ["14:00"], waiting_logged: [] };
+  assert.deepEqual(normalizeBook(legacy), {});
+  assert.deepEqual(dueSlots(["14:00"], at("2026-11-05T07:20:00Z"), bookDay(legacy, CID_A, at("2026-11-05T07:20:00Z"))), ["14:00"]);
+  assert.deepEqual(normalizeBook(null), {});
+  assert.deepEqual(normalizeBook([1, 2]), {});
+  assert.deepEqual(normalizeBook({ [CID_A]: "x", [CID_B]: { bj_date: "2026-11-05", done: [], waiting_logged: [] } }), { [CID_B]: { bj_date: "2026-11-05", done: [], waiting_logged: [] } });
+});
+
+test("向服务端申请定时批次时带最晚到期的那个时间点（错过的几个合成一次）；没有到期的不申请", () => {
+  assert.equal(slotToClaim(["09:00", "14:00"]), "14:00");
+  assert.equal(slotToClaim(["14:00"]), "14:00");
+  assert.equal(slotToClaim([]), null);
+});
+
 test("时间工具：北京日期、洛杉矶日期（含夏令时）、日期加减", () => {
   assert.equal(bjCompact(at("2026-10-31T03:00:00Z")), "20261031");
   assert.equal(bjShort("2026-10-31T13:31:00+00:00"), "10-31 21:31");
   assert.equal(bjShort("not a date"), null);
+  assert.equal(bjHm("2026-10-31T13:31:00+00:00"), "21:31");
+  assert.equal(bjHm(null), null);
   // 洛杉矶 2026-11-01 02:00 夏令时结束
   assert.equal(laDate(at("2026-11-01T06:59:00Z")), "2026-10-31"); // PDT 23:59
   assert.equal(laDate(at("2026-11-02T07:59:00Z")), "2026-11-01"); // PST 23:59

@@ -35,7 +35,7 @@ def _frozen(clean_db):
 def _claimed(conn, workspace, no, *, source=None):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     src = source or f.file_source(conn, ws, 2)
     order = fx.assigned_order(conn, ws, acc, source=src, upstream_order_no=no)
     run_id = fx.start(conn, dev)

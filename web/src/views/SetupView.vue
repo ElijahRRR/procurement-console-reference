@@ -51,7 +51,7 @@ async function submit() {
 </script>
 
 <template>
-  <AuthShell title="首次设置" description="创建所有者账号与工作区。之后的订单来源、买家账号与设备都属于这个工作区。">
+  <AuthShell title="首次设置" description="创建所有者账号与工作区。之后的订单来源、买家账号与装了插件的浏览器都属于这个工作区。">
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon class="mb-4" />
     <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
       <el-form-item label="工作区名称" prop="workspace_name">

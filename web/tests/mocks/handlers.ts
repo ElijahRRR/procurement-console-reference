@@ -3,7 +3,7 @@
  * Playwright 截图脚本用 page.route() 把 /api/v1/** 交给 handleApi；评审阶段也可以直接复用。
  * 写操作只改内存里的一份 fixtures，刷新页面不保留。
  */
-import type { FeishuSyncResult, ImportCommitResult, OrderRow, OrderStatus, OrderView, SimulationResetResult, VerifyWritebackResult } from '../../src/api/types.ts'
+import type { Account, FeishuSyncResult, ImportCommitResult, OrderRow, OrderStatus, OrderView, SimulationResetResult, VerifyWritebackResult } from '../../src/api/types.ts'
 import { buildFixtures, type Fixtures } from './fixtures.ts'
 
 export interface MockOptions {
@@ -55,6 +55,118 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
   const state = { loggedIn: opts.loggedIn ?? true, needsSetup: opts.needsSetup ?? false }
   const feishuConfigured = opts.feishuConfigured ?? true
   fx.overview.feishu_configured = feishuConfigured
+
+  const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/
+  /** 忽略名单：不要求此刻有浏览器登录着（include_ignored=1 时全部列出，否则无处恢复） */
+  const ignoredIds = new Set(fx.discovered.filter((x) => x.ignored).map((x) => x.customer_id))
+  /** 已经有采购结果或不再采购的状态：这些任务上来源指定的买家号 ID 不并入待登记列表 */
+  const DONE: OrderStatus[] = ['purchased', 'closed', 'cancelled']
+  /**
+   * 输入：无 → 输出：无。同服务端「登记后任务立刻分给它」的最小模拟：来源指定了买家号 ID、停在待分配的任务，
+   * 这个 ID 已登记到账号上时，账号接得了就分给它（分配方式「来源指定」），接不了就写明原因；列表行与详情一起改。
+   */
+  function assignDesignated(): void {
+    for (const d of Object.values(fx.details)) {
+      const id = d.designated_buyer?.customer_id
+      if (d.status !== 'queued' || !id) continue
+      const a = fx.accounts.find((x) => x.amazon_customer_id === id)
+      if (!a) continue
+      const ref = { id: a.id, name: a.name }
+      const sub = d.subtotal_eff === null ? null : Number(d.subtotal_eff)
+      const fits = sub !== null && sub >= Number(a.min_amount ?? 0) && (a.max_amount === null || sub <= Number(a.max_amount))
+      const patch: Partial<OrderRow> = !a.purchase_enabled
+        ? { status_reason: `来源指定的账号 ${a.name} 已关闭采购开关，不接收新分配；打开开关后会自动分配` }
+        : !fits
+          ? { status_reason: `金额不在来源指定的账号 ${a.name} 的区间内；调整账号的金额区间，或改派到其他账号` }
+          : { status: 'assigned', status_reason: null, assigned_account: ref, assignment_kind: 'source', assignment_note: `按来源的买家号 ID ${id}` }
+      const next: Partial<OrderRow> = { ...patch, designated_buyer: { customer_id: id, name: d.designated_buyer?.name ?? null, account: ref } }
+      Object.assign(d, next)
+      if (patch.status === 'assigned') d.allowed_actions = ['assign', 'unassign', 'override', 'cancel']
+      const row = fx.orders.find((o) => o.id === d.id)
+      if (row) Object.assign(row, next)
+    }
+    const count = (st: OrderStatus) => fx.orders.filter((o) => o.status === st).length
+    fx.overview.counts = { ...fx.overview.counts, queued: count('queued'), assigned: count('assigned') }
+  }
+  /**
+   * 输入：无 → 输出：无。按「账号上登记的 ID」「忽略名单」重算每个浏览器的登录状态、账号的所在浏览器、待登记列表与概览计数。
+   * 待登记列表 = 浏览器上报的未登记 ID ∪ 未采购任务上来源指定的、形状合格、没有账号登记的买家号 ID（契约 §8）；
+   * 每项带 source_orders（指定它的未采购任务数）；忽略名单里的 ID 全部列出（带 ignored）。
+   */
+  function syncBuyers(): void {
+    const registered = new Map(fx.accounts.filter((a) => a.amazon_customer_id).map((a) => [a.amazon_customer_id as string, a]))
+    for (const d of fx.devices) {
+      const id = d.login.customer_id
+      if (!id || !['ready', 'unregistered', 'ignored'].includes(d.login.state)) continue
+      const acc = registered.get(id)
+      d.login.state = acc ? 'ready' : ignoredIds.has(id) ? 'ignored' : 'unregistered'
+      d.account = acc ? { id: acc.id, name: acc.name } : null
+    }
+    const shown = fx.devices.filter((d) => !d.hidden_at)
+    const ref = (d: (typeof shown)[number]) => ({ id: d.id, name: d.name, online: d.online, last_seen_at: d.last_seen_at })
+    for (const a of fx.accounts) a.browsers = a.amazon_customer_id ? shown.filter((d) => d.login.customer_id === a.amazon_customer_id).map(ref) : []
+    const hints = new Map(fx.discovered.map((x) => [x.customer_id, x.name_hint]))
+    // 来源指定的买家号 ID：只算未采购的任务、形状合格的 ID
+    const bySource = new Map<string, OrderRow[]>()
+    for (const o of Object.values(fx.details)) {
+      const id = o.designated_buyer?.customer_id
+      if (!id || DONE.includes(o.status) || !CUSTOMER_ID_RE.test(id)) continue
+      bySource.set(id, [...(bySource.get(id) ?? []), o])
+    }
+    const reported = shown.map((d) => d.login.customer_id).filter((id): id is string => !!id)
+    const open = [...new Set([...reported, ...bySource.keys(), ...ignoredIds])].filter((id) => !registered.has(id))
+    const items = open.map((id) => {
+      const on = shown.filter((d) => d.login.customer_id === id)
+      const tasks = bySource.get(id) ?? []
+      return {
+        customer_id: id,
+        ignored: ignoredIds.has(id),
+        browsers: on.map(ref),
+        last_reported_at: on.map((d) => d.login.at).filter((t): t is string => !!t).sort().at(-1) ?? null,
+        // 名称优先取这些任务上来源写的「买家号」
+        name_hint: tasks.map((o) => o.designated_buyer?.name).find((n) => !!n) ?? hints.get(id) ?? null,
+        source_orders: tasks.length,
+      }
+    })
+    // 最近上报的在前；没有浏览器上报过的（只来自来源，或只在忽略名单里）排在后面
+    const at = (x: (typeof items)[number]) => x.last_reported_at ?? ''
+    fx.discovered = items.sort((x, y) => at(y).localeCompare(at(x)) || y.source_orders - x.source_orders || x.customer_id.localeCompare(y.customer_id))
+    fx.overview.devices = { total: shown.length, online: shown.filter((d) => d.online).length }
+    fx.overview.discovered_buyers = fx.discovered.filter((x) => !x.ignored).length
+  }
+  /** 同服务端 services/accounts：买家号 ID 形状不对时的提示 */
+  const CUSTOMER_ID_SHAPE_MESSAGE = '买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）'
+  /**
+   * 输入：新建 / 修改账号的请求体 → 输出：同服务端规范化后的副本：账号名称去首尾空白；买家号 ID 去首尾空白后大写，空串为 null。
+   * 别的类型原样留着，交给形状检查报错。
+   */
+  function normalizeAccountBody(b: Record<string, unknown>): Record<string, unknown> {
+    const out = { ...b }
+    if (typeof out.name === 'string') out.name = out.name.trim()
+    if (typeof out.amazon_customer_id === 'string') out.amazon_customer_id = out.amazon_customer_id.trim().toUpperCase() || null
+    return out
+  }
+  /** 输入：规范化后的买家号 ID → 输出：形状不对时的错误响应；留空或形状合格为 null */
+  function customerIdShapeProblem(raw: unknown): MockResponse | null {
+    if (raw === null || raw === undefined || raw === '') return null
+    return typeof raw !== 'string' || !CUSTOMER_ID_RE.test(raw) ? err(422, 'VALIDATION', CUSTOMER_ID_SHAPE_MESSAGE, { field: 'amazon_customer_id' }) : null
+  }
+  /**
+   * 输入：请求体里的账号名称、买家号 ID、当前账号 id（新建为 null）→ 输出：错误响应；可以写入时为 null。
+   * 同服务端 services/accounts 的检查顺序与形状：ID 形状 → 名称为空 → 名称重复 → ID 已登记在另一个账号上，都是 422 VALIDATION
+   * （detail.field = amazon_customer_id / name），不是 409。只检查请求里带了的字段；请求体先经 normalizeAccountBody。
+   */
+  function accountInputProblem(b: Record<string, unknown>, selfId: number | null): MockResponse | null {
+    const shape = 'amazon_customer_id' in b ? customerIdShapeProblem(b.amazon_customer_id) : null
+    if (shape) return shape
+    if ('name' in b && b.name !== null && b.name !== undefined && typeof b.name !== 'string') return err(422, 'VALIDATION', '账号名称必须是文本', { field: 'name' })
+    if (('name' in b || selfId === null) && !b.name) return err(422, 'VALIDATION', '账号名称不能为空', { field: 'name' })
+    const name = typeof b.name === 'string' ? b.name.trim() : null
+    if (name !== null && fx.accounts.some((a) => a.name === name && a.id !== selfId)) return err(422, 'VALIDATION', `账号名称「${name}」已存在`, { field: 'name' })
+    const raw = b.amazon_customer_id
+    const other = typeof raw === 'string' && raw ? fx.accounts.find((a) => a.amazon_customer_id === raw && a.id !== selfId) : undefined
+    return other ? err(422, 'VALIDATION', `买家号 ID ${String(raw)} 已登记在账号 ${other.name}`, { field: 'amazon_customer_id' }) : null
+  }
 
   function handle(method: string, url: URL, body: unknown): MockResponse {
     const path = url.pathname.replace(/^\/api\/v1/, '')
@@ -128,9 +240,11 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         const a = fx.accounts.find((x) => x.id === b.account_id)
         if (!a) return err(422, 'VALIDATION', '目标账号不存在')
         if (!a.purchase_enabled) return err(409, 'CONFLICT', '目标账号的采购开关已关闭')
-        Object.assign(d, { status: 'assigned', assigned_account: { id: a.id, name: a.name }, assignment_kind: 'manual', assignment_note: '人工改派' })
+        // 人工改派优先于来源指定：分配方式变成 manual，任务上的指定（designated_buyer）原样保留
+        Object.assign(d, { status: 'assigned', status_reason: null, assigned_account: { id: a.id, name: a.name }, assignment_kind: 'manual', assignment_note: '人工改派' })
       } else if (action === 'unassign') {
-        Object.assign(d, { status: 'queued', assigned_account: null, assignment_kind: null, assignment_note: null })
+        // 解除分配不清指定：下一次分配会再按来源指定分给那个账号
+        Object.assign(d, { status: 'queued', status_reason: '人工解除分配', assigned_account: null, assignment_kind: null, assignment_note: null })
       } else if (action === 'cancel') {
         Object.assign(d, { status: 'cancelled', status_reason: `人工取消：${String(b.note ?? '')}`, allowed_actions: ['uncancel'] })
       } else if (action === 'review') {
@@ -157,16 +271,71 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       return ok(d)
     }
 
-    // ── 账号与设备 ──
+    // ── 账号、待登记的买家号与浏览器 ──
     if (path === '/accounts' && m === 'GET') return ok(page(fx.accounts, q))
-    if (path === '/accounts' && m === 'POST') return ok({ ...fx.accounts[0], ...b, id: 99, quota_today: { limit: Number(b.daily_limit ?? 20), used: 0, planned: 0, available: Number(b.daily_limit ?? 20) }, devices: [], active_run: null })
+    if (path === '/accounts' && m === 'POST') {
+      // 登记 = 带 amazon_customer_id 的新建
+      const nb = normalizeAccountBody(b)
+      const bad = accountInputProblem(nb, null)
+      if (bad) return bad
+      const limit = Number(nb.daily_limit ?? 20)
+      const created: Account = {
+        ...fx.accounts[0],
+        amazon_customer_id: null,
+        execution_paused: false,
+        pause_reason: null,
+        paused_at: null,
+        pause_cause: null,
+        open_result_unknown: 0,
+        ...(nb as Partial<Account>),
+        id: Math.max(98, ...fx.accounts.map((a) => a.id)) + 1,
+        effective_max_delivery_days: Number(nb.max_delivery_days ?? fx.settings.default_max_delivery_days),
+        quota_today: { limit, used: 0, planned: 0, available: limit },
+        browsers: [],
+        active_run: null,
+        created_at: now.toISOString(),
+        updated_at: now.toISOString(),
+      }
+      fx.accounts.push(created)
+      // 新建账号后立刻重新分配：来源指定给这个买家号 ID 的任务分给它
+      assignDesignated()
+      syncBuyers()
+      return ok(created)
+    }
+    if (path === '/accounts/discovered' && m === 'GET') {
+      const all = q.get('include_ignored') === '1'
+      return ok({ items: fx.discovered.filter((x) => all || !x.ignored) })
+    }
+    if ((r = /^\/accounts\/discovered\/(ignore|unignore)$/.exec(path)) && m === 'POST') {
+      // 同服务端：去掉全部空白、大写后再检查形状
+      const id = typeof b.customer_id === 'string' ? b.customer_id.replace(/\s+/g, '').toUpperCase() : ''
+      if (!CUSTOMER_ID_RE.test(id)) return err(422, 'VALIDATION', CUSTOMER_ID_SHAPE_MESSAGE, { field: 'customer_id' })
+      // 忽略名单与此刻有没有浏览器登录着无关
+      const ignoring = r[1] === 'ignore'
+      if (ignoring) ignoredIds.add(id)
+      if (!ignoring && ignoredIds.has(id)) ignoredIds.delete(id)
+      syncBuyers()
+      return ok({ ok: true })
+    }
     if ((r = /^\/accounts\/(\d+)$/.exec(path))) {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
-      if (m === 'PATCH') Object.assign(a, b)
+      if (m === 'PATCH') {
+        const nb = normalizeAccountBody(b)
+        const bad = accountInputProblem(nb, a.id)
+        if (bad) return bad
+        if ('amazon_customer_id' in nb && (nb.amazon_customer_id ?? null) !== a.amazon_customer_id) {
+          // 填到已有账号 / 修改买家号 ID：执行中或有结果待核实时不允许
+          if (a.active_run || (a.open_result_unknown ?? 0) > 0) return err(409, 'CONFLICT', '账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID')
+        }
+        Object.assign(a, nb)
+        // 改买家号 ID 也触发重新分配（契约 §3.2）
+        assignDesignated()
+        syncBuyers()
+      }
       return ok(a)
     }
-    if ((r = /^\/accounts\/(\d+)\/(pause|resume|adopt-customer-id)$/.exec(path)) && m === 'POST') {
+    if ((r = /^\/accounts\/(\d+)\/(pause|resume)$/.exec(path)) && m === 'POST') {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
       if (r[2] === 'pause') Object.assign(a, { execution_paused: true, pause_reason: String(b.reason ?? ''), paused_at: now.toISOString() })
@@ -174,18 +343,26 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       if (r[2] === 'resume') Object.assign(a, { execution_paused: false, pause_reason: null, paused_at: null, pause_cause: null })
       return ok(a)
     }
-    if (path === '/devices' && m === 'GET') return ok(page(fx.devices, q))
-    if (path === '/devices/pairing-codes' && m === 'POST') return ok({ code: 'DEMO7K2Q', expires_at: new Date(now.getTime() + 10 * 60_000).toISOString() })
-    if ((r = /^\/devices\/(\d+)(\/revoke)?$/.exec(path))) {
+    if (path === '/devices' && m === 'GET') {
+      const all = q.get('include_hidden') === '1'
+      // 没有移除的在前
+      const rows = fx.devices.filter((d) => all || !d.hidden_at).sort((x, y) => Number(!!x.hidden_at) - Number(!!y.hidden_at))
+      return ok(page(rows, q))
+    }
+    if ((r = /^\/devices\/(\d+)(\/remove)?$/.exec(path))) {
       const d = fx.devices.find((x) => x.id === Number(r![1]))
-      if (!d) return err(404, 'NOT_FOUND', '设备不存在')
-      if (r[2] && m === 'POST') Object.assign(d, { revoked_at: now.toISOString(), online: false })
+      if (!d) return err(404, 'NOT_FOUND', '浏览器不存在')
+      if (r[2] && m === 'POST') {
+        if (d.active_run) return err(409, 'CONFLICT', '这个浏览器正在执行，结束后才能移除')
+        d.hidden_at = now.toISOString()
+        syncBuyers()
+      }
       if (!r[2] && m === 'PATCH') {
-        if (typeof b.name === 'string') d.name = b.name
-        if ('bound_account_id' in b) {
-          const a = fx.accounts.find((x) => x.id === b.bound_account_id)
-          d.bound_account = a ? { id: a.id, name: a.name } : null
-        }
+        // 只能改名
+        const name = typeof b.name === 'string' ? b.name.trim() : ''
+        if (!name) return err(422, 'VALIDATION', '请填写浏览器名称', { field: 'name' })
+        d.name = name
+        syncBuyers()
       }
       return ok(d)
     }
@@ -225,13 +402,17 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       if (!c) return err(404, 'NOT_FOUND', '连接不存在')
       if (r[2] === 'runs') return ok(page(fx.syncRuns[c.id] ?? [], q))
       if (r[2] === 'sync') {
-        // 同服务端 feishu_intake.run_connection：统计 + 问题记录样本 + 随后的分配摘要
+        // 同服务端 feishu_intake.run_connection：统计 + 问题记录样本（连接级问题在最前面，如来源表里找不到买家号列）
+        // + 随后的分配摘要；连接级问题同时留在连接的 last_stats.problems 里
+        const whole = (c.last_stats?.problems ?? []).filter((p) => p.scope === 'connection')
         const res: FeishuSyncResult = {
           read: 12, new: 2, update: 1, unchanged: 8, conflict: 0, historical: 0, skipped: 1, invalid: 0,
           run_id: 501,
-          problems: [{ record_id: 'recDEMO000777', upstream_order_no: 'PO-DEMO-20261199-SKU99', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
+          problems: [...whole, { record_id: 'recDEMO000777', upstream_order_no: 'PO-DEMO-20261199-SKU99', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
           allocation: { ...fx.lastAllocation, id: fx.lastAllocation.id + 1, trigger: 'intake', at: now.toISOString() },
         }
+        const stats = { read: res.read, new: res.new, update: res.update, unchanged: res.unchanged, conflict: res.conflict, historical: res.historical, skipped: res.skipped, invalid: res.invalid }
+        Object.assign(c, { last_sync_at: now.toISOString(), last_sync_ok_at: now.toISOString(), last_error: null, last_stats: whole.length ? { ...stats, problems: whole } : stats })
         return ok(res)
       }
       if (r[2] === 'verify-writeback') {

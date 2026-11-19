@@ -91,6 +91,9 @@ def test_intake_creates_tasks_only_for_approved_rows_of_our_purchaser(conn, work
     run = conn.execute("SELECT * FROM procure.feishu_sync_runs WHERE id = %s", (stats["run_id"],)).fetchone()
     assert run["ok"] is True and run["trigger"] == "manual" and run["stats"]["new"] == 1
     assert len(run["stats"]["problems"]) == 5
+    # 连接上的 last_stats 只有计数：逐条的问题在读取记录里；没有连接级问题时不带 problems 这个键
+    last = conn.execute("SELECT last_stats FROM procure.feishu_connections WHERE id = %s", (c["id"],)).fetchone()
+    assert last["last_stats"] == {k: stats[k] for k in feishu_intake.STAT_KEYS}
 
 
 def test_intake_twice_is_unchanged_without_duplicates(conn, workspace, fake, monkeypatch):

@@ -8,6 +8,12 @@
  * 闹钟（chrome.alarms）只负责把后台叫醒；「哪些时间点该执行」完全由这里的
  * `dueSlots` 根据当前时刻与当天已执行记录判定。这样闹钟丢了、晚了、电脑睡过了，
  * 结论都一样 —— 不依赖闹钟准时。
+ *
+ * 「一个时间点一天只执行一次」的权威在服务端：定时批次带着时间点（`POST /runs {trigger: "scheduled", slot}`），
+ * 服务端按（账号、北京日期、时间点）去重：这个时间点今天已有正常结束（finished）的批次时回 SLOT_DONE；
+ * 它的批次还在执行时回 ACCOUNT_BUSY（下一分钟再问：那个批次没跑完就结束的话时间点会重新空出来）。本地的当天记录只用来少发请求，
+ * 而且**按买家号 ID 分键**（ScheduleBook）：同一个浏览器当天先后登录两个买家号时，一个账号处理过的
+ * 时间点不能算到另一个账号头上。
  */
 
 import { DAY_MS, bjDate, bjMidnight } from "./time.js";
@@ -116,6 +122,43 @@ export function markSlots(
   const set = new Set(day[field]);
   for (const s of slots) set.add(s);
   return { ...day, [field]: [...set].sort() };
+}
+
+/** 各买家号的当天记录：买家号 ID → 当天记录（存 chrome.storage.local）。 */
+export type ScheduleBook = Record<string, ScheduleDayState>;
+
+const isDayState = (v: unknown): v is ScheduleDayState =>
+  !!v && typeof v === "object" && typeof (v as ScheduleDayState).bj_date === "string";
+
+/** 输入：存下来的任意值 → 输出：合法的记录本。旧版（不分买家号的单份记录，顶层就有 bj_date）整份作废：
+ *  不知道它是哪个买家号的，宁可多问服务端一次（执行过的它会回 SLOT_DONE），也不把一个账号的记录算给另一个。 */
+export function normalizeBook(v: unknown): ScheduleBook {
+  if (!v || typeof v !== "object" || Array.isArray(v) || isDayState(v)) return {};
+  const out: ScheduleBook = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (k && isDayState(x)) out[k] = x;
+  return out;
+}
+
+/** 输入：记录本、买家号 ID、当前时刻 → 输出：这个买家号今天的记录（没有或跨天了就是空的新记录）。 */
+export function bookDay(book: ScheduleBook | null | undefined, customerId: string, now: number): ScheduleDayState {
+  return dayState(normalizeBook(book)[customerId], now);
+}
+
+/** 输入：记录本、买家号 ID、它的新记录、当前时刻 → 输出：新的记录本（不修改入参）。
+ *  顺手丢掉别的买家号不是今天的记录，记录本不会越积越多。 */
+export function bookPut(book: ScheduleBook | null | undefined, customerId: string, state: ScheduleDayState, now: number): ScheduleBook {
+  const today = bjDate(now);
+  const out: ScheduleBook = {};
+  for (const [k, v] of Object.entries(normalizeBook(book))) if (v.bj_date === today) out[k] = v;
+  out[customerId] = state;
+  return out;
+}
+
+/** 输入：今天到期的时间点（升序）→ 输出：向服务端申请定时批次时带哪一个时间点：最晚的那个。
+ *  一个批次会把今天能执行的任务都跑掉，错过的几个时间点合成一次；各浏览器都报最晚的那个，
+ *  服务端对它去重（SLOT_DONE / ACCOUNT_BUSY），不会因为各自报了不同的时间点而各跑一次。没有到期的返回 null。 */
+export function slotToClaim(due: readonly string[]): string | null {
+  return due.length ? due[due.length - 1]! : null;
 }
 
 /** 输入：本机时刻与服务端时刻的偏差（毫秒，服务端减本机）→ 输出：用于闹钟的本机 epoch。

@@ -3,7 +3,8 @@
  * - 「需要留意」标签页用服务端筛选 needs_attention=true，正常分页，不在前端过滤；
  * - 文件导入：预览后改字段对应，预览过期、「提交导入」不可点；批次列表可以继续已预览的批次；
  * - 任务详情：飞书来源显示回填目标与「设为回填目标」；「标记已处理」清除需要留意；
- * - 飞书向导：多列回退的字段对应（ASIN → 来源码）显示为有序多选，保存时保留列表。
+ * - 飞书向导：多列回退的字段对应（ASIN → 来源码）显示为有序多选，保存时保留列表；
+ * - 两个字段对应向导的帮助段落都说明「买家号」「买家号 ID」两列填了就是指定账号。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
@@ -64,6 +65,7 @@ import ImportPanel from '@/components/sources/ImportPanel.vue'
 import OrderDetailDrawer from '@/components/orders/OrderDetailDrawer.vue'
 import FeishuWizard from '@/components/sources/FeishuWizard.vue'
 import type { FeishuConnection } from '@/api/types'
+import { DESIGNATION_MAPPING_HELP, FILE_DESIGNATION_MAPPING_HELP } from '@/utils/designation'
 
 function makeRouter() {
   const Blank = defineComponent({ render: () => h('div') })
@@ -150,6 +152,12 @@ describe('文件导入：预览之后改字段对应', () => {
     await flushPromises()
     expect(importsApi.getImport).toHaveBeenCalledWith(42)
     expect(w.text()).toContain('预览 · 共 2 行')
+    // 字段对应的帮助段落：原来的说明还在，后面多一句买家号两列的用法；文件导入另说明空着重新上传不会清除指定
+    const help = w.find('[data-testid="designation-help"]')
+    expect(help.text()).toBe(FILE_DESIGNATION_MAPPING_HELP)
+    expect(help.text()).toContain('买家号对应到另一个账号时不分配')
+    expect(help.text()).toContain('空着重新上传不会清除指定')
+    expect(help.element.parentElement!.textContent).toContain('没有对应的列不导入')
     const commitBtn = () => buttons('提交导入')[0]
     expect(commitBtn().disabled).toBe(false)
 
@@ -292,11 +300,13 @@ describe('任务详情：回填目标与需要留意', () => {
     }
   }
 
-  it('显示尝试的账号、设备与核实人，事件的操作者与中文 kind', async () => {
+  it('显示尝试的账号、浏览器与核实人，事件的操作者与中文 kind', async () => {
     ordersApi.getOrder.mockResolvedValue(detail())
     await mountWith(OrderDetailDrawer, { orderId: 7, modelValue: true })
     const text = document.body.textContent ?? ''
     expect(text).toContain('DEMO-环境-A / Mac-DEMO-01')
+    expect(text).toContain('账号 / 浏览器')
+    expect(text).not.toContain('账号 / 设备')
     expect(text).toContain('DEMO 所有者')
     expect(text).toContain('上游在采购开始后修改')
     expect(text).toContain('用户 DEMO 所有者')
@@ -382,6 +392,13 @@ describe('飞书向导：多列回退的字段对应', () => {
     await flushPromises()
     buttons('下一步')[0].click()
     await flushPromises()
+    // 字段对应一步的帮助段落：原来的说明还在，后面多一句买家号两列的用法
+    const help = document.body.querySelector('[data-testid="designation-help"]') as HTMLElement
+    expect(help.textContent).toBe(DESIGNATION_MAPPING_HELP)
+    expect(help.textContent).toContain('买家号对应到另一个账号时不分配')
+    // 飞书清空格子会清除指定：飞书向导不加文件导入那一句
+    expect(help.textContent).not.toContain('空着重新上传不会清除指定')
+    expect(help.parentElement!.textContent).toContain('左侧是系统字段，右侧选择飞书表里对应的列')
     const selects = w.findAllComponents(ElSelect).filter((s) => s.props('multiple'))
     const values = selects.map((s) => s.props('modelValue'))
     expect(values).toContainEqual(['ASIN', '来源码'])

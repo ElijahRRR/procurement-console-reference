@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
- * 任务详情抽屉：执行参数（有效值 vs 原值）、收件信息、分配、冲突、来源与快照（含回填目标）、采购尝试（含护栏逐项结果）、
- * 事件（更早的按页读取）。底部操作按钮只由后端给的 allowed_actions 决定，前端不自行推断哪些动作可做。
+ * 任务详情抽屉：执行参数（有效值 vs 原值）、收件信息、分配（含来源指定的买家号）、冲突、来源与快照（含回填目标）、
+ * 采购尝试（含护栏逐项结果）、事件（更早的按页读取）。底部操作按钮只由后端给的 allowed_actions 决定，前端不自行推断哪些动作可做。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
@@ -31,7 +31,6 @@ import {
   ATTEMPT_KIND_LABEL,
   ATTEMPT_STATUS_LABEL,
   ATTEMPT_STATUS_TAG,
-  GUARD_CODE_LABEL,
   RESOLUTION_LABEL,
   REVIEW_STATUS_LABEL,
   REVIEW_STATUS_TAG,
@@ -40,6 +39,7 @@ import {
   errorCodeLabel,
   eventKindLabel,
   fieldLabel,
+  guardCodeLabel,
   labelOf,
   tagOf,
 } from '@/utils/labels'
@@ -54,6 +54,7 @@ import {
   unknownPrefill,
   type ConflictChoice,
 } from '@/utils/orderDetail'
+import { assignDesignationNote, designationRowText, unassignConfirmText } from '@/utils/designation'
 import { confirmAction, notifyFailure, notifySuccess, promptText } from '@/utils/feedback'
 
 const props = defineProps<{ orderId: number | null }>()
@@ -286,7 +287,12 @@ async function reject() {
   await run('人审拒绝', () => ordersApi.reviewOrder(id, 'reject', note || undefined), '已拒绝')
 }
 
-// ── 改派 ──────────────────────────────────────────────────────────────────────
+// ── 分配与改派 ────────────────────────────────────────────────────────────────
+
+/** 「来源指定的买家号」一行：名（ID），人工改派到别的账号时带上改派到哪；没有指定为空串（不显示这一行） */
+const designationRow = computed(() => designationRowText(detail.value))
+/** 改派对话框里放在原说明前的一段：只在来源指定了买家号时有 */
+const assignLead = computed(() => assignDesignationNote(detail.value))
 
 const assignOpen = ref(false)
 const assignAccountId = ref<number | null>(null)
@@ -327,7 +333,8 @@ async function submitAssign() {
 
 async function unassign() {
   if (!detail.value) return
-  const ok = await confirmAction({ message: '确定要解除这笔任务的账号分配吗？任务会回到待分配。' })
+  // 来源指定了买家号的任务：解除后下次分配会再分给指定的账号，文案里写明
+  const ok = await confirmAction({ message: unassignConfirmText(detail.value) })
   if (!ok) return
   const id = detail.value.id
   await run('解除分配', () => ordersApi.unassignOrder(id), '已解除分配')
@@ -689,6 +696,10 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
               <dd>{{ labelOf(ASSIGNMENT_KIND_LABEL, detail.assignment_kind) }}</dd>
               <dt>分配说明</dt>
               <dd>{{ detail.assignment_note || '—' }}</dd>
+              <template v-if="designationRow">
+                <dt>来源指定的买家号</dt>
+                <dd data-testid="designated-buyer">{{ designationRow }}</dd>
+              </template>
               <dt>人审</dt>
               <dd>
                 <el-tag size="small" :type="tagOf(REVIEW_STATUS_TAG, detail.review_status)" disable-transitions>
@@ -797,7 +808,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
                   <el-tag v-if="a.submitted_at" size="small" type="danger" disable-transitions>已登记提交</el-tag>
                 </div>
                 <dl class="pc-kv mt-3">
-                  <dt>账号 / 设备</dt>
+                  <dt>账号 / 浏览器</dt>
                   <dd>{{ a.account_name || a.buyer_account_name || '—' }} / {{ a.device_name || '—' }}</dd>
                   <dt>额度日期</dt>
                   <dd>{{ formatDate(a.bj_date) }}</dd>
@@ -848,7 +859,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
                       {{ a.guard_verdict.verdict === 'pass' ? '通过' : '拦截' }}
                     </el-tag>
                     <span v-if="a.guard_verdict.code" class="text-red-600 dark:text-red-400">
-                      {{ labelOf(GUARD_CODE_LABEL, a.guard_verdict.code) }}
+                      {{ guardCodeLabel(a.guard_verdict.code) }}
                     </span>
                   </div>
                   <ul v-if="a.guard_verdict.reasons?.length" class="mb-2 list-disc pl-5 text-sm text-gray-700 dark:text-gray-300">
@@ -935,6 +946,7 @@ const hasActions = computed(() => FOOTER_ACTIONS.some((a) => can(a)))
 
     <!-- 改派 -->
     <el-dialog v-model="assignOpen" title="改派账号" width="560px" append-to-body>
+      <p v-if="assignLead" class="mb-2 text-sm text-gray-700 dark:text-gray-300" data-testid="assign-designation-note">{{ assignLead }}</p>
       <p class="mb-4 text-sm text-gray-500 dark:text-dark-400">
         人工改派后任务固定在该账号，不参与自动重算。目标账号须已开启采购、金额区间匹配（本单商品小计 {{ formatMoney(detail?.subtotal_eff) }}），且计划日期当天有剩余额度。
       </p>

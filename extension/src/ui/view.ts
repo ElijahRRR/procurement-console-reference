@@ -1,34 +1,28 @@
-/** 三处界面（页面内面板、设置页、弹出页）共用的展示逻辑：状态 → 中文文案与色调，
- *  以及一个只用 textContent 的 DOM 构造器（动态内容从不拼进 innerHTML）。 */
+/** 三处界面（页面内面板、设置页、弹出页）共用的展示：状态 → DOM，以及一个只用 textContent 的 DOM 构造器
+ *  （动态内容从不拼进 innerHTML）。「什么状态说什么话、给什么按钮」的判断在 core/status.ts（Node 里可测），
+ *  这里只负责画。 */
 
 import { codeLabel } from "../core/codes.js";
-import { IDENTITY_STATUS_TEXT, maskCustomerId } from "../core/identity.js";
 import type { StateSnapshot } from "../core/messages.js";
 import { receiptText } from "../core/receipts.js";
 import { normalizeSlots } from "../core/schedule.js";
 import { runViewActive, startGate } from "../core/startgate.js";
+import { ACTION_LABEL, loginLabel, panelStatus, type PanelStatus, type StatusAction, type Tone } from "../core/status.js";
 import { bjClock, bjShort } from "../core/time.js";
 import type { LogLine } from "../core/log.js";
 
-export type Tone = "success" | "warning" | "danger" | "muted" | "brand";
+export type { Tone } from "../core/status.js";
 
 /** 心跳超过这么久没成功，就不再显示「已连接」。 */
 const STALE_MS = 3 * 60_000;
 
-/** 输入：状态快照、当前时刻 → 输出：服务端连接的文案与色调。 */
+/** 输入：状态快照、当前时刻 → 输出：「服务端」一行的文案与色调（细节与下一步在状态区）。 */
 export function connectionText(s: StateSnapshot, now: number): { text: string; tone: Tone } {
-  if (!s.device.paired) return { text: "未配对", tone: "muted" };
   const c = s.connection;
   if (!c) return { text: "正在连接", tone: "muted" };
-  if (!c.ok) return { text: `连接失败：${c.message ?? codeLabel(c.code)}`, tone: "danger" };
+  if (!c.ok) return { text: `连接失败：${c.kind === "network" ? "连不上服务端" : c.message ?? codeLabel(c.code)}`, tone: "danger" };
   if (now - c.at > STALE_MS) return { text: `最近联系 ${bjShort(c.at) ?? "—"}，之后没有心跳`, tone: "warning" };
   return { text: `已连接 · ${bjClock(c.at)} 心跳`, tone: "success" };
-}
-
-/** 输入：状态快照 → 输出：身份状态的短文案、说明与色调。 */
-export function identityText(s: StateSnapshot): { short: string; long: string; tone: Tone } {
-  const t = IDENTITY_STATUS_TEXT[s.identity_status];
-  return { short: t.short, long: t.long, tone: t.tone };
 }
 
 /** 输入：状态快照 → 输出：今日额度文案（读不到就说读不到，不写 0）。 */
@@ -51,14 +45,12 @@ export function scheduleText(s: StateSnapshot): string {
   return "—"; // 认不出的执行方式不原样显示
 }
 
-/** 输入：状态快照 → 输出：绑定账号文案。 */
+/** 输入：状态快照 → 输出：「账号」一行（与控制台「浏览器」页签的「当前登录」同一套说法）。 */
 export function accountText(s: StateSnapshot): string {
-  if (!s.device.paired) return "—";
   const hb = s.config?.heartbeat;
-  if (!hb) return "等待心跳";
-  if (!hb.account) return "未绑定（请在控制台「账号与设备」里绑定）";
-  const paused = hb.account.execution_paused ? `，已暂停执行${hb.account.pause_reason ? `：${hb.account.pause_reason}` : ""}` : "";
-  return `${hb.account.name}${paused}`;
+  if (!s.device.registered || !hb) return "—";
+  const state = s.identity?.conflict ? "conflict" : hb.login.state;
+  return loginLabel(state, hb.login.customer_id, hb.account?.name ?? null, hb.account?.execution_paused === true);
 }
 
 /** 输入：状态快照 → 输出：「开始执行」现在能不能点，不能点时给原因（规则见 core/startgate.ts）。 */
@@ -67,13 +59,8 @@ export const canStart = startGate;
 /** 输入：状态快照 → 输出：本浏览器是不是正在执行（本地记录且没被更新的服务端心跳否定）。 */
 export const runActive = runViewActive;
 
-/** 输入：状态快照 → 输出：身份对账有分歧时的提示；没有分歧为 null。 */
-export function identityConflictText(s: StateSnapshot): string | null {
-  const id = s.identity;
-  if (!id?.conflict) return null;
-  const who = id.signed_in ? `买家号 ID ${maskCustomerId(id.customer_id)}` : "未登录";
-  return `本浏览器的亚马逊标签页显示的登录状态不一致（其中一页显示：${who}），服务端不会下发任务。请刷新或关闭较早打开的亚马逊标签页，再点「刷新身份」。`;
-}
+/** 输入：状态快照 → 输出：面板此刻的状态、文案与按钮（规格 §5，见 core/status.ts）。 */
+export const statusOf = panelStatus;
 
 /** 输入：状态快照 → 输出：待补交回执的提示行（没有为空数组）。 */
 export function receiptLines(s: StateSnapshot): string[] {
@@ -111,4 +98,33 @@ export function h<K extends keyof HTMLElementTagNameMap>(
 /** 输入：日志行列表 → 输出：日志窗口里的行节点。 */
 export function renderLogLines(lines: readonly LogLine[]): HTMLElement[] {
   return lines.map((l) => h("div", { class: l.level }, h("span", { class: "t" }, logTime(l)), l.text));
+}
+
+export const TONE_DOT: Record<Tone, string> = {
+  success: "pc-dot pc-dot-green",
+  warning: "pc-dot pc-dot-yellow",
+  danger: "pc-dot pc-dot-red",
+  muted: "pc-dot",
+  brand: "pc-dot pc-dot-green",
+};
+
+export const TONE_NOTICE: Record<Tone, string> = {
+  success: "pc-notice pc-notice-success",
+  warning: "pc-notice pc-notice-warning",
+  danger: "pc-notice pc-notice-danger",
+  muted: "pc-notice pc-notice-muted",
+  brand: "pc-notice pc-notice-brand",
+};
+
+/** 输入：面板状态、各按钮的处理函数（没给处理函数的按钮不画）、是否禁用 → 输出：状态区的节点：
+ *  一段正文、追加的说明、完整的买家号 ID（可选中）、这个状态带的按钮。 */
+export function statusBlock(st: PanelStatus, on: Partial<Record<StatusAction, () => void>>, disabled = false): HTMLElement {
+  const box = h("div", { class: `${TONE_NOTICE[st.tone]} pc-status` }, h("div", {}, st.text));
+  for (const line of st.extra) box.append(h("div", { class: "pc-status-extra" }, line));
+  if (st.customer_id) {
+    box.append(h("div", { class: "pc-idline" }, h("span", { class: "pc-idline-k" }, "买家号 ID"), h("code", { class: "pc-code pc-id", title: "买家号 ID（亚马逊 customerId）" }, st.customer_id)));
+  }
+  const btns = st.actions.filter((a) => on[a]).map((a) => h("button", { class: "pc-btn pc-btn-sm", type: "button", disabled, onclick: () => on[a]!() }, ACTION_LABEL[a]));
+  if (btns.length) box.append(h("div", { class: "pc-status-actions" }, ...btns));
+  return box;
 }

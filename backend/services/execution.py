@@ -3,29 +3,51 @@
 
 执行权与互斥（方案 v2 §2，全部由数据库唯一索引兜底）：
 
-- 一个账号同时只有一个未结束的批次（execution_runs_one_active_per_account）。开始批次前先查一遍给出
-  「谁在执行、从何时开始」，真正的互斥靠插入时的唯一索引；冲突在 SAVEPOINT 里捕获，调用方事务仍可用。
+- 一个账号同时只有一个未结束的批次（execution_runs_one_active_per_account），一个浏览器同时也只有一个
+  （execution_runs_one_active_per_device），一个账号的一个定时时间点一天只执行一次（execution_runs_slot_once）。
+  开始批次前先查一遍给出「谁在执行、从何时开始」，真正的互斥靠插入时的唯一索引；冲突在 SAVEPOINT 里捕获，
+  调用方事务仍可用。
+- 定时时间点的两种答复：这个时间点今天已有以 finished 结束的定时批次 → SLOT_DONE（插件把它记成今天已处理）；
+  它的批次**还在执行** → ACCOUNT_BUSY（带持有者，插件下一分钟再问）。批次没跑完就结束（租约过期、护栏 buyer 项
+  拦截、清除模拟结果）时时间点重新空出来，当时在线的另一个浏览器下一分钟就能接手，而不是早早把这个时间点记掉。
 - 一笔任务、一个账号同时只有一个在途尝试（claimed / checking / guard_passed / submitting / verifying）。
-- 每个调用都核对批次 / 尝试属于**这台设备、这个工作区**（否则 404，不泄露存在性），并且批次仍有效
-  （未结束且租约未过期，否则 409 LEASE_LOST）。已结束尝试的重复结果上报例外：内容相同就原样返回。
+- 每个调用都核对批次 / 尝试属于**这个浏览器**（库里的 devices 行；它的工作区登记时确定、之后不变；否则 404，
+  不泄露存在性），并且批次仍有效（未结束且租约未过期，否则 409 LEASE_LOST）。已结束尝试的重复结果上报例外：
+  内容相同就原样返回。
 
-加锁顺序（避免死锁，与 services/orders 的「任务 → 尝试」一致）：执行闸门（工作区咨询锁：开始批次 / 领取取
-共享锁，清除模拟结果取独占锁）→ 批次 → 任务 → 尝试 → 账号。
+谁能执行哪个账号（方案 v2「2026-11 修订：执行入口」）：浏览器与账号之间没有绑定。开始批次时插件报上当前页面读到的
+买家号 ID，服务端要求它与这个浏览器最近上报的登录状态一致且不过期，再按这个 ID 找登记了它的账号。执行中（领取、
+进度、提交登记）每一步都拿「这个浏览器最新的登录状态」对「批次账号**当前**登记的 ID」：中途换了买家号，未登记提交
+的那一笔中止、任务回已分配、不暂停账号；已登记提交的照常收结果。结果上报、结束批次、迟到回执不做身份检查（回执不丢）。
+
+加锁顺序（避免死锁，与 services/orders 的「任务 → 尝试」一致）：浏览器行（开始批次、提交登记用 FOR UPDATE
+与并发的身份上报串行）→ 执行闸门（工作区咨询锁：开始批次 / 领取取共享锁，清除模拟结果取独占锁）→ 批次 →
+任务 → 尝试 → 账号。
 
 提交登记前的最后关口（mark_submitting）：除状态、取消、账号、身份（含新鲜度）外，还要求领取后来源没有执行相关
-变化（见「来源基线」一节），并按最新配置对存下的结算事实复核一次护栏。
+变化（见「来源基线」一节），并按最新配置对存下的结算事实复核一次护栏（含结算页当场读到的买家号 ID）。
+
+护栏 buyer 项拦截（结算页读到的买家号 ID 不是批次账号登记的 ID，拦截码 IDENTITY_MISMATCH）的落地在护栏判定与
+提交登记复核两处相同（_buyer_blocked）：按中止类处理——尝试 aborted、任务回已分配（随后按派生规则重新校验）、
+不进异常、不暂停账号、不占额度——并在同一事务里把批次结束（end_reason = identity_mismatch），否则只要浏览器上报的
+登录状态没变，同一批次会立刻再领到同一笔。插件之后对这个批次的请求得到「批次已结束」的既有答复（409 LEASE_LOST）。
 
 提交登记是分界线（铁律 9）：
 
 - submitted_at 为空：可以中止（aborted）、可重试（PAGE_LOAD_FAILED 自动重试一次）、可转异常；
   任务回到已分配时**保留分配**。
-- submitted_at 非空：任何非成功结局（失败、结果不明、断线、租约过期、批次被结束、设备被撤销）一律
+- submitted_at 非空：任何非成功结局（失败、结果不明、断线、租约过期、批次被结束）一律
   尝试 → unknown、任务 → result_unknown、账号暂停执行（原因「结果待核实：<平台订单号>」），绝不自动重买。
 - 插件说「结果不明」，或未登记提交却上报成功、成功却没有合格的亚马逊订单号：同样按结果待核实处理
   （宁可人工核实，也不让任务回到可领取状态）。
 - 回执不丢：已登记提交的尝试在租约过期、尚未清扫时照常接收结果；已是「结果待核实」后才送到的不同结果
   （迟到的回执）只记录、不改状态（_late_receipt）；控制台已核实（已下单 / 未下单）后才送到的不同结果同样只记录，
   与核实结论矛盾时提醒并挡住重新领取（_late_receipt_after_resolution）。
+
+插件送来的文本（进度的阶段与细节、等待验证的说明、结果体里的单号 / 错误码 / 说明 / 配送文字、结束批次的原因与
+说明）入库前先去掉 PostgreSQL 存不了的字符（NUL、不成对的代理项；devices.storable_text）：页面文字被截断在一个
+表情中间就会带出半个代理项，不该让进度、回执因此变成 500。结算页事实例外：护栏按原样的事实判定（不把值「修好」
+再比对），判定之后才清理要入库、要返回的事实与裁决（见 submit_guard）。
 
 账号被本模块暂停时，除 accounts.pause 写的 'account.paused' 外，另写一条 PAUSE_MARKER_KIND 事件
 {cause: result_unknown | account_error, simulated, attempt_id, code}，供「清除模拟结果」判断哪些账号
@@ -35,6 +57,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -43,7 +66,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from registry import settings
-from services import accounts, clock, devices, events, guard, orders, quota, settings_svc, writeback
+from services import accounts, clock, designation, devices, events, guard, orders, quota, settings_svc, writeback
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import (
     ATTEMPT_INFLIGHT, ERROR_CODES, EXECUTION_FIELDS, PRE_EXECUTION_STATUSES, SIM_PREFIX, UpstreamRecord, money,
@@ -63,15 +86,27 @@ ATTEMPT_STATUS_ZH = {
     "claimed": "已领取", "checking": "结算中", "guard_passed": "护栏已放行", "submitting": "已登记提交",
     "verifying": "等待验证", "succeeded": "成功", "failed": "失败", "unknown": "结果待核实", "aborted": "已中止",
 }
+#: 批次结束原因的中文。现在只会写 finished / lease_expired / simulation_reset / identity_mismatch（护栏 buyer 项
+#: 拦截时服务端结束批次，见 _buyer_blocked）；device_revoked 是旧版「撤销设备授权」留下的历史行，标签保留给它们
+#: 显示（三端同一句：web 的 RUN_END_REASON_LABEL、插件的 codes）。
 END_REASON_ZH = {
-    "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）", "device_revoked": "设备授权已撤销",
+    "finished": "插件结束了批次", "lease_expired": "执行权超时（租约过期）",
+    "identity_mismatch": "结算页登录的买家号不是这个批次的买家号", "device_revoked": "浏览器的授权已撤销（旧版）",
     "simulation_reset": "已清除模拟结果",
 }
+#: 护栏 buyer 项的拦截码，以及它拦下时服务端结束批次所写的 end_reason
+BUYER_BLOCK_CODE = "IDENTITY_MISMATCH"
+BUYER_BLOCK_END_REASON = "identity_mismatch"
+#: 批次心跳 stop=true 的原因（不看身份新鲜度）
+STOP_REASONS = ("account_paused", "account_archived", "identity_mismatch")
+_SLOT_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 __all__ = [
-    "CANCEL_CODES", "HOLD_DEFERRED_KIND", "PAUSE_MARKER_KIND", "apply_source_drift", "drift_updates", "end_run",
-    "execution_gate", "finish_run", "mark_submitting", "mark_verifying", "next_attempt", "progress", "report_result",
-    "run_heartbeat", "start_run", "submit_guard", "sweep",
+    "BUYER_BLOCK_CODE", "BUYER_BLOCK_END_REASON", "CANCEL_CODES", "HOLD_DEFERRED_KIND", "PAUSE_MARKER_KIND",
+    "STOP_REASONS", "apply_source_drift",
+    "claimable_counts", "drift_updates", "end_run", "execution_gate", "finish_run", "mark_submitting",
+    "mark_verifying", "next_attempt", "progress", "report_result", "run_heartbeat", "start_run", "submit_guard",
+    "sweep",
 ]
 
 
@@ -104,10 +139,23 @@ def _id(v: Any, what: str) -> int:
 
 
 def _text(v: Any, n: int) -> str | None:
+    """输入：插件送来的值、最多几个字 → 输出：可以入库的文本（去掉存不了的字符、首尾空白，再截断）；空 → None。"""
     if v is None:
         return None
-    s = str(v).strip()
+    s = devices.storable_text(str(v)).strip()
     return s[:n] or None
+
+
+def _storable_json(v: Any) -> Any:
+    """输入：JSON 值（插件送来的细节，或护栏的事实与裁决）→ 输出：同样的结构，字符串（含字典的键）里 PostgreSQL
+    存不了的字符（NUL、不成对的代理项）已去掉；别的类型原样返回。入库、写事件、返回给插件之前用。"""
+    if isinstance(v, str):
+        return devices.storable_text(v)
+    if isinstance(v, dict):
+        return {(devices.storable_text(k) if isinstance(k, str) else k): _storable_json(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_storable_json(x) for x in v]
+    return v
 
 
 def _jsonable(v: Any) -> Any:
@@ -176,7 +224,7 @@ def _set_attempt(conn, att: dict[str, Any], **cols: Any) -> dict[str, Any]:
 
 
 def _run_for(conn, dev: dict[str, Any], run_id: Any) -> dict[str, Any]:
-    """输入：设备、批次 id → 输出：加锁的批次行；不属于这台设备 / 工作区 → NOT_FOUND。"""
+    """输入：浏览器行、批次 id → 输出：加锁的批次行；不属于这个浏览器（及它的工作区）→ NOT_FOUND。"""
     rid = _id(run_id, "执行批次")
     run = conn.execute(
         "SELECT * FROM procure.execution_runs WHERE id = %s AND workspace_id = %s AND device_id = %s FOR UPDATE",
@@ -200,8 +248,8 @@ def _require_active(run: dict[str, Any] | None) -> None:
 
 
 def _attempt_for(conn, dev: dict[str, Any], attempt_id: Any) -> tuple[dict, dict | None, dict]:
-    """输入：设备、尝试 id → 输出：(尝试, 批次, 任务)，按「批次 → 任务 → 尝试」加锁；
-    尝试不属于这台设备 / 工作区 → NOT_FOUND。"""
+    """输入：浏览器行、尝试 id → 输出：(尝试, 批次, 任务)，按「批次 → 任务 → 尝试」加锁；
+    尝试不属于这个浏览器（及它的工作区）→ NOT_FOUND。"""
     aid = _id(attempt_id, "采购尝试")
     ws = dev["workspace_id"]
     peek = conn.execute(
@@ -240,7 +288,7 @@ def _busy(holder: dict[str, Any] | None, account_name: str) -> DomainError:
                            {"holder_device_id": None, "holder_device_name": None, "since": None})
     return DomainError(
         "ACCOUNT_BUSY",
-        f"账号 {account_name} 正由设备「{holder['device_name']}」执行"
+        f"账号 {account_name} 正由浏览器「{holder['device_name']}」执行"
         f"（北京时间 {holder['started_at'].astimezone(clock.BJ_TZ):%m-%d %H:%M} 起），同一账号同时只能有一个执行者",
         409,
         {"holder_device_id": holder["device_id"], "holder_device_name": holder["device_name"],
@@ -248,43 +296,74 @@ def _busy(holder: dict[str, Any] | None, account_name: str) -> DomainError:
     )
 
 
+def _device_run(conn, dev: dict[str, Any]) -> dict[str, Any] | None:
+    """输入：浏览器行 → 输出：这个浏览器自己的未结束批次（附账号名）；没有 → None。"""
+    return conn.execute(
+        """
+        SELECT r.id, r.account_id, a.name AS account_name, r.started_at, r.lease_expires_at
+        FROM procure.execution_runs r
+        JOIN procure.buyer_accounts a ON a.id = r.account_id AND a.workspace_id = r.workspace_id
+        WHERE r.workspace_id = %s AND r.device_id = %s AND r.ended_at IS NULL
+        ORDER BY r.started_at, r.id LIMIT 1
+        """,
+        (dev["workspace_id"], dev["id"]),
+    ).fetchone()
+
+
+def _device_busy(run: dict[str, Any] | None) -> DomainError:
+    detail = {"run_id": run["id"] if run else None, "account_name": run["account_name"] if run else None,
+              "since": _iso(run["started_at"]) if run else None,
+              "lease_expires_at": _iso(run["lease_expires_at"]) if run else None}
+    return DomainError("DEVICE_BUSY", "这个浏览器上一个批次还没有结束", 409, detail)
+
+
+#: 登录状态不是 signed_in 时的说明（开始批次与执行中共用）
+_LOGIN_PROBLEM_ZH = {
+    "unknown": "插件还没有上报这个浏览器的登录状态，请打开或刷新亚马逊页面后重试",
+    "signed_out": "浏览器没有登录亚马逊",
+    "conflict": "这个浏览器的亚马逊标签页显示的买家号不一致，请刷新或关闭较早打开的标签页",
+    "no_id": "插件没有读到浏览器登录的买家号 ID，请打开亚马逊订单页后重试",
+}
+
+
 def _identity_problem(dev: dict[str, Any], acc: dict[str, Any]) -> tuple[str, str] | None:
-    """输入：设备行、账号行 → 输出：(有效身份状态, 中文说明)；身份为 match 时 None（不看新鲜度）。"""
-    status = devices.effective_identity_status(dev, acc)
-    if status == "match":
-        return None
-    ident = dev.get("identity") if isinstance(dev.get("identity"), dict) else {}
-    if status == "mismatch":
-        msg = (f"浏览器登录的买家账号（{ident.get('customer_id') or '未识别'}）与绑定账号 {acc['name']}"
-               f"（{acc['amazon_customer_id']}）不符，拒绝领取")
-    elif status == "signed_out":
-        msg = f"浏览器没有登录亚马逊买家账号，请先登录绑定账号 {acc['name']}"
-    elif not acc.get("amazon_customer_id"):
-        msg = f"账号 {acc['name']} 还没有登记买家号 ID，请在控制台采用插件识别的 ID 后再开始"
-    else:
-        msg = "插件还没有识别到浏览器登录的买家账号，请打开亚马逊页面后重试"
-    return status, msg
+    """输入：浏览器行、批次的账号行 → 输出：(登录状态, 中文说明)；这个浏览器最新的登录状态是 signed_in、且登录的
+    买家号 ID 等于账号**当前**登记的 ID 时 None（不看新鲜度，那是 _identity_stale 的事）。"""
+    state = devices.login_state(dev)
+    if state != "signed_in":
+        return state, _LOGIN_PROBLEM_ZH[state]
+    expected = acc.get("amazon_customer_id")
+    if not expected:
+        return state, f"账号 {acc['name']} 现在没有登记买家号 ID"
+    if dev["login_customer_id"] != expected:
+        return state, (f"浏览器登录的买家号变了（现在是 {dev['login_customer_id']}，"
+                       f"这个批次的账号 {acc['name']} 登记的是 {expected}）")
+    return None
 
 
 def _identity_stale(dev: dict[str, Any]) -> str | None:
-    """输入：设备行 → 输出：身份超过 identity_fresh_s 没有上报时的说明；新鲜 → None（开始批次、领取、提交前都看）。"""
-    fresh_s = int(settings.get().identity_fresh_s)
-    at = dev.get("identity_at")
-    if at is not None and (clock.now() - at).total_seconds() <= fresh_s:
+    """输入：浏览器行 → 输出：登录状态超过 identity_fresh_s 没有上报时的说明；新鲜 → None
+    （开始批次、领取、进度、提交登记都看）。"""
+    if not devices.identity_stale(dev):
         return None
-    return f"插件超过 {max(1, fresh_s // 60)} 分钟没有上报登录身份，身份信息已过期"
+    fresh_s = int(settings.get().identity_fresh_s)
+    return f"插件超过 {max(1, fresh_s // 60)} 分钟没有上报登录状态"
 
 
 # ── 执行闸门（清除模拟结果 ↔ 开始批次 / 领取）──────────────────────────────────
 
-_LOCK_NS = 7_310_433          # pg_advisory_xact_lock 命名空间（allocation 用 7_310_431、feishu_intake 用 7_310_432）
+_LOCK_NS = 7_310_433          # pg_advisory_xact_lock 命名空间（allocation 用 7_310_431、feishu_intake 用 7_310_432、devices 登记用 7_310_434）
 
 
 def execution_gate(conn, workspace_id: int, *, exclusive: bool = False) -> None:
     """输入：连接、工作区、是否独占 → 输出：无（事务级咨询锁，事务结束释放）。
 
     开始批次与领取取共享锁（彼此不排队）；清除模拟结果取独占锁，等进行中的开始 / 领取提交后才动手，清除期间
-    也不会冒出新的批次或尝试（否则新领取的尝试会被一并清掉、任务却卡在采购中）。调用方须在加任何行锁之前取。
+    也不会冒出新的批次或尝试（否则新领取的尝试会被一并清掉、任务却卡在采购中）。
+
+    调用方须在加批次 / 任务 / 尝试 / 账号的行锁之前取；浏览器行可以先锁（开始批次如此：先 FOR UPDATE 锁浏览器行、
+    查它自己的未结束批次，再取闸门，见模块说明的加锁顺序）。这个顺序之所以安全，是因为持有独占锁的一方（清除模拟
+    结果）从不锁浏览器行——以后也不得去锁，否则会和「拿着浏览器行等闸门」的开始批次互相等待。
     """
     fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
     conn.execute(f"SELECT {fn}(%s::int, %s::int)", (_LOCK_NS, int(workspace_id) % 2_147_483_647))
@@ -888,34 +967,102 @@ def end_run(conn, run: dict[str, Any], end_reason: str, *, actor_kind: str = "sy
 # ── 开始批次与批次心跳 ────────────────────────────────────────────────────────
 
 
-def start_run(conn, device: dict[str, Any], *, trigger: Any, simulated: Any) -> dict[str, Any]:
-    """输入：设备、触发方式（manual / scheduled）、是否模拟 → 输出：{run_id, lease_ttl_s, lease_expires_at}。
+def _norm_slot(slot: Any) -> str:
+    """输入：定时时间点（'H:MM' / 'HH:MM'，北京时间）→ 输出：规范成 'HH:MM'；缺失或写法不对 → VALIDATION。"""
+    if slot is None or (isinstance(slot, str) and not slot.strip()):
+        raise validation("定时执行需要带上时间点（slot，北京时间 HH:MM）", field="slot")
+    m = _SLOT_RE.match(slot.strip()) if isinstance(slot, str) else None
+    if m is None or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise validation("时间点格式不对（应为北京时间 HH:MM）", field="slot")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
 
-    依次要求：设备已绑定（NOT_BOUND 403）、账号未归档（NOT_BOUND 403）、身份 match 且在 identity_fresh_s 内上报过
-    （IDENTITY_MISMATCH 403）、账号未暂停执行（ACCOUNT_PAUSED 403）、模拟批次（本阶段一律拒绝非模拟，
-    REAL_PURCHASE_DISABLED 403）、账号没有未结束的批次（ACCOUNT_BUSY 409，detail 为持有者）。
+
+def _slot_finished(conn, workspace_id: int, account_id: int, bj_date: date, slot: str) -> bool:
+    """输入：账号、北京日期、时间点 → 输出：这个时间点今天是否已有以 finished 结束的定时批次（= 已经执行过）。
+
+    比唯一索引 execution_runs_slot_once 的口径窄：索引还让**未结束**的定时批次占着时间点（防并发重复开始），但那时
+    还不能说「已经执行过」——批次可能没跑完就结束（租约过期、护栏 buyer 项拦截、清除模拟结果），时间点随之空出来。
+    未结束的那种由占用检查回答 ACCOUNT_BUSY。
     """
-    dev = devices.require_active(conn, device)
+    return conn.execute(
+        "SELECT 1 FROM procure.execution_runs WHERE workspace_id = %s AND account_id = %s AND bj_date = %s "
+        "AND scheduled_slot = %s AND trigger = 'scheduled' AND end_reason = 'finished' LIMIT 1",
+        (workspace_id, account_id, bj_date, slot),
+    ).fetchone() is not None
+
+
+def _slot_done() -> DomainError:
+    return DomainError("SLOT_DONE", "这个时间点今天已经执行过", 409)
+
+
+def _check_slot(acc: dict[str, Any], slot: str, now: datetime) -> None:
+    """输入：账号行、规范化的时间点、现在 → 输出：无；账号不是定时模式、时间点不在账号的执行时间里、或北京时间今天
+    还没到点 → VALIDATION（说明原因）。"""
+    if acc["purchase_mode"] != "scheduled":
+        raise validation(f"账号 {acc['name']} 不是定时执行模式，不能按时间点开始", field="slot",
+                         purchase_mode=acc["purchase_mode"])
+    times = list(acc["schedule_times"] or [])
+    if slot not in times:
+        raise validation(f"时间点 {slot} 不在账号 {acc['name']} 的执行时间里（{'、'.join(times) or '未设置'}）",
+                         field="slot", schedule_times=times)
+    if f"{now.astimezone(clock.BJ_TZ):%H:%M}" < slot:
+        raise validation(f"北京时间还没有到 {slot}，不能开始这个时间点的批次", field="slot")
+
+
+def start_run(conn, device: dict[str, Any], *, customer_id: Any = None, trigger: Any, simulated: Any,
+              slot: Any = None) -> dict[str, Any]:
+    """输入：浏览器行、插件在当前页面读到的买家号 ID、触发方式（manual / scheduled）、是否模拟、定时时间点
+    （trigger = scheduled 时必填，北京时间 HH:MM）→ 输出：{run_id, lease_ttl_s, lease_expires_at, account: {id, name}}。
+
+    依次（契约 §5）：
+    1. 锁浏览器行（FOR UPDATE，与并发的身份上报串行）。
+    2. 参数：trigger、simulated（布尔）、customer_id（缺失 → VALIDATION「插件版本过旧，请更新插件」；形状不对 →
+       VALIDATION）。
+    3. 这个浏览器已有未结束的批次 → DEVICE_BUSY（409，detail {run_id, account_name, since, lease_expires_at}）。
+    4. 取执行闸门（共享）。
+    5. 身份：浏览器最新的登录状态必须是 signed_in、登录的买家号 ID 等于请求里的 customer_id、且不过期 →
+       否则 IDENTITY_MISMATCH（403，detail {login_state, identity_at, stale}）。
+    6. 账号：工作区内未归档、登记了这个 ID 的账号；没有 → ACCOUNT_NOT_REGISTERED（403）。
+    7. 账号已暂停 → ACCOUNT_PAUSED（403）；simulated 不是 true → REAL_PURCHASE_DISABLED（403，本阶段一律拒绝）。
+    8. 定时：必须带 slot；账号须是定时模式、slot 在它的执行时间里、北京时间今天已到点（否则 VALIDATION）；同一
+       (账号, 北京日期, slot) 已有以 finished 结束的定时批次 → SLOT_DONE（409，「已经执行过」是真的，插件据此把
+       这个时间点记成今天已处理）。手动批次不记 slot。
+    9. 账号已有未结束的批次 → ACCOUNT_BUSY（409，detail 为持有者）。**包括同一个时间点还在执行的定时批次**：
+       它可能没跑完就结束，那时时间点重新空出来，所以后到的浏览器得到的是「下一分钟再问」而不是「已经执行过」；
+       它正常结束之后再问才是 SLOT_DONE。
+    10. 插入（SAVEPOINT）；唯一索引冲突见 _start_conflict：两个浏览器同时为同一个时间点开始时，后到的稳定得到
+        ACCOUNT_BUSY（带持有者），不随数据库报哪个索引而变。
+    """
+    dev = devices.require_active(conn, device, lock=True)
     if trigger not in TRIGGERS:
         raise validation("触发方式只能是 manual 或 scheduled", field="trigger")
     if not isinstance(simulated, bool):
         raise validation("simulated 必须是 true 或 false", field="simulated")
+    if customer_id is None or (isinstance(customer_id, str) and not customer_id.strip()):
+        raise validation("插件版本过旧，请更新插件", field="customer_id")
+    cid = "".join(customer_id.split()).upper() if isinstance(customer_id, str) else ""
+    if len(cid) > 64 or not accounts.CUSTOMER_ID_RE.match(cid):
+        raise validation("买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）", field="customer_id")
+    mine = _device_run(conn, dev)
+    if mine is not None:
+        raise _device_busy(mine)
     ws = dev["workspace_id"]
     execution_gate(conn, ws)
-    if dev["bound_account_id"] is None:
-        raise DomainError("NOT_BOUND", "设备还没有绑定买家账号，请先在控制台「账号与设备」里绑定", 403)
-    acc = _account_row(conn, ws, dev["bound_account_id"])
-    if acc is None or acc["archived_at"] is not None:
-        raise DomainError("NOT_BOUND", "设备绑定的买家账号已归档，请在控制台重新绑定", 403)
-    problem = _identity_problem(dev, acc)
     now = clock.now()
-    if problem is not None:
-        raise DomainError("IDENTITY_MISMATCH", problem[1], 403,
-                          {"identity_status": problem[0], "identity_at": _iso(dev["identity_at"]), "stale": False})
+    state = devices.login_state(dev)
     stale = _identity_stale(dev)
+    detail = {"login_state": state, "identity_at": _iso(dev["identity_at"]), "stale": stale is not None}
+    if state != "signed_in":
+        raise DomainError("IDENTITY_MISMATCH", _LOGIN_PROBLEM_ZH[state], 403, detail)
+    if dev["login_customer_id"] != cid:
+        raise DomainError("IDENTITY_MISMATCH", "页面上的买家号与插件最近上报的不一致，请刷新亚马逊页面后重试", 403,
+                          detail)
     if stale is not None:
-        raise DomainError("IDENTITY_MISMATCH", f"{stale}，请打开或刷新亚马逊页面后重试", 403,
-                          {"identity_status": "match", "identity_at": _iso(dev["identity_at"]), "stale": True})
+        raise DomainError("IDENTITY_MISMATCH", f"{stale}，请打开或刷新亚马逊页面后重试", 403, detail)
+    acc = accounts.find_by_customer_id(conn, ws, cid)
+    if acc is None:
+        raise DomainError("ACCOUNT_NOT_REGISTERED", "这个买家号还没有登记：请在控制台「账号」页登记后再开始", 403,
+                          {"customer_id": cid})
     if acc["execution_paused"]:
         raise DomainError("ACCOUNT_PAUSED", f"账号 {acc['name']} 已暂停执行：{acc['pause_reason'] or '人工暂停'}", 403,
                           {"pause_reason": acc["pause_reason"], "paused_at": _iso(acc["paused_at"])})
@@ -924,7 +1071,16 @@ def start_run(conn, device: dict[str, Any], *, trigger: Any, simulated: Any) -> 
         # 本阶段（第一个 PR）无论设置如何都拒绝非模拟批次（铁律 10）
         msg = "本阶段只允许模拟执行，服务端拒绝真实采购批次" if sim_only else "真实采购尚未开放，服务端拒绝真实采购批次"
         raise DomainError("REAL_PURCHASE_DISABLED", msg, 403)
+    today = clock.bj_today()
+    scheduled_slot = _norm_slot(slot) if trigger == "scheduled" else None       # 手动批次不记时间点
+    if scheduled_slot is not None:
+        _check_slot(acc, scheduled_slot, now)
+    # 先读持有者、再查时间点、最后才报「账号被占用」：两句各取一次快照，持有者如果恰好在两句之间正常结束了
+    # 同一个时间点的批次，后到的得到的是 SLOT_DONE（此刻的事实），而不是带着一个已经不在的持有者的 ACCOUNT_BUSY。
+    # 时间点的批次还在执行时走不到 SLOT_DONE：只有 finished 才算「已经执行过」，其余由下面的占用检查回答。
     holder = _holder(conn, ws, acc["id"])
+    if scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
+        raise _slot_done()
     if holder is not None:
         raise _busy(holder, acc["name"])
     ttl = _ttl()
@@ -934,35 +1090,65 @@ def start_run(conn, device: dict[str, Any], *, trigger: Any, simulated: Any) -> 
             run = conn.execute(
                 """
                 INSERT INTO procure.execution_runs (workspace_id, account_id, device_id, trigger, simulated,
-                                                    started_at, heartbeat_at, lease_expires_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
+                                                    started_at, heartbeat_at, lease_expires_at, bj_date,
+                                                    scheduled_slot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
                 """,
-                (ws, acc["id"], dev["id"], trigger, simulated, now, now, expires),
+                (ws, acc["id"], dev["id"], trigger, simulated, now, now, expires, today, scheduled_slot),
             ).fetchone()
-    except psycopg.errors.UniqueViolation:
-        raise _busy(_holder(conn, ws, acc["id"]), acc["name"]) from None
+    except psycopg.errors.UniqueViolation as exc:
+        raise _start_conflict(conn, dev, acc, today, scheduled_slot,
+                              getattr(exc.diag, "constraint_name", None) or "") from None
     events.record(conn, ws, "run", run["id"], "run.started", actor_kind="device", actor_id=dev["id"],
-                  detail={"account_id": acc["id"], "trigger": trigger, "simulated": simulated})
-    return {"run_id": run["id"], "lease_ttl_s": ttl, "lease_expires_at": expires.isoformat()}
+                  detail={"account_id": acc["id"], "trigger": trigger, "simulated": simulated, "customer_id": cid,
+                          "scheduled_slot": scheduled_slot})
+    return {"run_id": run["id"], "lease_ttl_s": ttl, "lease_expires_at": expires.isoformat(),
+            "account": {"id": acc["id"], "name": acc["name"]}}
+
+
+def _start_conflict(conn, dev: dict[str, Any], acc: dict[str, Any], today: date, scheduled_slot: str | None,
+                    constraint: str) -> DomainError:
+    """输入：开始批次插入时撞上的唯一索引名 → 输出：对应的 409。
+
+    并发下先查后插没拦住的冲突：两个浏览器同时为同一个定时时间点开始时 …_per_account 与 …_slot_once 两个索引都会
+    撞上，数据库报哪个不一定，所以不能只看索引名：
+
+    1. 先按第 8 步的口径重查时间点：今天已有以 finished 结束的定时批次 → SLOT_DONE。
+    2. …_per_device → DEVICE_BUSY。
+    3. 其余（…_per_account、…_slot_once 及认不出的）：账号此刻有未结束的批次 → ACCOUNT_BUSY（带持有者）。撞上的
+       正是同一个时间点还在执行的批次时也走这里——它还没跑完，不能说「已经执行过」。
+    4. 已经没有持有者了（撞上的批次在这几句之间结束了）：再查一次时间点——它以 finished 结束 → SLOT_DONE；
+       没跑完就结束（时间点又空出来）或撞的不是时间点 → ACCOUNT_BUSY（不带持有者，插件下一分钟再问时就能开始）。
+       不按索引名直接回 SLOT_DONE：那样会让插件把一个刚空出来的时间点记成今天已处理。
+    """
+    ws = dev["workspace_id"]
+    if scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
+        return _slot_done()
+    if constraint == "execution_runs_one_active_per_device":
+        return _device_busy(_device_run(conn, dev))
+    holder = _holder(conn, ws, acc["id"])
+    if holder is None and scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
+        return _slot_done()
+    return _busy(holder, acc["name"])
 
 
 def _stop_reason(dev: dict[str, Any], acc: dict[str, Any] | None) -> str | None:
+    """输入：浏览器行、批次的账号行 → 输出：批次该停下的原因（STOP_REASONS 之一）；可以继续 → None。不看身份新鲜度。"""
     if acc is None or acc["archived_at"] is not None:
         return "account_archived"
     if acc["execution_paused"]:
         return "account_paused"
-    if dev["bound_account_id"] != acc["id"]:
-        return "device_unbound"
-    if devices.effective_identity_status(dev, acc) != "match":
+    if _identity_problem(dev, acc) is not None:
         return "identity_mismatch"
     return None
 
 
 def run_heartbeat(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
-    """输入：设备、批次 id → 输出：{lease_expires_at, stop, stop_reason}（续租 lease_ttl_s 秒）。
+    """输入：浏览器行、批次 id → 输出：{lease_expires_at, stop, stop_reason}（续租 lease_ttl_s 秒）。
 
-    stop=true 的原因：account_paused / account_archived / identity_mismatch / device_unbound；租约照样续，
-    让插件把手上这一笔做完再结束批次。批次已结束或租约已过期 → LEASE_LOST。
+    stop=true 的原因：account_paused / account_archived / identity_mismatch（这个浏览器最新的登录状态不是
+    「登录着批次账号当前登记的买家号」；不看新鲜度）；租约照样续，让插件把手上这一笔做完再结束批次。
+    批次已结束或租约已过期 → LEASE_LOST。
     """
     dev = devices.require_active(conn, device)
     run = _run_for(conn, dev, run_id)
@@ -1075,15 +1261,39 @@ _CLAIMABLE_WHERE = """
 """
 
 
+def _future_assigned(conn, workspace_id: int, account_id: int, today: date) -> int:
+    return int(conn.execute(
+        "SELECT count(*) AS n FROM procure.purchase_orders WHERE workspace_id = %s AND assigned_account_id = %s "
+        "AND status = 'assigned' AND suggested_purchase_date > %s",
+        (workspace_id, account_id, today),
+    ).fetchone()["n"])
+
+
+def claimable_counts(conn, workspace_id: int, account_id: int, today: date | None = None) -> dict[str, int]:
+    """输入：工作区、账号、北京今天（缺省现算）→ 输出：{executable_today, future_assigned}（插件心跳用）。
+
+    executable_today：与领取条件（_CLAIMABLE_WHERE）同口径的笔数——已分配给本账号、建议采购日期 ≤ 今天、人审通过、
+    未上游取消、无冲突、没有在途尝试；不与当天剩余额度取小（额度另在 quota_today 里给）。
+    future_assigned：已分配给本账号、建议采购日期在今天之后的笔数。
+    """
+    t = today or clock.bj_today()
+    n = conn.execute(f"SELECT count(*) AS n FROM procure.purchase_orders o WHERE {_CLAIMABLE_WHERE}",
+                     (workspace_id, account_id, t, [], _INFLIGHT)).fetchone()["n"]
+    return {"executable_today": int(n), "future_assigned": _future_assigned(conn, workspace_id, account_id, t)}
+
+
 def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
-    """输入：设备、批次 id → 输出：{attempt: 载荷 | None, reason}（契约 §3.3、§5 第 6 步）；候选任务只是被别的
+    """输入：浏览器行、批次 id → 输出：{attempt: 载荷 | None, reason}（契约 §3.3、§5 第 6 步）；候选任务只是被别的
     事务锁着时另有 retry_after_s（插件稍后再领，不要结束批次）。
 
-    本批次已有在途尝试 → ATTEMPT_IN_FLIGHT（409）。账号已暂停 / 已归档 / 身份不符或超过 identity_fresh_s 没有
-    上报 / 当天额度已满（used(账号, 北京今天, 本批次的模拟标记) ≥ 每日上限，在途、待核实、成功都占用）/
+    本批次已有在途尝试 → ATTEMPT_IN_FLIGHT（409）。账号已暂停 / 已归档 / 浏览器登录的买家号不是批次账号登记的 ID
+    或登录状态超过 identity_fresh_s 没有上报 / 当天额度已满（used(账号, 北京今天, 本批次的模拟标记) ≥ 每日上限，
+    在途、待核实、成功都占用）/
     账号在别处还有在途尝试时不领取，返回原因。领取条件：已分配给本账号、建议采购日期 ≤ 北京今天、人审通过、
-    未上游取消、无冲突、金额仍在账号区间内；顺序：建议采购日期、下单时间、id；FOR UPDATE SKIP LOCKED。
-    金额已不在区间的任务解除分配回待分配并跳过。
+    未上游取消、无冲突、金额仍在账号区间内、来源指定（如果有，且不是人工改派）解析到的仍是本账号；
+    顺序：建议采购日期、下单时间、id；FOR UPDATE SKIP LOCKED。
+    金额已不在区间、或来源指定的买家号已不是本账号的任务解除分配回待分配并跳过（后者与 orders._assignment_problem
+    共用 designation.off_target：指定变了而分配还没重算时，原账号领不到这笔任务）。
     """
     dev = devices.require_active(conn, device)
     execution_gate(conn, dev["workspace_id"])
@@ -1105,7 +1315,7 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
         return {"attempt": None, "reason": f"账号已暂停执行：{acc['pause_reason'] or '人工暂停'}"}
     if stop is not None:
         problem = _identity_problem(dev, acc)
-        return {"attempt": None, "reason": problem[1] if problem else "设备与账号的绑定已变化，停止领取"}
+        return {"attempt": None, "reason": f"{problem[1] if problem else '浏览器登录的买家号变了'}，停止领取"}
     stale = _identity_stale(dev)
     if stale is not None:
         return {"attempt": None, "reason": f"{stale}，停止领取（请打开或刷新亚马逊页面后重新开始）"}
@@ -1124,6 +1334,8 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
 
     skipped: list[int] = []
     unassigned = 0
+    redesignated = 0
+    des_ctx: designation.Context | None = None      # 解析来源指定用的账号表：有带指定的候选任务时才读，只读一次
     while True:
         rows = conn.execute(
             f"SELECT o.* FROM procure.purchase_orders o WHERE {_CLAIMABLE_WHERE} "
@@ -1136,6 +1348,15 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
             if orders.derive_status(o) != "assigned":
                 skipped.append(o["id"])
                 continue
+            if designation.has(o) and o["assignment_kind"] != "manual":
+                des_ctx = des_ctx if des_ctx is not None else designation.load_context(conn, ws)
+                if designation.off_target(o, designation.resolve_order(o, des_ctx)):
+                    orders.transition(conn, o, "queued",
+                                      reason=f"来源指定的买家号已不是账号 {acc['name']}，领取时解除分配",
+                                      actor_kind="device", actor_id=dev["id"],
+                                      event_detail={"action": "claim_recheck"})
+                    redesignated += 1
+                    continue
             sub = orders.subtotal_eff(o)
             if not orders.amount_in_range(sub, acc):
                 orders.transition(conn, o, "queued",
@@ -1152,17 +1373,15 @@ def next_attempt(conn, device: dict[str, Any], run_id: Any) -> dict[str, Any]:
         wait_s = int(settings.get().claim_busy_retry_s)
         return {"attempt": None, "retry_after_s": wait_s,
                 "reason": f"有 {locked} 笔可执行的任务正被其他操作（导入、同步或分配）占用，请 {wait_s} 秒后再领取"}
-    future = conn.execute(
-        "SELECT count(*) AS n FROM procure.purchase_orders WHERE workspace_id = %s AND assigned_account_id = %s "
-        "AND status = 'assigned' AND suggested_purchase_date > %s",
-        (ws, acc["id"], today),
-    ).fetchone()["n"]
+    future = _future_assigned(conn, ws, acc["id"], today)
     reason = "今天没有可执行的任务"
     extras = []
     if future:
         extras.append(f"另有 {future} 笔建议采购日期在未来")
     if unassigned:
         extras.append(f"{unassigned} 笔金额已不在区间、已解除分配")
+    if redesignated:
+        extras.append(f"{redesignated} 笔来源指定的买家号已不是本账号、已解除分配")
     if extras:
         reason += "（" + "，".join(extras) + "）"
     return {"attempt": None, "reason": reason}
@@ -1178,9 +1397,10 @@ CANCEL_CODES = ("UPSTREAM_CANCELLED", "ACCOUNT_ARCHIVED", "ACCOUNT_PAUSED", "IDE
 
 def _progress_stop(conn, dev: dict[str, Any], att: dict[str, Any],
                    order: dict[str, Any]) -> tuple[str, str] | None:
-    """输入：设备、在途且未登记提交的尝试、它的任务 → 输出：(cancel_code, 中文原因)；可以继续 → None。
+    """输入：浏览器行、在途且未登记提交的尝试、它的任务 → 输出：(cancel_code, 中文原因)；可以继续 → None。
 
-    依次看：上游取消、账号归档、账号暂停、身份不符、身份过期、来源写在任务上的暂停、领取后来源的执行相关变化。
+    依次看：上游取消、账号归档、账号暂停、浏览器登录的买家号不是批次账号登记的 ID、登录状态过期、来源写在任务上的
+    暂停、领取后来源的执行相关变化。
     """
     acc = _account_row(conn, att["workspace_id"], att["account_id"])
     if order["upstream_cancelled"] or order["status"] == "cancelled":
@@ -1206,11 +1426,12 @@ def _progress_stop(conn, dev: dict[str, Any], att: dict[str, Any],
 
 
 def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detail: Any = None) -> dict[str, Any]:
-    """输入：设备、尝试、阶段名、细节 → 输出：{continue, cancel_reason, cancel_code}。
+    """输入：浏览器行、尝试、阶段名、细节 → 输出：{continue, cancel_reason, cancel_code}。
 
     continue=false 时 cancel_code 是 CANCEL_CODES 之一（continue=true 时为 None）：尝试已结束 → ATTEMPT_FINISHED；
     未登记提交时，上游已取消 → UPSTREAM_CANCELLED、账号已归档 → ACCOUNT_ARCHIVED、已暂停 → ACCOUNT_PAUSED、
-    身份不符 → IDENTITY_MISMATCH、身份超过 identity_fresh_s 没有上报 → IDENTITY_STALE、来源在执行期间把暂停写在
+    浏览器登录的买家号不是批次账号当前登记的 ID（含未登录、读数不一致）→ IDENTITY_MISMATCH、登录状态超过
+    identity_fresh_s 没有上报 → IDENTITY_STALE、来源在执行期间把暂停写在
     任务上（order.conflict）→ SOURCE_HOLD、领取后来源有执行相关变化（外部 AMZ 订单号、人审结论、执行相关字段，见
     _source_drift）→ SOURCE_CHANGED。插件随后上报中止：UPSTREAM_CANCELLED → ABORTED_UPSTREAM_CANCELLED，
     ATTEMPT_FINISHED 不再上报，其余 → ABORTED_BY_SERVER。已登记提交的尝试一律 continue=true。
@@ -1233,28 +1454,75 @@ def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detai
     _set_attempt(conn, att, **cols)
     events.record(conn, att["workspace_id"], "attempt", att["id"], "attempt.progress", actor_kind="device",
                   actor_id=dev["id"], order_id=order["id"],
-                  detail={"stage": st, "detail": _small(detail) if detail is not None else None,
+                  detail={"stage": st, "detail": _small(_storable_json(detail)) if detail is not None else None,
                           "continue": cancel is None, "cancel_reason": cancel, "cancel_code": code})
     return {"continue": cancel is None, "cancel_reason": cancel, "cancel_code": code}
 
 
 def _evaluate_guard(conn, facts: dict[str, Any], order: dict[str, Any], acc: dict[str, Any]) -> dict[str, Any]:
-    """输入：规范化后的结算页事实、任务、账号 → 输出：按任务与账号**当前**有效值（限价、金额区间、有效配送上限、
-    期望卡尾号）与站点今天得到的护栏裁决。"""
+    """输入：规范化后的结算页事实、任务、账号 → 输出：按任务与账号**当前**有效值（登记的买家号 ID、限价、金额区间、
+    有效配送上限、期望卡尾号）与站点今天得到的护栏裁决。"""
     return guard.evaluate(
         facts, asin=orders.asin_eff(order), quantity=orders.quantity_eff(order), postal_code=order["postal_code"],
         price_cap=orders.price_cap_eff(order), amount_min=acc["min_amount"], amount_max=acc["max_amount"],
         max_delivery_days=accounts.effective_max_delivery_days(conn, order["workspace_id"], acc),
         expected_card_last4=acc["expected_card_last4"], site_today=clock.site_today(acc["site"]),
+        expected_customer_id=acc["amazon_customer_id"],
     )
 
 
-def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> dict[str, Any]:
-    """输入：设备、尝试、结算页事实 → 输出：护栏裁决（services/guard.evaluate 的结果）。
+def _buyer_blocked(conn, dev: dict[str, Any], run: dict[str, Any], att: dict[str, Any], order: dict[str, Any],
+                   verdict: dict[str, Any], *, at: str, cols: dict[str, Any] | None = None
+                   ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """输入：浏览器行、有效的批次（已锁）、未登记提交的在途尝试与它的任务（已锁）、护栏裁决（code = IDENTITY_MISMATCH）、
+    发生处（'guard' = 护栏判定，'submitting' = 提交登记前的复核）、要一并写到尝试上的列 → 输出：(尝试行, 任务行)。
 
-    事实先经 guard.sanitize_facts 规范化（只留契约 §4 的键、卡号只留后 4 位），判定与入库都用规范化后的事实。
+    护栏 buyer 项拦截的落地（两处共用，契约 §4 / §5）。结算页上要下单的不是这个批次的买家号：不是任务的问题，也不是
+    账号的问题，按**中止类**处理——
+
+    - 尝试 → aborted（error_code = IDENTITY_MISMATCH，error_detail 为裁决的原因；未登记提交，不占额度）；
+    - 任务回已分配、保留分配（上游已取消 → cancelled），随后按派生规则重新校验（_release → apply_source_drift：
+      领取后被挡住的来源变化照样落到任务上）；**不进异常、不暂停账号**；
+    - 同一事务里把批次结束（end_reason = identity_mismatch，run.ended 事件带 attempt_id / at / reason）：否则只要
+      浏览器上报的登录状态没变，同一批次会立刻再领到同一笔。
+
+    之后这个批次的领取、批次心跳、结束批次，以及这笔尝试的进度、护栏、提交登记一律 409 LEASE_LOST（_require_active）；
+    这笔尝试再上报结果：报的正是 IDENTITY_MISMATCH 的失败 → 200 duplicate，别的 → 409 CONFLICT（report_result 对已结束
+    尝试的既有规则）。都不会报 500，也不会再建第二笔尝试。
+    事件：attempt.guard_blocked {code, reasons, at}、attempt.aborted {error_code, reason, run_id}、
+    order.status_changed、run.ended。
+    """
+    ws = att["workspace_id"]
+    now = clock.now()
+    code = BUYER_BLOCK_CODE
+    zh = END_REASON_ZH[BUYER_BLOCK_END_REASON]
+    reasons = list(verdict.get("reasons") or [])
+    why = reasons[0] if reasons else zh
+    att = _set_attempt(conn, att, status="aborted", stage="guard" if at == "guard" else "submitting",
+                       error_code=code, error_detail="；".join(reasons)[:1000] or zh, finished_at=now,
+                       heartbeat_at=now, **(cols or {}))
+    order = _release(conn, order, att, f"{why}，未提交前中止，任务保留待重新领取", actor_kind="device",
+                     actor_id=dev["id"])
+    events.record(conn, ws, "attempt", att["id"], "attempt.guard_blocked", actor_kind="device", actor_id=dev["id"],
+                  order_id=order["id"], detail={"code": code, "reasons": reasons, "at": at})
+    events.record(conn, ws, "attempt", att["id"], "attempt.aborted", actor_kind="device", actor_id=dev["id"],
+                  order_id=order["id"], detail={"error_code": code, "reason": why, "run_id": att["run_id"]})
+    _bump(conn, run, "aborted")
+    end_run(conn, run, BUYER_BLOCK_END_REASON, actor_kind="device", actor_id=dev["id"], cause=zh,
+            event_detail={"attempt_id": att["id"], "at": at, "reason": why})
+    return att, order
+
+
+def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> dict[str, Any]:
+    """输入：浏览器行、尝试、结算页事实 → 输出：护栏裁决（services/guard.evaluate 的结果）。
+
+    事实先经 guard.sanitize_facts 规范化（只留契约 §4 的键、卡号只留后 4 位），判定与入库都用规范化后的事实；
+    判定之后、入库与返回之前，事实与裁决里 PostgreSQL 存不了的字符（NUL、不成对的代理项）会被去掉（判定时不去）。
     按任务与账号**当前**的有效值判定。放行 → 尝试 guard_passed；拦截 → 尝试 failed（error_code 为拦截码）、
     任务 exception（原因为拦截码的中文说明；上游已取消则 cancelled），批次可以继续下一笔。
+    例外：buyer 项拦截（拦截码 IDENTITY_MISMATCH，结算页读到的买家号 ID 不是批次账号登记的 ID）按中止类落地并
+    结束批次（见 _buyer_blocked）：尝试 aborted、任务回已分配、不进异常、不暂停账号、批次 end_reason =
+    identity_mismatch；返回的裁决照旧是 {verdict: block, code: IDENTITY_MISMATCH, …}，插件据此停下、不再上报结果。
     已登记提交或已结束的尝试 → CONFLICT。
     """
     dev = devices.require_active(conn, device)
@@ -1271,6 +1539,9 @@ def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> d
         raise not_found("买家账号")
     guard_input = guard.sanitize_facts(facts)
     verdict = _evaluate_guard(conn, guard_input, order, acc)
+    # 判定用的是原样的事实：带坏字符的值不会先被「修好」再去比对（去掉字符可能把不相等的变成相等，买家号 ID、ASIN、
+    # 币种都是整段比对的）。入库、写事件、返回给插件之前才去掉 PostgreSQL 存不了的字符。
+    guard_input, verdict = _storable_json(guard_input), _storable_json(verdict)
     now = clock.now()
     if verdict["verdict"] == "pass":
         _set_attempt(conn, att, status="guard_passed", stage="guard_passed", guard_input=guard_input,
@@ -1280,6 +1551,11 @@ def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> d
                                                     "delivery_days": verdict["delivery_days"]})
         return verdict
     code = verdict["code"]
+    if code == BUYER_BLOCK_CODE:
+        _buyer_blocked(conn, dev, run, att, order, verdict, at="guard",
+                       cols={"guard_input": guard_input, "guard_verdict": verdict,
+                             "delivery_days": verdict["delivery_days"]})
+        return verdict
     zh = ERROR_CODES[code].zh if code in ERROR_CODES else "护栏拦截"
     reason = f"{zh}：{verdict['reasons'][0]}" if verdict["reasons"] else zh
     att = _set_attempt(conn, att, status="failed", stage="guard", guard_input=guard_input, guard_verdict=verdict,
@@ -1293,16 +1569,26 @@ def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> d
 
 
 def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, Any]:
-    """输入：设备、尝试 → 输出：{ok: true, submitted_at}。返回 200 后插件才允许点击下单；登记即写 submitted_at
+    """输入：浏览器行、尝试 → 输出：{ok: true, submitted_at}。返回 200 后插件才允许点击下单；登记即写 submitted_at
     （此后视为可能已下单）。
 
+    先锁浏览器行（FOR UPDATE），再做身份检查与登记，和并发的身份上报串行：要么登记看到新身份而拒绝，要么身份上报
+    排在登记之后、由下一次进度或结果处理。
+
     拒绝（409，不改任何状态）：护栏未放行 / 尝试不在 guard_passed、批次失效（LEASE_LOST）、任务已取消或状态
-    已变、账号已归档或暂停（ACCOUNT_PAUSED）、身份不符或超过 identity_fresh_s 没有上报（IDENTITY_MISMATCH，
-    detail.stale）、领取后来源有执行相关变化（SOURCE_CHANGED）、按最新配置（任务的有效限价、账号金额区间、
-    有效配送上限、期望卡尾号、站点今天）对存下的结算事实复核护栏不再放行（GUARD_BLOCKED，detail 带
-    block_code / reasons）。
+    已变、账号已归档或暂停（ACCOUNT_PAUSED）、这个浏览器最新的登录状态不是「登录着批次账号当前登记的买家号」
+    或超过 identity_fresh_s 没有上报（IDENTITY_MISMATCH，detail.login_state / stale）、领取后来源有执行相关变化
+    （SOURCE_CHANGED）、按最新配置（账号登记的买家号 ID、任务的有效限价、账号金额区间、有效配送上限、期望卡尾号、
+    站点今天）对存下的结算事实复核护栏不再放行（GUARD_BLOCKED，detail 带 block_code / reasons）。
+
+    唯一会改状态的拒绝：复核的拦截码是 IDENTITY_MISMATCH（存下的结算页买家号 ID 已不是批次账号当前登记的 ID）。
+    这时**不抛异常**，按 _buyer_blocked 落地（尝试 aborted、任务回已分配、不暂停账号、批次结束 end_reason =
+    identity_mismatch；复核的裁决存进尝试的 guard_verdict），返回
+    {ok: false, blocked: true, code: 'GUARD_BLOCKED', message, detail: {block_code, reasons, attempt_status: 'aborted',
+    order_status, run_ended: true, end_reason: 'identity_mismatch'}}；调用方照常提交事务，插件路由据此回 409
+    GUARD_BLOCKED（与迟到回执同一个办法：抛异常会把落地一起回滚）。
     """
-    dev = devices.require_active(conn, device)
+    dev = devices.require_active(conn, device, lock=True)
     att, run, order = _attempt_for(conn, dev, attempt_id)
     _require_active(run)
     verdict = att["guard_verdict"] if isinstance(att["guard_verdict"], dict) else {}
@@ -1325,10 +1611,11 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
         raise conflict(f"账号已暂停执行（{acc['pause_reason'] or '人工暂停'}），不能提交", code="ACCOUNT_PAUSED")
     problem = _identity_problem(dev, acc)
     if problem is not None:
-        raise conflict(f"{problem[1]}，不能提交", code="IDENTITY_MISMATCH", identity_status=problem[0])
+        raise conflict(f"{problem[1]}，不能提交", code="IDENTITY_MISMATCH", login_state=problem[0], stale=False,
+                       identity_at=_iso(dev["identity_at"]))
     stale = _identity_stale(dev)
     if stale is not None:
-        raise conflict(f"{stale}，不能提交", code="IDENTITY_MISMATCH", identity_status="match", stale=True,
+        raise conflict(f"{stale}，不能提交", code="IDENTITY_MISMATCH", login_state="signed_in", stale=True,
                        identity_at=_iso(dev["identity_at"]))
     hold = _hold_reason(order)
     if hold is not None:
@@ -1341,8 +1628,15 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
     if recheck["verdict"] != "pass":
         why = recheck["reasons"][0] if recheck["reasons"] else (
             ERROR_CODES[recheck["code"]].zh if recheck["code"] in ERROR_CODES else "护栏拦截")
-        raise conflict(f"按最新配置复核护栏未通过：{why}，不能提交", code="GUARD_BLOCKED",
-                       block_code=recheck["code"], reasons=recheck["reasons"])
+        message = f"按最新配置复核护栏未通过：{why}，不能提交"
+        if recheck["code"] == BUYER_BLOCK_CODE:
+            att, order = _buyer_blocked(conn, dev, run, att, order, recheck, at="submitting",
+                                        cols={"guard_verdict": recheck})
+            return {"ok": False, "blocked": True, "code": "GUARD_BLOCKED", "message": message,
+                    "detail": {"block_code": recheck["code"], "reasons": recheck["reasons"],
+                               "attempt_status": att["status"], "order_status": order["status"],
+                               "run_ended": True, "end_reason": BUYER_BLOCK_END_REASON}}
+        raise conflict(message, code="GUARD_BLOCKED", block_code=recheck["code"], reasons=recheck["reasons"])
     now = clock.now()
     _set_attempt(conn, att, status="submitting", submitted_at=now, stage="submitting", heartbeat_at=now)
     events.record(conn, att["workspace_id"], "attempt", att["id"], "attempt.submitting", actor_kind="device",
@@ -1351,7 +1645,7 @@ def mark_submitting(conn, device: dict[str, Any], attempt_id: Any) -> dict[str, 
 
 
 def mark_verifying(conn, device: dict[str, Any], attempt_id: Any, note: Any = None) -> dict[str, Any]:
-    """输入：设备、尝试、说明 → 输出：{ok: true, attempt_status: 'verifying'}（银行人工验证；任务与名额保留）。
+    """输入：浏览器行、尝试、说明 → 输出：{ok: true, attempt_status: 'verifying'}（银行人工验证；任务与名额保留）。
 
     只限已登记提交的尝试（submitting / verifying），否则 CONFLICT。
     """
@@ -1620,7 +1914,7 @@ def _hold_for_late_success(conn, order: dict[str, Any], att: dict[str, Any], no:
 
 
 def report_result(conn, device: dict[str, Any], attempt_id: Any, payload: Any) -> dict[str, Any]:
-    """输入：设备、尝试、结果 {outcome, amazon_order_no, amounts, card_last4, delivery, error_code, error_detail}
+    """输入：浏览器行、尝试、结果 {outcome, amazon_order_no, amounts, card_last4, delivery, error_code, error_detail}
     → 输出：{attempt_status, order_status}（重复上报时另有 duplicate: true）。
 
     处理表（契约 §5）：
@@ -1745,17 +2039,18 @@ def _plugin_detail(v: Any) -> str | None:
     文本再截；空 → None。"""
     if v is None:
         return None
+    v = _storable_json(v)
     if not isinstance(v, str):
         try:
             v = json.dumps(_jsonable(v), ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError):
-            v = str(v)
+            v = devices.storable_text(str(v))
     return v.strip()[:_PLUGIN_DETAIL_MAX] or None
 
 
 def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finished",
                detail: Any = None) -> dict[str, Any]:
-    """输入：设备、批次、结束原因（插件给的短码，缺省 finished）、说明（可选，任意 JSON）→ 输出：
+    """输入：浏览器行、批次、结束原因（插件给的短码，缺省 finished）、说明（可选，任意 JSON）→ 输出：
     {run_id, ended_at, end_reason, stats}；end_reason 恒为 finished，插件的短码记进 run.ended 事件的 plugin_reason。
 
     说明记进 run.ended 事件的 plugin_detail（字符串去掉首尾空白后截到 200 字；非字符串先转成 JSON 文本再截）。
@@ -1765,7 +2060,7 @@ def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finishe
     dev = devices.require_active(conn, device)
     run = _run_for(conn, dev, run_id)
     _require_active(run)
-    # end_reason 是封闭取值（finished / lease_expired / device_revoked / simulation_reset）；插件给的短码
+    # end_reason 是封闭取值（finished / lease_expired / simulation_reset / identity_mismatch）；插件给的短码
     # 记在 run.ended 事件的 plugin_reason 里
     end_run(conn, run, "finished", actor_kind="device", actor_id=dev["id"], cause="插件结束了执行批次",
             event_detail={"plugin_reason": _text(reason, 64) or "finished", "plugin_detail": _plugin_detail(detail)})
@@ -1776,14 +2071,18 @@ def finish_run(conn, device: dict[str, Any], run_id: Any, reason: Any = "finishe
 
 
 def sweep(conn, now: datetime | None = None) -> dict[str, Any]:
-    """输入：连接、可选「现在」→ 输出：{expired_runs, revoked_runs, orphan_attempts, aborted, unknown}（id 列表与计数）。
+    """输入：连接、可选「现在」→ 输出：{expired_runs, orphan_attempts, removed_devices, aborted, unknown}
+    （id 列表与计数）。
 
-    跨全部工作区（后台任务）：租约已过期的批次 → 结束（lease_expired）；设备已撤销的批次 → 结束
-    （device_revoked）；它们的在途尝试按 _settle_inflight 处理。另把「所属批次已结束」的在途尝试一并收尾。
-    被别的事务锁住的批次跳过（SKIP LOCKED），下一轮再处理。
+    跨全部工作区（后台任务）：租约已过期的批次 → 结束（lease_expired），它们的在途尝试按 _settle_inflight 处理；
+    另把「所属批次已结束」的在途尝试一并收尾。被别的事务锁住的批次跳过（SKIP LOCKED），下一轮再处理。
+    最后清理浏览器行：最近联系时间早于 settings.device_retention_days 天、且没有任何批次 / 尝试引用的行直接删除
+    （自动登记会不断留下换了令牌的旧行；有批次或尝试的行要留着给历史记录显示名称——它们过了保留期同样不再占
+    登记名额，见 devices.register）。
     """
     t = now or clock.now()
-    out: dict[str, Any] = {"expired_runs": [], "revoked_runs": [], "orphan_attempts": [], "aborted": 0, "unknown": 0}
+    out: dict[str, Any] = {"expired_runs": [], "orphan_attempts": [], "removed_devices": [], "aborted": 0,
+                           "unknown": 0}
     expired = conn.execute(
         "SELECT * FROM procure.execution_runs WHERE ended_at IS NULL AND lease_expires_at <= %s "
         "ORDER BY id FOR UPDATE SKIP LOCKED",
@@ -1792,19 +2091,6 @@ def sweep(conn, now: datetime | None = None) -> dict[str, Any]:
     for run in expired:
         res = end_run(conn, run, "lease_expired")
         out["expired_runs"].append(run["id"])
-        out["aborted"] += res["aborted"]
-        out["unknown"] += res["unknown"]
-    revoked = conn.execute(
-        """
-        SELECT r.* FROM procure.execution_runs r
-        JOIN procure.devices d ON d.id = r.device_id AND d.workspace_id = r.workspace_id
-        WHERE r.ended_at IS NULL AND d.revoked_at IS NOT NULL
-        ORDER BY r.id FOR UPDATE OF r SKIP LOCKED
-        """
-    ).fetchall()
-    for run in revoked:
-        res = end_run(conn, run, "device_revoked")
-        out["revoked_runs"].append(run["id"])
         out["aborted"] += res["aborted"]
         out["unknown"] += res["unknown"]
     orphans = conn.execute(
@@ -1825,4 +2111,29 @@ def sweep(conn, now: datetime | None = None) -> dict[str, Any]:
         st = _settle_inflight(conn, None, att, order, "所属执行批次已结束", actor_kind="system", actor_id=None)
         out["orphan_attempts"].append(att["id"])
         out[st] += 1
+    out["removed_devices"] = _purge_idle_devices(conn, t)
     return out
+
+
+def _purge_idle_devices(conn, now: datetime) -> list[int]:
+    """输入：连接、现在 → 输出：被删除的浏览器行 id（升序）。
+
+    条件：最近联系时间（从未联系过的按登记时间）早于 device_retention_days 天，且没有任何执行批次、采购尝试引用它。
+    截止时刻取 devices.retention_cutoff——登记上限用的是同一个：过了它的行不再占名额，这里再把其中没有历史的删掉。
+    正被别的事务锁着的行（正在登记、心跳、开始批次）跳过。
+    """
+    cutoff = devices.retention_cutoff(now)
+    rows = conn.execute(
+        """
+        WITH idle AS (
+            SELECT d.id FROM procure.devices d
+            WHERE COALESCE(d.last_seen_at, d.created_at) < %s
+              AND NOT EXISTS (SELECT 1 FROM procure.execution_runs r WHERE r.device_id = d.id)
+              AND NOT EXISTS (SELECT 1 FROM procure.purchase_attempts a WHERE a.device_id = d.id)
+            ORDER BY d.id FOR UPDATE OF d SKIP LOCKED
+        )
+        DELETE FROM procure.devices d USING idle WHERE d.id = idle.id RETURNING d.id
+        """,
+        (cutoff,),
+    ).fetchall()
+    return sorted(r["id"] for r in rows)

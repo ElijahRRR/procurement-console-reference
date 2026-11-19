@@ -38,8 +38,9 @@ def list_for(conn, workspace_id: int, *, entity: str | None = None, entity_id: i
              order_id: int | None = None, limit: int = 200, offset: int = 0) -> dict[str, Any]:
     """输入：工作区、过滤条件（对象种类、对象 id、任务 id）、条数、偏移 → 输出：{total, rows}（新的在前）。
 
-    行 = events 的列 + actor_name：操作者是控制台用户时为显示名（没有则用户名），是设备时为设备名，其余为 None。
-    只查本工作区；设备名也按本工作区连接（别的工作区的设备不会泄露名字）。
+    行 = events 的列 + actor_name：操作者是控制台用户时为显示名（没有则用户名），是浏览器（actor_kind = device）
+    时为浏览器名称，其余为 None。只查本工作区；浏览器名称也按本工作区连接（别的工作区的浏览器不会泄露名字；
+    已被清扫删除的浏览器行没有名称）。
     """
     where = ["e.workspace_id = %s"]
     params: list[Any] = [workspace_id]

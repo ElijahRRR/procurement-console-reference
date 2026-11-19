@@ -19,6 +19,7 @@ import { displayValue, failureText, formatNumber } from '@/utils/format'
 import { FEISHU_VERDICT_LABEL, SYNC_STAT_LABEL, VERDICT_TAG, labelOf, tagOf } from '@/utils/labels'
 import { ADMISSION_FIELDS, FEISHU_ADMISSION_DEFAULTS, defaultsHint, fullAdmission } from '@/utils/admission'
 import { fillSuggested, missingRequired as missingRequiredOf, toEditableMap, toFieldMap } from '@/utils/feishuMap'
+import { DESIGNATION_MAPPING_HELP } from '@/utils/designation'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
 
 const props = defineProps<{ connection: FeishuConnection | null }>()
@@ -291,6 +292,7 @@ const previewRows = computed(() =>
         <h4 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">来源字段</h4>
         <p class="mb-3 text-xs text-gray-500 dark:text-dark-400">
           左侧是系统字段，右侧选择飞书表里对应的列。只读取用到的列。带 * 的必须对应。可以按顺序选多列：前一列为空时读下一列（如 ASIN 缺失时用「来源码」）。
+          <span class="mt-1 block" data-testid="designation-help">{{ DESIGNATION_MAPPING_HELP }}</span>
         </p>
         <el-table :data="systemFields?.source_fields ?? []" size="small" max-height="300" class="eq-table-card">
           <el-table-column label="系统字段" min-width="160">

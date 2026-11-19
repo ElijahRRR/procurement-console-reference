@@ -41,7 +41,8 @@ def test_ab_example_a_gets_25_b_gets_45(conn, workspace):
     s = allocation.allocate(conn, ws, trigger="manual")
     assert _assigned(conn, ws, o25["id"]) == (a["id"], allocation.NOTE_COVERAGE)
     assert _assigned(conn, ws, o45["id"]) == (b["id"], allocation.NOTE_COVERAGE)
-    assert s["stats"] == {"considered": 2, "assigned": 2, "coverage": 2, "fill": 0, "unassigned": 0}
+    assert s["stats"] == {"considered": 2, "assigned": 2, "coverage": 2, "fill": 0, "designated": 0,
+                          "unassigned": 0}
     assert s["uncovered"] == []
 
 

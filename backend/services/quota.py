@@ -8,7 +8,8 @@
   ``kind='external'`` 尝试不是本系统下单，不计额度。
 - ``planned(A, D)``：已分配给 A、状态为 assigned、没有在途尝试、计划日期等于 D 的任务数。
   计划日期 ``plan = max(建议采购日期, 今天)``：过期未采的任务算在今天，未来任务算在它自己的日期。
-- ``fixed(A, D)``：planned 中 ``assignment_kind='manual'`` 的部分（分配算法里不可重算、但占用容量）。
+- ``fixed(A, D)``：planned 中 ``assignment_kind='manual'`` 的部分（分配算法里不可重算、但占用容量）。来源指定
+  （``'source'``）与自动分配（``'auto'``）的任务每次分配都重算，不算 fixed；planned / summary 照常把它们算进去。
 - ``attempted(A, D)``：D 日 A 的采购尝试数，不论结局（只排除外部单号与「清除模拟结果」中止的）：分配的「已覆盖」。
 - ``summary(A, today)``：``{limit, used, planned, available}``，
   ``available = max(0, limit − used(A, today) − planned(A, today))``，即今天还能再分给 A 的单数。

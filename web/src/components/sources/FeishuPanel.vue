@@ -2,6 +2,9 @@
 /**
  * 飞书连接：未配置应用时说明如何配置；已配置时列出连接（立即同步、编辑、停用 / 启用、写回验收、读取记录）。
  * 写回未验收时显示「回填待验证」，队列只积压不发送。
+ * 最近一次成功读取有说整个连接的问题（last_stats.problems，如来源表里找不到买家号列）时，卡片上显示一条提醒，
+ * 状态点仍是「读取正常」；读取记录对话框按读取逐条列出（列表而不是表格，手机宽度下也完整可见），每次读取的统计下面
+ * 列出它的问题（连接级的作为提醒行，记录级的与立即同步的提示同一格式，超过 5 条可展开）。
  */
 import { onMounted, ref } from 'vue'
 import type { FeishuConnection, SyncRun } from '@/api/types'
@@ -12,7 +15,7 @@ import StatusDot from '@/components/StatusDot.vue'
 import FeishuWizard from './FeishuWizard.vue'
 import { formatDateTime, formatNumber, formatRelative } from '@/utils/format'
 import { SYNC_TRIGGER_LABEL, WRITEBACK_STATE_LABEL, WRITEBACK_STATE_TAG, labelOf, tagOf } from '@/utils/labels'
-import { statsText, syncSummary, verifySummary } from '@/utils/results'
+import { SYNC_PROBLEM_SHOWN, problemLines, statsText, syncSummary, unsampledProblems, verifySummary } from '@/utils/results'
 import { confirmAction, notifyFailure, notifySuccess, notifySummary, promptText } from '@/utils/feedback'
 
 const emit = defineEmits<{ changed: [] }>()
@@ -30,6 +33,26 @@ const runs = ref<SyncRun[]>([])
 const runsLoading = ref(false)
 /** 写回验收后没能恢复原值的测试记录（连接 id → 提醒）：记录里还留着测试值，提醒一直显示到手动关掉 */
 const restoreProblems = ref<Record<number, string>>({})
+/** 读取记录对话框里展开了全部问题记录的读取（读取记录 id） */
+const expandedRuns = ref<Set<number>>(new Set())
+
+/** 输入：连接 → 输出：最近一次成功读取里说整个连接的问题（如来源表里找不到买家号列）；没有为空列表 */
+const connectionProblems = (c: FeishuConnection) => problemLines(c.last_stats?.problems).whole
+
+/** 输入：读取记录 → 输出：这次读取的问题：连接级的原因、要显示的记录级行（没展开时只列前几条）、没显示的条数、没有保留样本的条数 */
+function runProblems(row: SyncRun) {
+  const { whole, records } = problemLines(row.stats?.problems)
+  const expanded = expandedRuns.value.has(row.id)
+  const shown = expanded ? records : records.slice(0, SYNC_PROBLEM_SHOWN)
+  return { whole, shown, hidden: records.length - shown.length, expanded, canCollapse: expanded && records.length > SYNC_PROBLEM_SHOWN, unsampled: unsampledProblems(row.stats) }
+}
+
+function toggleRun(id: number) {
+  const next = new Set(expandedRuns.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedRuns.value = next
+}
 
 async function load() {
   loading.value = true
@@ -129,6 +152,7 @@ async function verify(c: FeishuConnection) {
 
 async function openRuns(c: FeishuConnection) {
   runsFor.value = c
+  expandedRuns.value = new Set()
   runsOpen.value = true
   runsLoading.value = true
   try {
@@ -219,6 +243,16 @@ function onSaved() {
               <dd>{{ c.writeback_verified_at ? `${formatDateTime(c.writeback_verified_at)} 通过` : '回填待验证：写回只积压不发送' }}</dd>
             </template>
           </dl>
+          <el-alert
+            v-for="(w, i) in connectionProblems(c)"
+            :key="`whole-${i}`"
+            :title="w"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="mt-3"
+            data-testid="connection-problem"
+          />
           <el-alert v-if="c.last_error" :title="c.last_error" type="error" :closable="false" show-icon class="mt-3" />
           <el-alert v-if="restoreProblems[c.id]" :title="restoreProblems[c.id]" type="error" show-icon :closable="false" class="mt-3">
             <template #default>
@@ -252,29 +286,44 @@ function onSaved() {
     <FeishuWizard v-model="wizardOpen" :connection="editing" @saved="onSaved" />
 
     <el-dialog v-model="runsOpen" :title="`读取记录 · ${runsFor?.name ?? ''}`" width="760px" append-to-body>
-      <el-table v-loading="runsLoading" :data="runs" size="small" max-height="440" class="eq-table-card">
-        <el-table-column label="开始" width="150">
-          <template #default="{ row }">{{ formatDateTime(row.started_at) }}</template>
-        </el-table-column>
-        <el-table-column label="方式" width="90">
-          <template #default="{ row }">{{ labelOf(SYNC_TRIGGER_LABEL, row.trigger) }}</template>
-        </el-table-column>
-        <el-table-column label="结果" width="90">
-          <template #default="{ row }">
-            <StatusDot
-              :color="row.ok === true ? 'green' : row.ok === false ? 'red' : 'blue'"
-              :label="row.ok === true ? '成功' : row.ok === false ? '失败' : '进行中'"
-            />
-          </template>
-        </el-table-column>
-        <el-table-column label="统计 / 错误" min-width="280">
-          <template #default="{ row }">
-            <span v-if="row.error" class="text-red-600 dark:text-red-400">{{ row.error }}</span>
-            <span v-else class="text-gray-700 dark:text-gray-300">{{ statsText(row.stats) || '—' }}</span>
-          </template>
-        </el-table-column>
-        <template #empty><span class="text-sm text-gray-500 dark:text-dark-400">还没有读取记录</span></template>
-      </el-table>
+      <!-- 列表而不是表格：每次读取的问题行要在手机宽度下也完整可见（表格在窄屏只能在框里横向滚动） -->
+      <div v-loading="runsLoading" class="min-h-[5rem]">
+        <ul
+          v-if="runs.length"
+          class="max-h-[60vh] divide-y divide-gray-100 overflow-y-auto rounded-xl border border-gray-100 dark:divide-dark-700 dark:border-dark-700"
+          data-testid="sync-runs"
+        >
+          <li v-for="row in runs" :key="row.id" class="px-4 py-3">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span class="whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">{{ formatDateTime(row.started_at) }}</span>
+              <span class="whitespace-nowrap text-xs text-gray-500 dark:text-dark-400">{{ labelOf(SYNC_TRIGGER_LABEL, row.trigger) }}</span>
+              <StatusDot
+                :color="row.ok === true ? 'green' : row.ok === false ? 'red' : 'blue'"
+                :label="row.ok === true ? '成功' : row.ok === false ? '失败' : '进行中'"
+              />
+            </div>
+            <p v-if="row.error" class="mt-1 break-all text-sm text-red-600 dark:text-red-400">{{ row.error }}</p>
+            <template v-else>
+              <p class="mt-1 text-sm text-gray-700 dark:text-gray-300">{{ statsText(row.stats) || '—' }}</p>
+              <div v-for="v in [runProblems(row)]" :key="row.id" data-testid="run-problems">
+                <p v-for="(w, i) in v.whole" :key="`whole-${i}`" class="mt-1.5 flex items-start gap-1 text-xs leading-5 text-amber-700 dark:text-amber-400">
+                  <AppIcon name="exclamationTriangle" size="sm" class="mt-0.5" />
+                  <span class="min-w-0">{{ w }}</span>
+                </p>
+                <ul v-if="v.shown.length" class="mt-1.5 space-y-0.5 text-xs leading-5 text-gray-500 dark:text-dark-400">
+                  <li v-for="(line, i) in v.shown" :key="`rec-${i}`" class="break-all">{{ line }}</li>
+                </ul>
+                <el-button v-if="v.hidden > 0" text type="primary" size="small" class="!px-0" @click="toggleRun(row.id)">展开其余 {{ formatNumber(v.hidden) }} 条</el-button>
+                <el-button v-else-if="v.canCollapse" text type="primary" size="small" class="!px-0" @click="toggleRun(row.id)">收起</el-button>
+                <p v-if="v.unsampled > 0" class="mt-0.5 text-xs leading-5 text-gray-500 dark:text-dark-400">
+                  {{ v.shown.length ? '另有 ' : '' }}{{ formatNumber(v.unsampled) }} 条有问题的记录没有保留明细
+                </p>
+              </div>
+            </template>
+          </li>
+        </ul>
+        <p v-else-if="!runsLoading" class="py-6 text-center text-sm text-gray-500 dark:text-dark-400">还没有读取记录</p>
+      </div>
       <template #footer><el-button @click="runsOpen = false">关闭</el-button></template>
     </el-dialog>
   </div>

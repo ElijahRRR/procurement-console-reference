@@ -8,24 +8,28 @@
  *        network       fetch 抛错（断网、拒绝连接、超时）—— 状态未知；
  *        http          服务端明确回了非 2xx（带 `{code, message, detail}`）—— 状态已定；
  *        bad_response  回了，但不是约定的形状 —— 当作没听懂，不当成功。
- *   4. **重试只针对「没说上话」，而且只对可以重复的请求。** 配对码一次性、开始批次会占执行权、
- *      领取会建尝试、**提交登记绝不自动重试**（登记即「可能已下单」）。
+ *   4. **重试只针对「没说上话」，而且只对可以重复的请求。** 开始批次会占执行权、
+ *      领取会建尝试、**提交登记绝不自动重试**（登记即「可能已下单」）。设备登记本身幂等，
+ *      但什么时候再试由后台按退避决定（core/register.ts），这里不重试。
  *      服务端明确拒绝（4xx）就是拒绝，再问一遍答案一样，也不重试；
  *      5xx 表示服务端这次事务已回滚，只有跑单必需、可以重复的几个接口（RETRY_ON_5XX）再试。
  */
 
 import type {
+  AccountConfig,
   Attempt,
-  Browser,
   BusyHolder,
   CheckoutFacts,
+  DeviceBusy,
   GuardOut,
   HeartbeatOut,
   Identity,
-  IdentityStatus,
+  IdentityRejection,
+  LoginInfo,
+  LoginStateName,
   NextOut,
-  PairOut,
   ProgressOut,
+  RegisterOut,
   ResultIn,
   RunHeartbeatOut,
   RunStartOut,
@@ -67,7 +71,8 @@ export interface ClientOptions {
 /** 开始批次、领取、提交登记等「跑单那一组」接口。引擎只依赖这一组，
  *  内容脚本里的实现经由后台转发（content/remote-api.ts），测试里直接用 PluginClient。 */
 export interface RunApi {
-  startRun(trigger: Trigger): Promise<ApiResult<RunStartOut>>;
+  /** customerId：当前页面读到的买家号 ID（服务端按它找账号）；slot：定时触发的时间点 `HH:MM`（手动为 null）。 */
+  startRun(trigger: Trigger, customerId: string, slot?: string | null): Promise<ApiResult<RunStartOut>>;
   runHeartbeat(runId: number): Promise<ApiResult<RunHeartbeatOut>>;
   next(runId: number): Promise<ApiResult<NextOut>>;
   progress(attemptId: number, stage: string, detail: Record<string, unknown>): Promise<ApiResult<ProgressOut>>;
@@ -82,10 +87,10 @@ export interface RunApi {
 
 /** 每个接口能不能在 network 失败后自动重试。**这张表就是重试策略的全部。** */
 export const RETRY_POLICY = {
-  pair: false, // 配对码一次性
+  register: false, // 幂等，但再试的节奏由后台按 5 / 15 / 60 秒退避决定，不在这里连发
   heartbeat: true,
   identity: true,
-  startRun: false, // 会占执行权；丢了响应再发一次只会拿到 409 ACCOUNT_BUSY
+  startRun: false, // 会占执行权；丢了响应再发一次只会拿到 409 DEVICE_BUSY
   runHeartbeat: true,
   next: false, // 会建尝试；丢了响应再发一次只会拿到 409 ATTEMPT_IN_FLIGHT
   progress: true,
@@ -153,80 +158,112 @@ export function parseBusyHolder(detail: unknown): BusyHolder {
   };
 }
 
-const IDENTITY_STATUSES: ReadonlySet<string> = new Set(["match", "mismatch", "signed_out", "unknown"]);
-
-/** 输入：任意值 → 输出：合法的身份状态（认不出按 unknown，不往好的方向猜）。 */
-export function parseIdentityStatus(v: unknown): IdentityStatus {
-  return IDENTITY_STATUSES.has(String(v)) ? (v as IdentityStatus) : "unknown";
+/** 输入：任意值 → 输出：`DEVICE_BUSY` 的 detail（这个浏览器自己还没结束的批次）；形状不对时各字段为 null。 */
+export function parseDeviceBusy(detail: unknown): DeviceBusy {
+  const d = isObj(detail) ? detail : {};
+  return { run_id: int(d.run_id), account_name: str(d.account_name), since: str(d.since), lease_expires_at: str(d.lease_expires_at) };
 }
 
-function parsePair(body: unknown): PairOut | null {
+/** 输入：任意值 → 输出：开始批次被 `IDENTITY_MISMATCH` 拒绝时的 detail；形状不对时 login_state 为 null、stale 为 false。 */
+export function parseIdentityRejection(detail: unknown): IdentityRejection {
+  const d = isObj(detail) ? detail : {};
+  return { login_state: str(d.login_state), identity_at: str(d.identity_at), stale: d.stale === true };
+}
+
+const LOGIN_STATES: ReadonlySet<string> = new Set(["unknown", "signed_out", "no_id", "conflict", "unregistered", "ignored", "ready"]);
+
+/** 输入：任意值 → 输出：合法的登录状态（认不出按 unknown，不往好的方向猜）。 */
+export function parseLoginState(v: unknown): LoginStateName {
+  return typeof v === "string" && LOGIN_STATES.has(v) ? (v as LoginStateName) : "unknown";
+}
+
+function parseLogin(v: Record<string, unknown>): LoginInfo {
+  return { state: parseLoginState(v.state), customer_id: str(v.customer_id), at: str(v.at), stale: v.stale === true };
+}
+
+/** `POST /register` 的返回 `{device_id, device_name, workspace_id, workspace_name, created}`。没有 device_id 不认。 */
+function parseRegister(body: unknown): RegisterOut | null {
   if (!isObj(body)) return null;
-  const token = str(body.device_token);
   const id = int(body.device_id) ?? str(body.device_id);
-  if (!token || id === null) return null;
-  return { device_id: id, device_token: token, workspace_name: str(body.workspace_name) };
+  if (id === null || id === "") return null;
+  return {
+    device_id: id,
+    device_name: str(body.device_name),
+    workspace_id: int(body.workspace_id),
+    workspace_name: str(body.workspace_name),
+    created: body.created === true,
+  };
 }
 
-function parseAccount(v: unknown): HeartbeatOut["account"] {
+function parseAccount(v: unknown): AccountConfig | null {
   if (!isObj(v)) return null;
   const id = int(v.id);
   if (id === null) return null;
   const q = isObj(v.quota_today) ? v.quota_today : null;
+  const ar = isObj(v.active_run) ? v.active_run : null;
+  const arId = ar ? int(ar.id) : null;
   return {
     id,
     name: str(v.name) ?? `#${id}`,
     amazon_customer_id: str(v.amazon_customer_id),
-    purchase_mode: str(v.purchase_mode),
-    schedule_times: Array.isArray(v.schedule_times) ? v.schedule_times.filter((t): t is string => typeof t === "string") : [],
-    effective_max_delivery_days: int(v.effective_max_delivery_days),
     purchase_enabled: bool(v.purchase_enabled),
     execution_paused: bool(v.execution_paused),
     pause_reason: str(v.pause_reason),
-    min_amount: strOrNum(v.min_amount),
-    max_amount: strOrNum(v.max_amount),
-    daily_limit: int(v.daily_limit),
-    expected_card_last4: str(v.expected_card_last4),
+    purchase_mode: str(v.purchase_mode),
+    schedule_times: Array.isArray(v.schedule_times) ? v.schedule_times.filter((t): t is string => typeof t === "string") : [],
+    effective_max_delivery_days: int(v.effective_max_delivery_days),
     quota_today: q
       ? { limit: int(q.limit), used: int(q.used), planned: int(q.planned), available: int(q.available) }
       : null,
-  };
-}
-
-function parseHeartbeat(body: unknown): HeartbeatOut | null {
-  if (!isObj(body) || !isObj(body.device)) return null;
-  const dev = body.device;
-  const devId = int(dev.id) ?? str(dev.id);
-  if (devId === null) return null;
-  const ar = isObj(body.active_run) ? body.active_run : null;
-  const arId = ar ? int(ar.id) : null;
-  return {
-    device: { id: devId, name: str(dev.name), bound_account_id: int(dev.bound_account_id) },
-    account: parseAccount(body.account),
-    identity_status: parseIdentityStatus(body.identity_status),
-    server_time: str(body.server_time),
-    bj_date: str(body.bj_date),
-    // 只认真正的 true/false；缺失按 true（本阶段服务端只允许模拟，往安全的一侧取）。
-    simulation_only: bool(body.simulation_only) ?? true,
+    // 没给就是没读到（null），不是 0：面板上写「—」，不写「今天可执行 0 笔」。
+    executable_today: int(v.executable_today),
+    future_assigned: int(v.future_assigned),
     active_run:
       ar && arId !== null
-        ? { id: arId, device_id: int(ar.device_id), device_name: str(ar.device_name), is_mine: ar.is_mine === true }
+        ? { id: arId, device_id: int(ar.device_id), device_name: str(ar.device_name), started_at: str(ar.started_at), is_mine: ar.is_mine === true }
         : null,
   };
 }
 
-/** `POST /runs` 的返回：服务端给 `{run_id, lease_ttl_s, lease_expires_at}`；早期的 `{id}`、`{run: {id}}` 也认。 */
+/** 心跳与身份上报的返回（同一形状）。没有 device.id 或没有 login 不认：
+ *  旧版服务端的形状（identity_status、device.bound_account_id）在这里按「响应不是约定的形状」失败，
+ *  不把它读成「登录状态未知」。 */
+function parseHeartbeat(body: unknown): HeartbeatOut | null {
+  if (!isObj(body) || !isObj(body.device) || !isObj(body.login)) return null;
+  const dev = body.device;
+  const devId = int(dev.id) ?? str(dev.id);
+  if (devId === null) return null;
+  const dr = isObj(body.device_run) ? body.device_run : null;
+  const drId = dr ? int(dr.id) : null;
+  return {
+    device: { id: devId, name: str(dev.name) },
+    login: parseLogin(body.login),
+    account: parseAccount(body.account),
+    device_run:
+      dr && drId !== null ? { id: drId, account_id: int(dr.account_id), account_name: str(dr.account_name), started_at: str(dr.started_at) } : null,
+    server_time: str(body.server_time),
+    bj_date: str(body.bj_date),
+    // 只认真正的 true/false；缺失按 true（本阶段服务端只允许模拟，往安全的一侧取）。
+    simulation_only: bool(body.simulation_only) ?? true,
+  };
+}
+
+/** `POST /runs` 的返回：服务端给 `{run_id, lease_ttl_s, lease_expires_at, account: {id, name}}`；
+ *  早期的 `{id}`、`{run: {id}}` 也认。 */
 function parseRunStart(body: unknown): RunStartOut | null {
   if (!isObj(body)) return null;
   const run = isObj(body.run) ? body.run : null;
   const id = int(body.run_id) ?? int(body.id) ?? (run ? int(run.id) : null);
   if (id === null) return null;
   const ttl = int(body.lease_ttl_s) ?? (run ? int(run.lease_ttl_s) : null);
+  const acc = isObj(body.account) ? body.account : null;
+  const accId = acc ? int(acc.id) : null;
   return {
     run_id: id,
     lease_expires_at: str(body.lease_expires_at) ?? (run ? str(run.lease_expires_at) : null),
     // 租约有效期只认正整数；读不出就是读不出（引擎按契约默认值算），不当成 0。
     lease_ttl_s: ttl !== null && ttl > 0 ? ttl : null,
+    account: acc && accId !== null ? { id: accId, name: str(acc.name) } : null,
   };
 }
 
@@ -333,36 +370,6 @@ function retryable(endpoint: Endpoint, e: ApiError): boolean {
   return e.kind === "http" && e.status !== null && e.status >= 500 && RETRY_ON_5XX.has(endpoint);
 }
 
-/** 输入：配对失败、填的服务端地址 → 输出：给人看的一句「配对失败：……」。
- *  · 429 RATE_LIMITED（配对按 IP 限速）：说清楚多少秒后再试（detail.retry_after_s 或 Retry-After 响应头）；
- *  · 403 FORBIDDEN（服务端的 Host 允许名单：只接受本机地址与 PC_ALLOWED_HOSTS 里的名字）：
- *    提示改用 http://127.0.0.1:8790 或 localhost，或请管理员把这个主机名加进 PC_ALLOWED_HOSTS；
- *  · 其他：服务端的中文原话。 */
-export function pairFailureText(e: ApiError, serverUrl: string): string {
-  if (e.kind === "http" && (e.code === "RATE_LIMITED" || e.status === 429)) {
-    const n = retryAfterSeconds(e);
-    return n !== null && n > 0 ? `配对失败：尝试次数过多，请 ${n} 秒后再试` : "配对失败：尝试次数过多，请稍后再试";
-  }
-  if (e.kind === "http" && e.status === 403 && e.code === "FORBIDDEN") {
-    let host = "";
-    let port = "8790";
-    try {
-      const u = new URL(serverUrl);
-      host = u.hostname;
-      port = u.port || port;
-    } catch {
-      // 地址读不出来：提示里不带主机名
-    }
-    const who = host ? `主机名 ${host} ` : "这个主机名";
-    return (
-      `配对失败：服务端不接受${who}的请求（服务端只接受本机地址和 PC_ALLOWED_HOSTS 里登记的主机名）。` +
-      `请把服务端地址改成 http://127.0.0.1:${port} 或 http://localhost:${port}，` +
-      `或者请管理员把 ${host || "这个主机名"} 加进服务端的 PC_ALLOWED_HOSTS 后再试`
-    );
-  }
-  return `配对失败：${e.message || codeLabel(e.code)}`;
-}
-
 /** 插件协议客户端。一个实例绑定一个服务端地址与设备令牌。 */
 export class PluginClient implements RunApi {
   private readonly base: string;
@@ -381,20 +388,21 @@ export class PluginClient implements RunApi {
 
   /** 输入：端点名、路径、请求体、解析器 → 输出：ApiResult。按 RETRY_POLICY 决定是否在 network 失败后重试，
    *  按 RETRY_ON_5XX 决定是否在 5xx 后重试。重试发的是同一份请求体。 */
-  async call<T>(endpoint: Endpoint, path: string, body: unknown, parse: Parser<T>): Promise<ApiResult<T>> {
+  async call<T>(endpoint: Endpoint, path: string, body: unknown, parse: Parser<T>, auth = true): Promise<ApiResult<T>> {
     const retries = RETRY_POLICY[endpoint] ? this.retryDelays : [];
-    let res = await this.once(path, body, parse);
+    let res = await this.once(path, body, parse, auth);
     for (const delay of retries) {
       if (res.ok || !retryable(endpoint, res.error)) break;
       await this.sleep(delay);
-      res = await this.once(path, body, parse);
+      res = await this.once(path, body, parse, auth);
     }
     return res;
   }
 
-  private async once<T>(path: string, body: unknown, parse: Parser<T>): Promise<ApiResult<T>> {
+  private async once<T>(path: string, body: unknown, parse: Parser<T>, auth: boolean): Promise<ApiResult<T>> {
+    // 服务端的插件入口闸要求 POST 带 Content-Type: application/json。
     const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
-    if (this.opts.token) headers.Authorization = `Bearer ${this.opts.token}`;
+    if (auth && this.opts.token) headers.Authorization = `Bearer ${this.opts.token}`;
     let res: Response;
     try {
       res = await this.fetchFn(this.base + path, {
@@ -456,37 +464,34 @@ export class PluginClient implements RunApi {
 
   // ── 设备 ──────────────────────────────────────────────────────────────
 
-  /** 输入：配对码、设备名、浏览器类型 → 输出：设备 ID 与设备令牌。配对码一次性，不重试。 */
-  pair(code: string, deviceName: string, browser: Browser): Promise<ApiResult<PairOut>> {
-    return this.call("pair", "/plugin/v1/pair", {
-      code,
-      device_name: deviceName,
-      browser,
-      ext_version: this.opts.extVersion,
-    }, parsePair);
+  /** 输入：插件自己生成的设备令牌、工作区 ID（只有服务端里有多个工作区时才需要）→ 输出：这个浏览器在服务端的登记。
+   *  **不带 Authorization**（登记不需要令牌头，令牌在请求体里）；同一个令牌重复登记是幂等的。 */
+  register(deviceToken: string, workspaceId: number | null = null): Promise<ApiResult<RegisterOut>> {
+    const body: Record<string, unknown> = { device_token: deviceToken, ext_version: this.opts.extVersion };
+    if (workspaceId !== null) body.workspace_id = workspaceId;
+    return this.call("register", "/plugin/v1/register", body, parseRegister, false);
   }
 
-  /** 输入：最新身份快照（过期或没有就不传）→ 输出：设备、绑定账号的有效配置与身份状态。 */
+  /** 输入：最新身份（过期或没有就不传）→ 输出：这个浏览器、登录状态、当前买家号对应账号的配置、本浏览器的未结束批次。 */
   heartbeat(identity: Identity | null): Promise<ApiResult<HeartbeatOut>> {
     const body: Record<string, unknown> = { ext_version: this.opts.extVersion };
     if (identity) body.identity = identity;
     return this.call("heartbeat", "/plugin/v1/heartbeat", body, parseHeartbeat);
   }
 
-  /** 输入：身份快照 → 输出：服务端的回执（可能带 identity_status）。
-   *  契约 §5 没有单列这个接口；服务端没有它时（404/405/422）调用方改用心跳捎带。 */
-  identity(identity: Identity): Promise<ApiResult<{ identity_status: IdentityStatus | null }>> {
-    return this.call("identity", "/plugin/v1/identity", { ...identity, ext_version: this.opts.extVersion }, (b) => {
-      const o = isObj(b) ? b : {};
-      return { identity_status: "identity_status" in o ? parseIdentityStatus(o.identity_status) : null };
-    });
+  /** 输入：身份 → 输出：与心跳同一形状（服务端按这份身份现算的登录状态与账号），调用方直接拿它更新缓存。 */
+  identity(identity: Identity): Promise<ApiResult<HeartbeatOut>> {
+    return this.call("identity", "/plugin/v1/identity", { ...identity, ext_version: this.opts.extVersion }, parseHeartbeat);
   }
 
   // ── 执行批次 ──────────────────────────────────────────────────────────
 
-  startRun(trigger: Trigger): Promise<ApiResult<RunStartOut>> {
+  startRun(trigger: Trigger, customerId: string, slot: string | null = null): Promise<ApiResult<RunStartOut>> {
     // 本阶段只发模拟批次。这一位写死在这里，不从配置读 —— 没有任何开关能把它翻成 false。
-    return this.call("startRun", "/plugin/v1/runs", { trigger, simulated: true }, parseRunStart);
+    const body: Record<string, unknown> = { customer_id: customerId, trigger, simulated: true };
+    // slot 只跟着定时批次走；手动批次不带（服务端记 NULL）。
+    if (trigger === "scheduled" && slot) body.slot = slot;
+    return this.call("startRun", "/plugin/v1/runs", body, parseRunStart);
   }
 
   runHeartbeat(runId: number): Promise<ApiResult<RunHeartbeatOut>> {

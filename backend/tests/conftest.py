@@ -6,9 +6,11 @@ PC_TEST_ADMIN_DSN 覆盖。连不上时整体跳过（并打印原因），不�
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import psycopg
@@ -52,11 +54,63 @@ def isolate_settings() -> None:
 isolate_settings()
 
 
+# ── 分层标记 ──────────────────────────────────────────────────────────────────
+# 经过 HTTP（server/ 的应用）的测试自动带 `http` 标记：test_api_*.py 里的全部用例，以及其他文件里用到 `api` 夹具
+# （含依赖它的 owner / other）的用例。只跑服务层：python -m pytest -m "not http"；只跑 HTTP 层：-m http。
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line("markers", "http: 经过 HTTP 层（server 应用）的测试；其余是只走服务层 / 工作流的测试")
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    for item in items:
+        module = getattr(item, "module", None)
+        name = module.__name__.rsplit(".", 1)[-1] if module is not None else ""
+        if name.startswith("test_api_") or "api" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.http)
+
+
 def _tables(conn) -> list[str]:
     rows = conn.execute(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'procure'"
     ).fetchall()
     return [f"procure.{r['tablename']}" for r in rows]
+
+
+@contextlib.contextmanager
+def temp_database(prefix: str = "procure_tmp") -> Iterator[str]:
+    """输入：库名前缀 → 输出：一个全新的空临时库的 DSN（退出时删除）。
+
+    给需要自己建表的测试用（旧结构升级、db_init 重复执行）：与会话共用的测试库互不影响。库里什么都没有，
+    连 procure 这个 schema 也没有。
+    """
+    name = f"{prefix}_{os.getpid()}_{secrets.token_hex(3)}"
+    with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{name}"')
+    try:
+        yield make_conninfo(ADMIN_DSN, dbname=name)
+    finally:
+        with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def run_schema(dsn: str, script_path: Path | None = None) -> None:
+    """输入：DSN、建表脚本路径（缺省当前的 refdata/schema.sql）→ 输出：无（整份脚本作为一条多语句查询在 autocommit
+    连接上执行一遍：脚本本身要么全部生效、要么全不生效）。
+
+    只执行脚本：不建库，也不做 db_init 的来源指定回填（db_init.run 把脚本和回填放在同一个事务里，要测回填用它）。
+    """
+    script = (script_path or paths.SCHEMA_SQL).read_text(encoding="utf-8")
+    with db.pg_conn(dsn, autocommit=True, statement_timeout_s=0) as conn:
+        conn.execute(script)
+
+
+@pytest.fixture()
+def scratch_db() -> Iterator[str]:
+    """输入：无 → 输出：一个空临时库的 DSN（测试结束时删除）。"""
+    with temp_database() as dsn:
+        yield dsn
 
 
 @pytest.fixture(scope="session")

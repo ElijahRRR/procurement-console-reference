@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "采购助手",
-  "version": "0.1.0",
-  "description": "采购控制台的浏览器插件：配对、心跳、亚马逊登录身份识别与模拟执行。本版本不产生真实订单。",
+  "version": "0.2.0",
+  "description": "采购控制台的浏览器插件：自动登记、心跳，按当前登录的亚马逊买家号领取任务并模拟执行。本版本不产生真实订单。",
   "minimum_chrome_version": "103",
   "permissions": ["storage", "alarms"],
   "host_permissions": [

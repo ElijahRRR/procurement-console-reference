@@ -25,8 +25,10 @@ def test_overview_shape_and_counts(conn, workspace):
     ws = workspace["id"]
     empty = overview.overview(conn, ws)
     assert set(empty) == {"bj_date", "counts", "needs_attention", "today_executable", "future_assigned", "accounts",
-                          "devices", "recent_exceptions", "last_allocation", "simulation_only", "feishu_configured"}
+                          "devices", "discovered_buyers", "recent_exceptions", "last_allocation", "simulation_only",
+                          "feishu_configured"}
     assert empty["bj_date"] == "2026-10-31" and empty["last_allocation"] is None
+    assert empty["devices"] == {"total": 0, "online": 0} and empty["discovered_buyers"] == 0
     assert empty["simulation_only"] is True and isinstance(empty["feishu_configured"], bool)
     assert set(empty["counts"]) == set(orders.ORDER_STATUS_ZH) and sum(empty["counts"].values()) == 0
 
@@ -34,9 +36,9 @@ def test_overview_shape_and_counts(conn, workspace):
     paused = f.make_account(conn, ws, execution_paused=True)
     f.make_account(conn, ws, purchase_enabled=False)
     f.make_account(conn, ws, archived_at=NOW)
-    f.make_device(conn, ws, bound_account_id=acc["id"])
+    f.make_device(conn, ws)
     f.make_device(conn, ws, last_seen_at=NOW - timedelta(minutes=10))
-    f.make_device(conn, ws, revoked_at=NOW)
+    f.make_device(conn, ws, hidden_at=NOW)                                   # 已移除的浏览器不计
     f.ingest_ready_order(conn, ws)
     f.ingest_ready_order(conn, ws, suggested_purchase_date=TODAY + timedelta(days=2))
     f.ingest_ready_order(conn, ws, review_value=None, review="unknown")
@@ -53,12 +55,35 @@ def test_overview_shape_and_counts(conn, workspace):
     assert paused["id"]
 
 
+def test_overview_counts_discovered_buyers_not_yet_registered(conn, workspace):
+    """discovered_buyers = 浏览器上报了、还没有账号登记、也没被忽略的买家号个数（按 ID 去重）。"""
+    from services import accounts
+
+    ws, uid = workspace["id"], workspace["user_id"]
+    f.make_account(conn, ws, amazon_customer_id="A1DEMO00001")
+    f.make_device(conn, ws, customer_id="A1DEMO00001")                       # 已登记
+    f.make_device(conn, ws, customer_id="A2TEST0000X")
+    f.make_device(conn, ws, customer_id="A2TEST0000X")                       # 同一个 ID 的第二台：只算一个
+    f.make_device(conn, ws, customer_id="A2TEST0000Y")
+    f.make_device(conn, ws, customer_id="A2TEST0000Z", hidden_at=NOW)        # 已移除的浏览器
+    f.make_device(conn, ws, identity={"signed_in": False, "customer_id": "A2TEST0000W"})
+    assert overview.overview(conn, ws)["discovered_buyers"] == 2
+    accounts.ignore_buyer_id(conn, ws, "A2TEST0000Y", uid)
+    assert overview.overview(conn, ws)["discovered_buyers"] == 1
+    accounts.create(conn, ws, {"name": "环境-DEMO-X", "amazon_customer_id": "A2TEST0000X"}, uid)
+    out = overview.overview(conn, ws)
+    assert out["discovered_buyers"] == 0 and out["devices"] == {"total": 5, "online": 5}
+    assert out["discovered_buyers"] == len(accounts.discovered(conn, ws))
+
+
 def test_overview_is_workspace_scoped(conn, workspace):
     other = f.make_workspace(conn)
     f.ingest_ready_order(conn, other["id"])
     f.make_account(conn, other["id"])
+    f.make_device(conn, other["id"], customer_id="A2TEST0000X")
     out = overview.overview(conn, workspace["id"])
     assert sum(out["counts"].values()) == 0 and out["accounts"]["total"] == 0
+    assert out["devices"] == {"total": 0, "online": 0} and out["discovered_buyers"] == 0
 
 
 def test_allocate_workflow_runs_every_workspace_in_own_transaction(conn, workspace):

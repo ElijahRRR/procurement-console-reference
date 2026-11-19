@@ -10,6 +10,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import OrderListCard, { type OrderTab } from '@/components/orders/OrderListCard.vue'
 import { formatDate, formatNumber } from '@/utils/format'
 import { ORDER_VIEW_LABEL, labelOf } from '@/utils/labels'
+import { REALLOCATE_CONFIRM_TEXT, UNASSIGNED_EMPTY_TEXT } from '@/utils/designation'
 import { confirmAction, notifyFailure, notifySuccess, runDownload } from '@/utils/feedback'
 
 const overview = ref<Overview | null>(null)
@@ -31,7 +32,7 @@ const tabs = computed<OrderTab[]>(() => {
   return [
     { value: 'today', label: '今日可采购', count: o?.today_executable, emptyTitle: '今天没有可采购的任务', emptyDescription: '已分配且建议采购日期不晚于今天的任务会出现在这里，由对应浏览器插件领取执行。' },
     { value: 'future', label: '未来日期', count: o?.future_assigned, emptyTitle: '没有未来日期的任务', emptyDescription: '建议采购日期在明天及以后的已分配任务，到期前不会执行。' },
-    { value: 'unassigned', label: '待分配', count: c.queued, emptyTitle: '没有待分配的任务', emptyDescription: '分不出去的任务会写明原因：金额不在任何启用账号的区间内，或匹配账号当天额度已满。' },
+    { value: 'unassigned', label: '待分配', count: c.queued, emptyTitle: '没有待分配的任务', emptyDescription: UNASSIGNED_EMPTY_TEXT },
     { value: 'pending_review', label: '待确认', count: c.pending_review, emptyTitle: '没有待确认的任务', emptyDescription: '人审结果不是「通过」的任务停在这里，不下发采购。' },
     { value: 'needs_info', label: '资料待补齐', count: c.needs_info, emptyTitle: '没有资料待补齐的任务', emptyDescription: '缺少 ASIN、数量、单价、限价、建议采购日期或收件信息的任务停在这里。' },
     { value: 'conflict', label: '待核实', count: c.conflict, emptyTitle: '没有待核实的任务', emptyDescription: '不同来源内容冲突，或外部单号与本系统记录矛盾的任务停在这里。' },
@@ -46,7 +47,7 @@ function exportCurrent() {
 }
 
 async function reallocate() {
-  const ok = await confirmAction({ message: '确定要重新分配吗？自动分配的任务会按当前账号配置重算，人工改派的任务保持不动。' })
+  const ok = await confirmAction({ message: REALLOCATE_CONFIRM_TEXT })
   if (!ok) return
   allocating.value = true
   try {
@@ -81,6 +82,7 @@ async function reallocate() {
       mode="pending"
       :bulk-review-tabs="['pending_review']"
       :missing-tabs="['needs_info']"
+      :wide-note-tabs="['unassigned']"
       @changed="loadCounts"
     />
   </div>

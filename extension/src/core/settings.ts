@@ -1,15 +1,19 @@
 /** 插件本地设置与输入校验（纯函数）。
  *
- * 设置存在 chrome.storage.local，由设置页修改。设备令牌单独存在扩展源下的 IndexedDB 里
- * （见 background/secrets.ts，内容脚本打不开），只在后台使用，永不显示、永不写日志。
+ * 设置存在 chrome.storage.local，由设置页修改（后台只接受扩展自己的页面发来的修改，见 core/messages.isPrivilegedSender）。
+ * 设备令牌单独存在扩展源下的 IndexedDB 里（见 background/secrets.ts，内容脚本打不开），
+ * 只在后台使用，永不显示、永不写日志。
+ *
+ * 零设置可用：服务端地址缺省 http://127.0.0.1:8790，装好就自动登记，没有任何必填项。
  */
 
 import { normalizeOutcome, type SimOutcome } from "./simulate.js";
-import type { Browser } from "./types.js";
 
 export interface Settings {
   serverUrl: string;
   simulationOutcome: SimOutcome;
+  /** 高级：工作区 ID。只有服务端里有多个工作区时才需要填（控制台「设置」页可以查到）；不填为 null。 */
+  workspaceId: number | null;
 }
 
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:8790";
@@ -17,19 +21,17 @@ export const DEFAULT_SERVER_URL = "http://127.0.0.1:8790";
 export const DEFAULT_SETTINGS: Settings = {
   serverUrl: DEFAULT_SERVER_URL,
   simulationOutcome: "pass",
+  workspaceId: null,
 };
 
-export const BROWSER_OPTIONS: ReadonlyArray<{ value: Browser; label: string }> = [
-  { value: "chrome", label: "Chrome" },
-  { value: "adspower", label: "AdsPower" },
-  { value: "other", label: "其他" },
-];
+/** 「打开订单页」打开的地址：订单历史页的内联脚本里有 customerId。只在所有者点击时打开。 */
+export const ORDER_HISTORY_URL = "https://www.amazon.com/gp/css/order-history";
 
 /** 输入：存下来的任意值 → 输出：补全默认值后的设置。 */
 export function normalizeSettings(v: unknown): Settings {
   const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
   const url = typeof o.serverUrl === "string" && validateServerUrl(o.serverUrl).ok ? normalizeServerUrl(o.serverUrl) : DEFAULT_SERVER_URL;
-  return { serverUrl: url, simulationOutcome: normalizeOutcome(o.simulationOutcome) };
+  return { serverUrl: url, simulationOutcome: normalizeOutcome(o.simulationOutcome), workspaceId: normalizeWorkspaceId(o.workspaceId) };
 }
 
 /** 输入：服务端地址 → 输出：去掉首尾空白与末尾斜杠后的地址。 */
@@ -39,40 +41,50 @@ export function normalizeServerUrl(s: string): string {
 
 /** 输入：服务端地址 → 输出：能不能用，不能用时给出原因。
  *
- *  只允许本机地址（http://127.0.0.1 或 http://localhost，端口任意）：
- *  插件的主机权限只申请了这两个（不申请 <all_urls>），别的地址请求会被浏览器拦下。 */
+ *  只允许本机的 http 地址（http://127.0.0.1 或 http://localhost，端口任意），只有协议、主机和端口：
+ *  插件的主机权限只申请了这两个的 http（不申请 <all_urls>，也没有 https），别的地址请求会被浏览器拦下；
+ *  服务端的插件接口也只接受本机对端。带用户名密码（fetch 拒绝这种地址）、查询串或片段（请求会拼成
+ *  「/?x=1/plugin/v1/…」）的地址永远连不上，保存它会白白换掉令牌，所以一律不收。
+ *  查询串与片段看文本里有没有 `?`、`#`：只写一个 `?` 或 `#` 时 URL 解析出的 search、hash 是空的。
+ *  反斜杠同样看文本：URL 解析把 `\` 当成 `/`（「…:8790\」解析出的路径是「/」），而请求是「地址 + /plugin/v1/…」
+ *  拼出来的，会变成「//plugin/v1/…」，服务端答「接口不存在」。 */
 export function validateServerUrl(s: string): { ok: true } | { ok: false; reason: string } {
+  const text = normalizeServerUrl(s);
   let u: URL;
   try {
-    u = new URL(normalizeServerUrl(s));
+    u = new URL(text);
   } catch {
     return { ok: false, reason: "地址格式不正确，例如 http://127.0.0.1:8790" };
   }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return { ok: false, reason: "只支持 http 或 https 地址" };
+  if (u.protocol !== "http:") return { ok: false, reason: "只支持 http 地址，例如 http://127.0.0.1:8790" };
+  if (u.username !== "" || u.password !== "") return { ok: false, reason: "地址里不要带用户名或密码" };
   if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") {
     return { ok: false, reason: "当前版本只支持本机服务端（127.0.0.1 或 localhost）" };
   }
-  if (u.pathname !== "/" && u.pathname !== "") return { ok: false, reason: "只填协议、主机和端口，不要带路径" };
+  if ((u.pathname !== "/" && u.pathname !== "") || text.includes("?") || text.includes("#") || text.includes("\\")) {
+    return { ok: false, reason: "只填协议、主机和端口，不要带路径" };
+  }
   return { ok: true };
 }
 
-/** 输入：用户输入的配对码 → 输出：去掉空白与短横后的配对码（不改大小写）。 */
-export function normalizePairingCode(s: string): string {
-  return s.replace(/[\s-]+/g, "");
+/** 输入：任意值（数字、数字文本、空）→ 输出：正整数的工作区 ID；空、0、负数、小数、别的文本一律为 null。 */
+export function normalizeWorkspaceId(v: unknown): number | null {
+  if (typeof v === "number") return Number.isSafeInteger(v) && v > 0 ? v : null;
+  if (typeof v === "string" && /^\s*\d{1,15}\s*$/.test(v)) {
+    const n = Number(v.trim());
+    return n > 0 ? n : null;
+  }
+  return null;
 }
 
-/** 输入：配对码 → 输出：是不是 8 位字母或数字。 */
-export function isValidPairingCode(s: string): boolean {
-  return /^[A-Za-z0-9]{8}$/.test(normalizePairingCode(s));
+/** 输入：设置页里填的工作区 ID 文本 → 输出：能不能用（留空可以）。 */
+export function validateWorkspaceIdText(s: string): { ok: true; value: number | null } | { ok: false; reason: string } {
+  if (s.trim() === "") return { ok: true, value: null };
+  const n = normalizeWorkspaceId(s);
+  return n === null ? { ok: false, reason: "工作区 ID 应为正整数（控制台「设置」页可以查到）；不需要时留空" } : { ok: true, value: n };
 }
 
-/** 输入：任意值 → 输出：合法的浏览器类型（认不出按 other）。 */
-export function normalizeBrowser(v: unknown): Browser {
-  return v === "chrome" || v === "adspower" ? v : "other";
-}
-
-/** 输入：设备名 → 输出：去掉首尾空白、限制 60 字以内的设备名；空则返回 null。 */
-export function normalizeDeviceName(s: string): string | null {
-  const t = s.trim().slice(0, 60);
-  return t === "" ? null : t;
+/** 输入：服务端地址 → 输出：「打开控制台」打开的地址（控制台的「账号」页）。 */
+export function consoleAccountsUrl(serverUrl: string): string {
+  return `${normalizeServerUrl(serverUrl)}/accounts`;
 }

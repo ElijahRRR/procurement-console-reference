@@ -1,13 +1,14 @@
 /** 内容脚本入口（https://www.amazon.com/*，document_idle，只在顶层页面）。
  *
  * 做三件事，都不导航、不点击、不改动亚马逊页面本身：
- *   1. 读身份：页面加载时、每 2 分钟、以及按需（「刷新身份」、开始执行前后台来问），
- *      从导航栏与内联脚本读登录状态与 customerId，连同**这一页的加载时刻**交给后台对账、上报
+ *   1. 读身份：页面加载时、每 2 分钟、以及按需（「重新读取」、开始执行前、后台来问），
+ *      从导航栏读登录状态、从内联脚本读 customerId（买家号 ID），连同**这一页的加载时刻**交给后台对账、上报
  *      （同一页重读一百遍也只是加载那一刻的样子：后台比先后只看加载时刻，见 core/identity.ts）；
  *   2. 承载执行引擎（本阶段只做模拟）：手动点「开始执行（模拟）」或后台在定时到点时调用；
  *      后台随时可以问一声「引擎还在吗」（pc.ping），页面离开时告诉后台（pc.bye）；
  *   3. 挂一个 Shadow DOM 面板（订单历史页默认展开，其余页面是收起的悬浮按钮）。
  * 唯一往页面里加的东西是面板的宿主节点；页面的样式进不来，我们的样式也出不去。
+ * 不读 Cookie、不上传页面 HTML、不做任何反检测。
  */
 
 import { identityFromPage, type IdentitySnapshot } from "../core/identity.js";
@@ -53,17 +54,18 @@ function boot(): void {
   if (window.__pcAssistantLoaded) return; // 防止重复注入
   window.__pcAssistantLoaded = true;
 
-  const host = new RunHost();
+  const host = new RunHost(readPage);
 
   chrome.runtime.onMessage.addListener((msg: TabMsg, _sender, respond) => {
     if (msg?.type === "pc.startScheduled") {
-      host.start("scheduled").then(respond, () =>
-        respond({ result: "rejected", message: "开始执行失败：页面内部错误" } satisfies ScheduledReply),
+      // 定时到点：后台带来时间点与定时所属的买家号 ID；这一页登的不是它就答「换下一个标签页」。
+      host.start("scheduled", { slot: String(msg.slot ?? ""), customerId: String(msg.customer_id ?? "") }).then(respond, () =>
+        respond({ result: "rejected", code: null, message: "开始执行失败：页面内部错误" } satisfies ScheduledReply),
       );
       return true;
     }
     if (msg?.type === "pc.readIdentity") {
-      // 后台来问（开始执行前、刚配对完）：读一次本页，读数直接放在答复里，由后台对账。
+      // 后台来问（开始执行前、执行中、「重新读取」）：读一次本页，读数直接放在答复里，由后台对账。
       respond({ ok: true, identity: readPage() });
       return false;
     }
@@ -81,7 +83,7 @@ function boot(): void {
 
   void readIdentity(false);
   setInterval(() => void readIdentity(false), IDENTITY_REFRESH_MS);
-  // 亚马逊页面打开了 = 环境上线：后台对一下「执行页面是不是刚被刷新」，同步一次心跳，检查今天错过的定时。
+  // 亚马逊页面打开了 = 环境上线：后台对一下「执行页面是不是刚被刷新」，同步一次心跳（还没登记上就先登记），检查今天错过的定时。
   void toSw({ type: "pc.hello", href: location.origin + location.pathname, loaded_at: LOADED_AT }).catch(() => undefined);
   // 页面要离开了（刷新、跳转、关闭）：告诉后台。正在跑的批次由后台接管，不用等它自己发现。
   window.addEventListener("pagehide", () => {
@@ -93,7 +95,7 @@ function boot(): void {
     }
   });
 
-  mountPanel(host, readIdentity);
+  mountPanel(host);
 }
 
 boot();

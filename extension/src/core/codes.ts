@@ -5,7 +5,7 @@
  *   · 护栏拦截码（契约 §4），`/guard` 返回的 `code`，插件原样作为 `error_code` 上报；
  *   · 尝试失败原因（契约 §5「结果处理」表，服务端 services/models.ERROR_CODES）；
  *   · 进度 continue=false 的机读原因 cancel_code（契约 §5 第 7 步）；
- *   · 插件本地的码：描述「没说上话」（NETWORK / TIMEOUT / BAD_RESPONSE）、没配对等。
+ *   · 插件本地的码：描述「没说上话」（NETWORK / TIMEOUT / BAD_RESPONSE）、还没登记上、这一页读不到买家号等。
  *
  * 原样的英文码（含认不出的）不进面板、弹出页与设置页：一律经 codeLabel / cancelLabel /
  * stopReasonLabel / stageLabel 换成中文。
@@ -14,20 +14,26 @@
  * 这里只给「原因」那半句，动作由调用处拼。
  */
 
-/** 服务端统一错误码（契约 §8，顺序同契约与 web 的 API_ERROR_CODES）。 */
+/** 服务端统一错误码（契约 §8、规格 §2.8；顺序同契约与 web 的 API_ERROR_CODES，测试钉住）。 */
 export const SERVER_CODE_LABEL: Record<string, string> = {
-  UNAUTHORIZED: "设备令牌无效或已撤销，请重新配对",
-  FORBIDDEN: "没有权限",
+  UNAUTHORIZED: "这个浏览器还没有登记，插件会自动重新登记",
+  FORBIDDEN: "服务端拒绝了这个请求",
   NOT_FOUND: "服务端没有这个接口或资源",
   VALIDATION: "请求参数不正确",
   CONFLICT: "状态冲突，服务端拒绝了这次操作",
-  ACCOUNT_BUSY: "该账号正在其他设备或页面上执行",
+  ACCOUNT_BUSY: "这个买家号正在另一个浏览器或页面里执行",
+  DEVICE_BUSY: "这个浏览器上一个批次还没有结束",
   ATTEMPT_IN_FLIGHT: "本批次还有一笔未结束的尝试",
-  IDENTITY_MISMATCH: "身份未通过：当前浏览器登录的亚马逊账号与绑定账号不一致，或 10 分钟内没有上报身份",
-  NOT_BOUND: "本设备还没有绑定买家账号，请在控制台「账号与设备」里绑定",
+  // 开始批次时：没有登录、标签页读数不一致、页面上的买家号与最近上报的不同、太久没有上报；
+  // 执行中（进度、提交登记、护栏的 buyer 项）：浏览器登录的买家号变了。中止类：任务回已分配，不进异常、不暂停账号。
+  IDENTITY_MISMATCH: "浏览器登录的买家号对不上（没有登录、标签页读数不一致、买家号变了，或登录状态太久没有上报）",
+  ACCOUNT_NOT_REGISTERED: "这个买家号还没有登记：请在控制台「账号」页登记后再开始",
   ACCOUNT_PAUSED: "账号已暂停执行，请在控制台恢复后再试",
   REAL_PURCHASE_DISABLED: "服务端当前只允许模拟执行",
   LEASE_LOST: "执行权已失效（租约过期或批次已被结束）",
+  SLOT_DONE: "这个时间点今天已经执行过",
+  WORKSPACE_REQUIRED: "系统里有多个工作区：请在插件设置的「工作区 ID」里填写（控制台「设置」页可以查到）",
+  PLUGIN_OUTDATED: "插件版本过旧，请重新构建并加载新版插件",
   FEISHU_NOT_CONFIGURED: "服务端还没有配置飞书应用",
   FEISHU_ERROR: "飞书接口出错",
   INVALID_TRANSITION: "任务状态不允许这次变更",
@@ -65,21 +71,25 @@ export const ATTEMPT_CODE_LABEL: Record<string, string> = {
   CAPTCHA_ENCOUNTERED: "遇到验证码或风控，转人工处理",
   ABORTED_UPSTREAM_CANCELLED: "上游已取消，未提交前中止",
   ABORTED_BY_USER: "插件端人工中止，未提交前中止",
-  ABORTED_BY_SERVER: "服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止",
+  ABORTED_BY_SERVER: "服务端要求中止（账号暂停或归档、浏览器登录的买家号变了或登录状态过期、来源有变化），未提交前中止",
   SUBMIT_REJECTED: "服务端拒绝了提交登记",
   PLUGIN_SIMULATION_ONLY: "插件当前只做模拟执行，拒绝执行非模拟尝试",
 };
 
-/** 插件本地的错误（没说上话、没配对等），不上报。 */
+/** 插件本地的错误（没说上话、还没登记上、这一页读不到买家号等），不上报。 */
 export const LOCAL_CODE_LABEL: Record<string, string> = {
   NETWORK: "无法连接服务端",
   TIMEOUT: "请求超时",
   BAD_RESPONSE: "服务端响应格式不正确",
-  NOT_PAIRED: "尚未配对，请先在设置页完成配对",
+  NOT_REGISTERED: "还没有连上服务端（插件会自动重试）",
+  TOKEN_STORE: "插件的密钥库写不进去（浏览器存储不可用），请重新加载插件后再试",
   SW_UNAVAILABLE: "插件后台没有响应",
   TAB_BUSY: "本浏览器的另一个亚马逊页面正在执行",
   ALREADY_RUNNING: "本页面已经在执行",
   NO_IDENTITY: "没有读到亚马逊登录状态",
+  SIGNED_OUT: "浏览器没有登录亚马逊",
+  NO_CUSTOMER_ID: "这一页没有读到买家号 ID，请打开订单页后再试",
+  IDENTITY_CONFLICT: "这个浏览器的亚马逊标签页显示的买家号不一致，请刷新或关闭较早打开的亚马逊标签页",
 };
 
 /** 认不出的错误码的说明：界面上不出现原样的英文码。 */
@@ -102,8 +112,8 @@ export const CANCEL_CODE_LABEL: Record<string, string> = {
   UPSTREAM_CANCELLED: "上游已取消",
   ACCOUNT_ARCHIVED: "账号已归档",
   ACCOUNT_PAUSED: "账号已暂停执行",
-  IDENTITY_MISMATCH: "浏览器登录的买家账号与绑定账号不一致，或没有登录",
-  IDENTITY_STALE: "插件超过 10 分钟没有上报登录身份，身份信息已过期",
+  IDENTITY_MISMATCH: "浏览器登录的买家号变了",
+  IDENTITY_STALE: "插件超过 10 分钟没有上报登录状态，登录状态已过期",
   SOURCE_HOLD: "来源把这笔任务暂停了（有冲突待处理）",
   SOURCE_CHANGED: "领取后来源有变化，提交前中止",
   ATTEMPT_FINISHED: "本次采购尝试已结束",
@@ -114,22 +124,28 @@ export function cancelLabel(code: string | null | undefined): string {
   return (code ? CANCEL_CODE_LABEL[code] : undefined) ?? "服务端要求中止";
 }
 
-/** 账号级错误：服务端收到后会暂停账号执行（契约 §5 结果处理表）。插件随后结束本批次。 */
+/** 账号级错误：服务端收到后会暂停账号执行（契约 §5 结果处理表）。插件随后结束本批次。
+ *  IDENTITY_MISMATCH **不在**这里：浏览器换登另一个买家号是正常操作，它是中止类
+ *  （任务回已分配、不暂停账号、不占额度），否则另一个登着这个买家号的浏览器也跑不了它的任务。 */
 export const ACCOUNT_LEVEL_CODES: ReadonlySet<string> = new Set([
   "LOGIN_REQUIRED",
   "ACCOUNT_RESTRICTED",
   "CARD_DECLINED",
   "CAPTCHA_ENCOUNTERED",
-  "IDENTITY_MISMATCH",
   "PLUGIN_SIMULATION_ONLY",
 ]);
+
+/** 执行中浏览器登录的买家号变了（进度的 cancel_code、护栏 buyer 项的拦截码都是 IDENTITY_MISMATCH）时，
+ *  面板与日志上的那一句（规格 §5 状态文案表）。服务端都按中止类处理：这一笔没有登记提交，任务回已分配、
+ *  不进异常、不暂停账号；护栏 buyer 项拦下的那一种，服务端还会把批次一并结束（重新开始批次后再领）。 */
+export const BUYER_CHANGED_TEXT = "浏览器登录的买家号变了，这一笔在提交前中止";
 
 /** 输入：进度返回的 cancel_code（服务端没给为 null）→ 输出：插件要上报的中止码；null = 不用上报
  *  （尝试已经结束了）。
  *
  *  · UPSTREAM_CANCELLED → ABORTED_UPSTREAM_CANCELLED（只有真的是上游取消才这么报）；
  *  · ATTEMPT_FINISHED → 不上报（服务端已经结束了这一笔，再报只会 409）；
- *  · 其他（账号暂停 / 归档、身份不符或过期、来源有变化）→ ABORTED_BY_SERVER（中止类，任务回到已分配）；
+ *  · 其他（账号暂停 / 归档、买家号变了或登录状态过期、来源有变化）→ ABORTED_BY_SERVER（中止类，任务回到已分配）；
  *  · 服务端没给 cancel_code（旧服务端）→ ABORTED_UPSTREAM_CANCELLED：那时它认得的中止码只有这一个，
  *    报一个它不认识的码会被当成任务级失败、任务转异常。 */
 export function abortCodeFor(cancelCode: string | null | undefined): string | null {
@@ -151,14 +167,19 @@ export const STAGE_LABEL: Record<string, string> = {
   done: "本笔完成",
 };
 
-/** 批次心跳 `stop_reason` 的中文名（服务端 execution._stop_reason 的四个值，外加两个批次结束原因）。 */
+/** 批次心跳 `stop_reason` 的中文名（服务端 execution._stop_reason 的三个值：account_paused /
+ *  account_archived / identity_mismatch），外加批次结束原因（服务端 execution.END_REASON_ZH 的键）。
+ *  identity_mismatch 两处都有：作停止原因是「这个浏览器上报的登录状态不是批次的买家号」，作结束原因是护栏 buyer 项
+ *  拦下、服务端把批次结束（服务端的原话「结算页登录的买家号不是这个批次的买家号」随 409 LEASE_LOST 的 message 给出）。
+ *  device_revoked 只出现在历史批次里（旧版「撤销浏览器授权」留下的），三端同一句：服务端 END_REASON_ZH、
+ *  控制台 RUN_END_REASON_LABEL、这里。 */
 export const STOP_REASON_LABEL: Record<string, string> = {
   account_paused: "账号已被暂停执行",
   account_archived: "账号已归档",
-  device_unbound: "设备已解除绑定或改绑到别的账号",
-  identity_mismatch: "浏览器登录的买家账号与绑定账号不一致，或身份已过期",
+  identity_mismatch: "浏览器登录的买家号变了（或已退出登录、标签页读数不一致）",
   lease_expired: "执行租约已过期",
-  device_revoked: "设备授权已被撤销",
+  simulation_reset: "模拟结果已在控制台清除",
+  device_revoked: "浏览器的授权已撤销（旧版）",
 };
 
 /** 输入：停止原因码 → 输出：中文说明。 */

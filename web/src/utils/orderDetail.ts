@@ -4,16 +4,16 @@
  * 颜色表达含义（设计系统）：成功为绿、进行中为蓝灰、需要人处理为黄、出错与待核实为红。
  */
 import type { Attempt, EventRecord, OrderConflict, OrderDetail, OrderRow, OrderStatus } from '@/api/types'
-import { displayValue, formatMoney, parseAmount } from './format'
+import { displayValue, formatMoney, isBlank, parseAmount } from './format'
 import {
   CONFLICT_KIND_LABEL,
   FEISHU_VERDICT_LABEL,
-  GUARD_CODE_LABEL,
   ORDER_STATUS_LABEL,
   PROGRESS_CANCEL_LABEL,
   SOURCE_KIND_LABEL,
   errorCodeLabel,
   fieldLabel,
+  guardCodeLabel,
   labelOf,
 } from './labels'
 
@@ -63,14 +63,22 @@ export function showStatusReason(o: Pick<OrderRow, 'status' | 'status_reason' | 
 
 /** 事件 detail 里直接显示的文字键（按顺序） */
 const EVENT_TEXT_KEYS = ['reason', 'cause', 'note', 'message', 'account_name', 'amazon_order_no'] as const
-/** 摘要里另行处理、不再按「键：值」列出的键 */
+/**
+ * 摘要里另行处理、不再按「键：值」列出的键（所有事件通用）。
+ * 只对某一种事件有意义的键不放这里，否则别的事件同名的键会被藏起来
+ * （例如 order.attention_cleared 的 previous 是原提醒，order.designation_not_adopted 的 previous 是对象，各自单独处理）。
+ */
 const EVENT_HANDLED_KEYS = new Set<string>([
   ...EVENT_TEXT_KEYS, 'from', 'to', 'source', 'status', 'verdict', 'changes', 'fields', 'notes', 'error_code', 'code', 'reasons',
   'stage', 'continue', 'cancel_reason', 'cancel_code', 'detail',
 ])
 
-/** 输入：事件里的来源描述 {kind, connection_id, record_id} / {kind, batch_id, row_no} → 输出：「飞书记录 recX」「文件批次 3 第 6 行」 */
+/**
+ * 输入：事件里的来源描述 {kind, connection_id, record_id} / {kind, batch_id, row_no} → 输出：「飞书记录 recX」「文件批次 3 第 6 行」。
+ * 字符串 "upgrade" 是旧库升级时的一次性回填（order.designation_changed）：按来源里早已填好的买家号补上指定。
+ */
 export function eventSourceText(src: unknown): string {
+  if (src === 'upgrade') return '升级时按来源里已有的买家号补上'
   if (!src || typeof src !== 'object') return ''
   const o = src as Record<string, unknown>
   if (o.kind === 'feishu') return o.record_id ? `飞书记录 ${String(o.record_id)}` : '飞书记录'
@@ -81,22 +89,63 @@ export function eventSourceText(src: unknown): string {
   return ''
 }
 
-/** 输入：{字段: [旧值, 新值]} → 输出：「数量 1 → 2；限价 $35.00 → $30.00」 */
-function changesText(v: unknown): string {
+const MONEY_KEYS = new Set(['unit_price', 'price_cap', 'sales_total'])
+/** 来源指定的买家号两列（任务上的 designated_customer_id / designated_buyer_name）：空 = 没有指定 */
+const DESIGNATION_KEYS = new Set(['designated_customer_id', 'designated_buyer_name'])
+export const NOT_DESIGNATED_TEXT = '未指定'
+
+/** 输入：字段键、值 → 输出：字段变化里的展示文本（金额按 $1,234.50；指定买家号两列为空时写「未指定」） */
+function changeValue(key: string, v: unknown): string {
+  if (MONEY_KEYS.has(key)) return formatMoney(v)
+  if (DESIGNATION_KEYS.has(key)) return isBlank(v) ? NOT_DESIGNATED_TEXT : displayValue(v)
+  return displayValue(v)
+}
+
+/**
+ * 输入：{字段: [旧值, 新值]} → 输出：「数量 1 → 2；限价 $35.00 → $30.00」。
+ * 来源指定的买家号变化用扁平键：「指定买家号 ID 未指定 → A1DEMO00000；指定买家号 环境-DEMO-A → 未指定」。
+ */
+export function changesText(v: unknown): string {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return ''
   return Object.entries(v as Record<string, unknown>)
     .map(([k, pair]) => {
       const [a, b] = Array.isArray(pair) ? pair : [undefined, pair]
-      const show = (x: unknown) => (MONEY_KEYS.has(k) ? formatMoney(x) : displayValue(x))
-      return `${fieldLabel(k)} ${show(a)} → ${show(b)}`
+      return `${fieldLabel(k)} ${changeValue(k, a)} → ${changeValue(k, b)}`
     })
     .join('；')
 }
-const MONEY_KEYS = new Set(['unit_price', 'price_cap', 'sales_total'])
+
+/** 输入：事件里的一个指定 {customer_id, name} → 输出：「名称（ID）」，缺哪个省哪个；都没有（或不是对象）为「未指定」 */
+function designationPairText(v: unknown): string {
+  const o = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+  const part = (x: unknown) => (typeof x === 'string' && x.trim() ? x.trim() : null)
+  const id = part(o.customer_id)
+  const name = part(o.name)
+  if (id && name) return `${name}（${id}）`
+  return name ?? id ?? NOT_DESIGNATED_TEXT
+}
 
 /**
- * 输入：事件 → 输出：时间线里的一行摘要：状态变化、来源、预览结论、字段变化、叫停原因（cancel_code 的中文）、错误码与护栏码中文、
- * 原因与备注；剩下的简单值按「字段：值」列出（对象不原样打印 JSON）。
+ * 输入：order.designation_not_adopted 事件的 detail {stated, previous, current} → 输出：没采用的是什么。
+ * previous 非空（此时 stated 两项为空）= 这条来源清空了它上次写的、当初就没被采用的买家号，任务现有的指定保持不变；
+ * 否则 = 这条来源写的买家号与任务现有的指定不同，没有采用。
+ */
+export function notAdoptedText(d: Record<string, unknown> | null | undefined): string {
+  const detail = d ?? {}
+  const current = designationPairText(detail.current)
+  const previous = detail.previous && typeof detail.previous === 'object' ? designationPairText(detail.previous) : null
+  const stated = designationPairText(detail.stated)
+  if (previous && previous !== NOT_DESIGNATED_TEXT && stated === NOT_DESIGNATED_TEXT) {
+    return `来源清空了买家号「${previous}」，任务现有的指定「${current}」不是这条来源写的，保持不变`
+  }
+  return `来源的买家号「${stated}」与任务现有的指定「${current}」不同，未采用`
+}
+
+/**
+ * 输入：事件 → 输出：时间线里的一行摘要：状态变化、来源、预览结论、字段变化（含来源指定的买家号「旧 → 新」）、
+ * 没采用的来源指定（order.designation_not_adopted：来源写的与任务现有的指定）、
+ * 叫停原因（cancel_code 的中文）、错误码与护栏码中文、原因与备注、标记已处理时清掉的原提醒（order.attention_cleared 的 previous）；
+ * 都没有时剩下的简单值按「字段：值」列出（对象不原样打印 JSON）。
  */
 export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
   const d = e.detail ?? {}
@@ -117,12 +166,13 @@ export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
     return parts.join(' · ')
   }
   push(eventSourceText(d.source))
+  if (e.kind === 'order.designation_not_adopted') push(notAdoptedText(d))
   if (typeof d.verdict === 'string' && d.verdict) push(labelOf(FEISHU_VERDICT_LABEL, d.verdict))
   if (!from && typeof d.status === 'string' && d.status) push(`状态：${labelOf(ORDER_STATUS_LABEL, d.status)}`)
   push(changesText(d.changes))
   push(changesText(d.fields))
   if (typeof d.error_code === 'string' && d.error_code) push(errorCodeLabel(d.error_code))
-  if (e.kind === 'attempt.guard_blocked' && typeof d.code === 'string' && d.code) push(labelOf(GUARD_CODE_LABEL, d.code))
+  if (e.kind === 'attempt.guard_blocked' && typeof d.code === 'string' && d.code) push(guardCodeLabel(d.code))
   for (const k of EVENT_TEXT_KEYS) {
     const v = d[k]
     if (typeof v === 'string' && v) push(v)
@@ -131,6 +181,9 @@ export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
     const v = d[k]
     if (Array.isArray(v)) push(v.filter((x) => typeof x === 'string' && x).join('；'))
   }
+  // 标记已处理：previous 是被清掉的原提醒（备注可以为空）
+  const clearedNote = e.kind === 'order.attention_cleared' && typeof d.previous === 'string' && d.previous.trim() ? d.previous.trim() : null
+  if (clearedNote) push(`原提醒：${clearedNote}`)
   if (!parts.length) {
     const rest = Object.entries(d).filter(
       ([k, v]) => !EVENT_HANDLED_KEYS.has(k) && v !== null && v !== undefined && v !== '' && typeof v !== 'object',

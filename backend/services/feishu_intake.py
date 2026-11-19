@@ -20,6 +20,17 @@
   人审未通过），跳过的计 skipped 并写明原因；其余 ingest 新建。已有的单把准入规则一并交给 ingest（采购方移走、
   采购状态变为已拍单 / 拿回 → 开始前转待核实）。
 - 连接的写回验收测试记录（writeback_test_record）一律 skipped：验收写进去的测试值不能被当成订单结果接收。
+- **买家号两列按列判断读没读到**（feishu_fields.unread_buyer_keys → 每条记录的 SourceRef.buyer_unread）：一个字段在
+  字段对应里没配列、或配的任一候选列在来源表里找不到（被改名或删除），这个字段这次就没读到：既不设置也不清除任务上的
+  指定，来源关联里保留它上次读到的值；另一个字段照常读取、照常应用修改。两个字段都没读到 → 这次读取对来源指定不表态。
+- **来源表里找不到买家号列**（配了列、而列已被改名或删除；没配列不算）：
+  * 库里没有的单，如果没有可信 AMZ 订单号 → skipped，不建任务（读不出这一行有没有指定买家号，不能让它落进自动分配；
+    列恢复或改了字段对应之后自动接收）。带可信单号的行照常按历史采购接收。样本预览给出同样的结论。
+  * 在读取结果的 problems 最前面加一条 {record_id: None, upstream_order_no: BUYER_COLUMNS_LABEL, verdict: 'skipped',
+    reason, scope: 'connection'}（不计入 skipped 统计），并把这些连接级问题带在连接的 last_stats.problems 里
+    （控制台的连接卡片据此提示；没有连接级问题时 last_stats 不带这个键）。
+- **字段对应里没给「买家号」或「买家号 ID」配列**（连接不读它，或所有者取消了对应）：那个字段同样算没读到，但不报
+  问题、也不挡新记录（这是所有者自己的设置）。要清掉一笔任务的指定，得在对应着、读得到的列里把格子清空。
 
 来源快照 = 本次读到的已对应列（列名 → 可读值）。本模块不 commit。
 """
@@ -33,7 +44,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from services import allocation, clock, feishu_connections, feishu_fields, orders
+from services import allocation, clock, feishu_connections, feishu_fields, normalize, orders
 from services.errors import DomainError, conflict, validation
 from services.models import SourceRef, UpstreamRecord
 
@@ -43,6 +54,8 @@ STAT_KEYS = ("read", "new", "update", "unchanged", "conflict", "historical", "sk
 TRIGGERS = ("schedule", "manual")
 #: 读取记录里保留的问题行样本条数
 PROBLEM_SAMPLES = 100
+#: 「来源表里找不到买家号列」这条连接级问题在 problems 里占 upstream_order_no 的位置（控制台按「谁：结论，原因」显示）
+BUYER_COLUMNS_LABEL = "买家号列"
 _LOCK_NS = feishu_connections.INTAKE_LOCK_NS   # 同一连接同一时刻只有一次读取（写回验收也持有它）
 
 
@@ -65,17 +78,45 @@ def _normalize_one(rec: dict[str, Any], field_map: dict[str, Any], field_types: 
             f"记录内容无法解析（{type(exc).__name__}）"
 
 
+def _missing_columns_text(field_map: dict[str, Any], field_types: dict[str, int]) -> str | None:
+    """字段对应给买家号两个字段配了、而来源表里找不到的列，写成「a」、「b」；没有 → None。"""
+    missing = feishu_fields.missing_buyer_columns(field_map, field_types)
+    return "、".join(f"「{c}」" for c in missing) or None
+
+
+def buyer_columns_problem(field_map: dict[str, Any], field_types: dict[str, int]) -> str | None:
+    """输入：字段对应、来源表的列类型 → 输出：来源表里找不到买家号列时的连接级问题文案；都在（或没配）→ None。"""
+    cols = _missing_columns_text(field_map, field_types)
+    if cols is None:
+        return None
+    return f"来源表里找不到买家号列{cols}，这一列的指定保持上次读到的内容，新记录暂不接收"
+
+
+def new_record_hold_reason(field_map: dict[str, Any], field_types: dict[str, int]) -> str | None:
+    """输入：字段对应、来源表的列类型 → 输出：来源表里找不到买家号列时，不为**新记录**建任务的原因；都在（或没配）→ None。
+    只对没有可信 AMZ 订单号的新记录用（evaluate_records）：读不出它有没有指定买家号，建了任务就会落进自动分配。"""
+    cols = _missing_columns_text(field_map, field_types)
+    if cols is None:
+        return None
+    return (f"来源表里找不到买家号列{cols}，读不出这一行有没有指定买家号，暂不接收；"
+            "恢复这一列或改字段对应后会自动接收")
+
+
 def evaluate_records(conn, workspace_id: int, connection_id: int, records: list[dict[str, Any]],
                      field_map: dict[str, Any], field_types: dict[str, int], admission: dict[str, Any], *,
-                     dry_run: bool, skip_record_ids: set[str] | frozenset[str] | None = None) -> list[dict[str, Any]]:
+                     dry_run: bool, skip_record_ids: set[str] | frozenset[str] | None = None,
+                     ) -> list[dict[str, Any]]:
     """输入：工作区、连接 id（预览可为占位 id）、records/search 的记录 [{record_id, fields}]、字段对应、列类型、准入规则、
-    是否只预演、要跳过的记录 id（写回验收测试记录）→ 输出：每条记录一个
-    {record_id, upstream_order_no, verdict, reason, record, issues, status, order_id}。
+    是否只预演、要跳过的记录 id（写回验收测试记录）
+    → 输出：每条记录一个 {record_id, upstream_order_no, verdict, reason, record, issues, status, order_id}。
 
     verdict 取 new / update / unchanged / conflict / historical / skipped / invalid。dry_run=True 时不写库。
     每条记录的规范化与 ingest 各自兜底：任何异常只让这一条成为 invalid（写明原因），其余照常。
+    买家号两列这次读没读到按字段对应与列类型现算（见模块说明），正式读取与样本预览用的是同一份。
     """
     skip_ids = set(skip_record_ids or ())
+    buyer_unread = feishu_fields.unread_buyer_keys(field_map, field_types)
+    hold_new = new_record_hold_reason(field_map, field_types)
     normalized = [_normalize_one(rec, field_map, field_types, admission) for rec in records]
     items: list[tuple[dict[str, Any], UpstreamRecord]] = [(rec, n[0]) for rec, n in zip(records, normalized)]
     broken = {i: n[1] for i, n in enumerate(normalized) if n[1]}
@@ -129,20 +170,23 @@ def evaluate_records(conn, workspace_id: int, connection_id: int, records: list[
             continue
         if key not in known_keys and rid not in linked:
             skip = feishu_connections.new_record_skip_reason(r, admission)
+            if not skip and hold_new and not normalize.amazon_order_no_ok(r.external_amz_order_no):
+                skip = hold_new         # 找不到买家号列：读不出这一行的指定，不建会被自动分配的任务
             if skip:
                 out.append({**base, "verdict": "skipped", "reason": skip})
                 continue
         snapshot = feishu_fields.snapshot_fields(rec.get("fields") or {}, field_types)
         link = links.get(rid)
+        src = SourceRef(kind="feishu", snapshot=snapshot, connection_id=connection_id, record_id=rid,
+                        buyer_unread=buyer_unread)
         if (not dry_run and link is not None and link["upstream_order_no"] == key
-                and link["normalized"] == r.to_json()):
-            # 与上次读到的规范化记录完全相同：ingest 的结论必然是 unchanged。直接记 last_seen_at，
-            # 不再逐条锁任务行（大表定时读取时不挡插件领取）。
+                and link["normalized"] == orders.link_normalized(r, src, link)):
+            # 与上次读到的规范化记录完全相同（没读到的买家号字段按上次读到的算）：ingest 的结论必然是
+            # unchanged。直接记 last_seen_at，不再逐条锁任务行（大表定时读取时不挡插件领取）。
             seen_unchanged.append((Jsonb(snapshot), clock.now(), link["id"], workspace_id))
             out.append({**base, "verdict": "unchanged", "reason": None, "status": link["status"],
                         "order_id": link["purchase_order_id"]})
             continue
-        src = SourceRef(kind="feishu", snapshot=snapshot, connection_id=connection_id, record_id=rid)
         try:
             with conn.transaction():
                 outcome = orders.ingest(conn, workspace_id, r, src, dry_run=dry_run, admission=admission)
@@ -215,6 +259,8 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
 
     admission = feishu_connections.clean_admission(row["admission"])
     skip = {row["writeback_test_record"]} if row.get("writeback_test_record") else set()
+    buyer_problem = buyer_columns_problem(field_map, types)
+    allocation.lock_workspace(conn, workspace_id)       # 飞书已读完才取：分配锁先于任务行（契约 §3.2），不占着锁等网络
     try:
         with conn.transaction():
             results = evaluate_records(conn, workspace_id, cid, records, field_map, types, admission, dry_run=False,
@@ -226,6 +272,11 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
         raise DomainError("INTERNAL", msg, 500, {"run_id": run_id, "connection_id": cid}) from exc
     stats = empty_stats()
     problems: list[dict[str, Any]] = []
+    if buyer_problem is not None:
+        # 没读到不等于清空：找不到的那一列这次没有动任何任务的指定、新记录暂不接收，要让所有者看到
+        problems.append({"record_id": None, "upstream_order_no": BUYER_COLUMNS_LABEL, "verdict": "skipped",
+                         "reason": buyer_problem, "scope": "connection"})
+    connection_problems = list(problems)        # 连接级问题：另带在连接的 last_stats 里（连接卡片提示用）
     for r in results:
         stats["read"] += 1
         stats[r["verdict"]] += 1
@@ -235,9 +286,10 @@ def run_connection(conn, workspace_id: int, connection_id: int, *, trigger: str,
     now = clock.now()
     conn.execute("UPDATE procure.feishu_sync_runs SET finished_at = %s, ok = true, stats = %s WHERE id = %s "
                  "AND workspace_id = %s", (now, Jsonb({**stats, "problems": problems}), run_id, workspace_id))
+    last_stats = {**stats, "problems": connection_problems} if connection_problems else stats
     conn.execute("UPDATE procure.feishu_connections SET last_sync_at = %s, last_sync_ok_at = %s, last_error = NULL, "
                  "last_stats = %s WHERE id = %s AND workspace_id = %s",
-                 (now, now, Jsonb(stats), cid, workspace_id))
+                 (now, now, Jsonb(last_stats), cid, workspace_id))
     alloc = None
     if stats["new"] or stats["update"] or stats["conflict"] or stats["historical"]:
         alloc = allocation.allocate(conn, workspace_id, trigger="intake")

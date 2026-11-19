@@ -162,6 +162,32 @@ def test_suggest_field_map_loose_and_missing():
                    "recipient_name": "收件人", "external_buyer_customer_id": "买家号ID"}
 
 
+def test_unread_buyer_keys_is_per_field_and_missing_columns_only_lists_what_was_mapped():
+    """买家号两个字段读没读到按列判断：没配列、或配的任一候选列（含回退列）在来源表里找不到 → 这个字段没读到；
+    另一个字段不受影响。missing_buyer_columns 只列「配了却找不到」的列名（给提示用），没配列的不算。"""
+    types = {"平台订单号": 1, "买家号": 1, "买家号1": 1, "买家号id": 1}
+    k_name, k_id = ff.BUYER_FIELD_KEYS
+    assert (k_name, k_id) == ("external_buyer_account", "external_buyer_customer_id")
+    both = {"upstream_order_no": "平台订单号", k_name: ["买家号", "买家号1"], k_id: "买家号id"}
+    assert ff.unread_buyer_keys(both, types) == () and ff.missing_buyer_columns(both, types) == []
+
+    no_id_col = {c: t for c, t in types.items() if c != "买家号id"}               # 「买家号id」被改名或删除
+    assert ff.unread_buyer_keys(both, no_id_col) == (k_id,)                       # 「买家号」照常读得到
+    assert ff.missing_buyer_columns(both, no_id_col) == ["买家号id"]
+    no_fallback = {c: t for c, t in types.items() if c != "买家号1"}              # 只少了回退列
+    assert ff.unread_buyer_keys(both, no_fallback) == (k_name,)
+    assert ff.missing_buyer_columns(both, no_fallback) == ["买家号1"]
+    assert ff.unread_buyer_keys(both, {"平台订单号": 1}) == (k_name, k_id)
+    assert ff.missing_buyer_columns(both, {"平台订单号": 1}) == ["买家号", "买家号1", "买家号id"]
+
+    name_only = {"upstream_order_no": "平台订单号", k_name: "买家号"}              # 所有者没给「买家号 ID」配列
+    assert ff.unread_buyer_keys(name_only, types) == (k_id,) and ff.missing_buyer_columns(name_only, types) == []
+    assert ff.unread_buyer_keys({k_name: "", k_id: None}, types) == (k_name, k_id)
+    neither = {"upstream_order_no": "平台订单号"}
+    assert ff.unread_buyer_keys(neither, types) == (k_name, k_id) and ff.missing_buyer_columns(neither, types) == []
+    assert not hasattr(ff, "buyer_columns_readable")                              # 「两列一起算」的旧判断已经去掉
+
+
 def test_used_columns(headers):
     cols = ff.used_columns(ff.DEFAULT_FIELD_MAP)
     assert cols[0] == "平台订单号" and "来源码" in cols and "数量1" in cols

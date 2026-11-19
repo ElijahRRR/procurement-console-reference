@@ -25,7 +25,7 @@ def _frozen(clean_db):
 
 def _env(conn, workspace, **kw):
     acc = fx.exec_account(conn, workspace["id"], **kw)
-    dev = fx.paired_device(conn, workspace, account=acc)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
     return acc, dev
 
 
@@ -44,7 +44,7 @@ def test_reset_restores_orders_and_resumes_account_paused_by_simulated_unknown(c
     # ② 护栏拦截 → 异常
     b = fx.claim(conn, dev, run_id)
     execution.submit_guard(conn, dev, b["attempt_id"],
-                           fx.good_facts(fx.order_row(conn, blocked["id"]), total="99.00"))
+                           fx.facts_for(conn, fx.order_row(conn, blocked["id"]), total="99.00"))
     # ③ 页面错误一次 → 已分配（重试计数 1）
     c = fx.claim(conn, dev, run_id)
     execution.report_result(conn, dev, c["attempt_id"], fx.failure_payload("PAGE_LOAD_FAILED"))

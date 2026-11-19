@@ -1,17 +1,23 @@
-"""插件设备：配对码（一次性、过期）、令牌认证、心跳形状、身份比对、设备列表与改绑、撤销（契约 §5.1–5.3、§10）。"""
+"""浏览器（devices 行）：自动登记（幂等、并发、多工作区、上限、版本闸）、令牌认证、身份清洗、登录状态全集与解析、
+心跳形状、列表 / 改名 / 移除与自动恢复（契约 §5、§10）。全部数据虚构。"""
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from services import accounts, clock, devices, execution
+from registry import db, settings
+from services import accounts, clock, devices, execution, overview
 from services.errors import DomainError
 from tests import factories as f
 from tests import factories_exec as fx
 
 NOW = datetime(2026, 10, 31, 2, 0, tzinfo=timezone.utc)   # 北京 2026-10-31 10:00
+TOKEN = "DEMO-device-token-AAAAAAAAAAAAAAAAAAAAAAAAA"      # 43 个字符，虚构
 
 
 @pytest.fixture(autouse=True)
@@ -26,251 +32,746 @@ def _events(conn, entity_id, kind):
                         "ORDER BY id", (entity_id, kind)).fetchall()
 
 
-# ── 配对 ──────────────────────────────────────────────────────────────────────
-
-
-def test_pairing_code_shape_hash_only_and_ttl(conn, workspace):
-    out = devices.create_pairing_code(conn, workspace["id"], workspace["user_id"])
-    code = out["code"]
-    assert len(code) == 8 and all(ch in devices.PAIRING_ALPHABET for ch in code)
-    assert not set(code) & set("0O1IL")
-    assert datetime.fromisoformat(out["expires_at"]) == NOW + timedelta(minutes=10)
-    row = conn.execute("SELECT * FROM procure.device_pairings").fetchone()
-    assert row["code_hash"] != code and len(row["code_hash"]) == 64 and row["created_by"] == workspace["user_id"]
-
-
-def test_pair_returns_token_and_workspace_and_code_is_one_time(conn, workspace):
-    code = devices.create_pairing_code(conn, workspace["id"], workspace["user_id"])["code"]
-    out = devices.pair(conn, code.lower()[:4] + "-" + code[4:], device_name="Mac-AdsPower-DEMO", browser="AdsPower",
-                       ext_version="0.1.0", user_agent="DEMO-UA")
-    assert set(out) == {"device_id", "device_token", "workspace_name"}
-    assert out["workspace_name"] == "测试工作区" and len(out["device_token"]) >= 40
-    dev = devices.authenticate(conn, out["device_token"])
-    assert dev["id"] == out["device_id"] and dev["workspace_id"] == workspace["id"]
-    assert dev["browser"] == "adspower" and dev["token_hash"] != out["device_token"]
-    assert dev["identity_status"] == "unknown" and dev["last_seen_at"] == NOW
+def _err(fn, *a, **kw) -> DomainError:
     with pytest.raises(DomainError) as e:
-        devices.pair(conn, code, device_name="第二台", browser="chrome", ext_version="0.1.0")
-    assert e.value.code == "VALIDATION" and e.value.message == "配对码无效或已过期"
+        fn(*a, **kw)
+    return e.value
+
+
+def _setting(monkeypatch, **over):
+    monkeypatch.setattr(settings, "_loaded", dataclasses.replace(settings.get(), **over))
+
+
+# ── 登记 ──────────────────────────────────────────────────────────────────────
+
+
+def test_register_creates_browser_without_any_manual_step(conn, workspace):
+    out = devices.register(conn, TOKEN, ext_version="0.2.0", user_agent="DEMO-UA " + "x" * 400)
+    assert set(out) == {"device_id", "device_name", "workspace_id", "workspace_name", "created"}
+    assert out["created"] is True and out["workspace_id"] == workspace["id"] and out["workspace_name"] == "测试工作区"
+    assert out["device_name"] == f"浏览器 {out['device_id']}"
+    row = conn.execute("SELECT * FROM procure.devices WHERE id = %s", (out["device_id"],)).fetchone()
+    assert row["token_hash"] != TOKEN and len(row["token_hash"]) == 64          # 库里只存 sha256
+    assert row["name"] == out["device_name"] and row["ext_version"] == "0.2.0" and row["last_seen_at"] == NOW
+    assert row["identity"] is None and row["login_customer_id"] is None and row["hidden_at"] is None
+    assert row["browser"] is None                                              # 历史列，不再写入
+    ev = _events(conn, out["device_id"], "device.registered")
+    assert len(ev) == 1 and ev[0]["actor_kind"] == "device" and ev[0]["actor_id"] == out["device_id"]
+    assert ev[0]["detail"]["ext_version"] == "0.2.0" and len(ev[0]["detail"]["user_agent"]) == 200
+    assert devices.authenticate(conn, TOKEN)["id"] == out["device_id"]
+
+
+@pytest.mark.parametrize("token", ["", "short", "a" * 31, "a" * 129, "has space " + "a" * 32, "bad/char+" + "a" * 32,
+                                   "中文" + "a" * 32, "a" * 40 + "\n", " " + "a" * 40, None,
+                                   12345678901234567890123456789012, ["a" * 40]])
+def test_register_rejects_malformed_token(conn, workspace, token):
+    e = _err(devices.register, conn, token)
+    assert e.code == "VALIDATION" and e.http_status == 422 and e.detail["field"] == "device_token"
+    assert f.count(conn, "devices") == 0
+
+
+@pytest.mark.parametrize("token", ["a" * 32, "A-b_9" * 8, "z" * 128])
+def test_register_accepts_token_shapes(conn, workspace, token):
+    assert devices.register(conn, token)["created"] is True
+
+
+def test_register_is_idempotent_and_restores_removed_browser(conn, workspace):
+    ws = workspace["id"]
+    first = devices.register(conn, TOKEN, ext_version="0.2.0")
+    devices.remove_device(conn, ws, first["device_id"], workspace["user_id"])
+    clock.freeze(NOW + timedelta(minutes=5))
+    again = devices.register(conn, TOKEN, ext_version="0.2.1", workspace_id=987654)   # 已登记：不看 workspace_id
+    assert again == {**first, "created": False}
+    assert f.count(conn, "devices") == 1 and len(_events(conn, first["device_id"], "device.registered")) == 1
+    row = devices.authenticate(conn, TOKEN)
+    assert row["last_seen_at"] == NOW + timedelta(minutes=5) and row["ext_version"] == "0.2.1"
+    assert row["hidden_at"] is None
+    ev = _events(conn, first["device_id"], "device.ext_version_changed")
+    assert [e["detail"] for e in ev] == [{"from": "0.2.0", "to": "0.2.1"}]
+    # 改过的名字不会被重新登记冲掉
+    devices.update_device(conn, ws, first["device_id"], name="AdsPower-DEMO-7", actor_user_id=workspace["user_id"])
+    assert devices.register(conn, TOKEN)["device_name"] == "AdsPower-DEMO-7"
+
+
+def test_concurrent_register_of_same_token_creates_one_row(clean_db, conn, workspace):
+    conn.commit()
+    n = 6
+    barrier = threading.Barrier(n)
+    results: list = [None] * n
+
+    def worker(i):
+        try:
+            with db.pg_conn(clean_db, statement_timeout_s=20) as c:
+                barrier.wait(timeout=10)
+                results[i] = devices.register(c, TOKEN, ext_version="0.2.0", user_agent=f"DEMO-UA-{i}")
+        except Exception as exc:  # noqa: BLE001 - 带回主线程断言
+            results[i] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(isinstance(r, dict) for r in results), results
+    assert len({r["device_id"] for r in results}) == 1
+    assert sum(r["created"] for r in results) == 1
     assert f.count(conn, "devices") == 1
-    assert _events(conn, dev["id"], "device.paired")
+    assert f.count(conn, "events", "kind = 'device.registered'") == 1
 
 
-def test_pair_code_expires_after_ttl(conn, workspace):
-    code = devices.create_pairing_code(conn, workspace["id"], workspace["user_id"])["code"]
-    clock.freeze(NOW + timedelta(minutes=10))
-    with pytest.raises(DomainError) as e:
-        devices.pair(conn, code, device_name="Mac-DEMO", browser="chrome", ext_version="0.1.0")
-    assert e.value.code == "VALIDATION" and e.value.message == "配对码无效或已过期"
-    clock.freeze(NOW + timedelta(minutes=9, seconds=59))
-    assert devices.pair(conn, code, device_name="Mac-DEMO", browser="chrome", ext_version="0.1.0")["device_id"]
+def test_register_needs_initialised_server(conn):
+    e = _err(devices.register, conn, TOKEN)
+    assert e.code == "CONFLICT" and e.http_status == 409
+    assert e.message == "服务端还没有初始化：请先打开控制台创建用户"
 
 
-@pytest.mark.parametrize("code", ["", "ABC", "ZZZZZZZZ", None, 12345678])
-def test_pair_unknown_or_malformed_code(conn, workspace, code):
-    devices.create_pairing_code(conn, workspace["id"], workspace["user_id"])
-    with pytest.raises(DomainError) as e:
-        devices.pair(conn, code, device_name="Mac-DEMO", browser="chrome", ext_version="0.1.0")
-    assert e.value.code == "VALIDATION"
+def test_register_single_workspace_ignores_workspace_id(conn, workspace):
+    assert devices.register(conn, TOKEN, workspace_id=424242)["workspace_id"] == workspace["id"]
 
 
-def test_pair_requires_name_without_consuming_code(conn, workspace):
-    code = devices.create_pairing_code(conn, workspace["id"], workspace["user_id"])["code"]
-    with pytest.raises(DomainError) as e:
-        devices.pair(conn, code, device_name="  ", browser="chrome", ext_version="0.1.0")
-    assert e.value.code == "VALIDATION" and e.value.detail["field"] == "name"
-    assert devices.pair(conn, code, device_name="Mac-DEMO", browser="weird", ext_version="0.1.0")["device_id"]
-    assert conn.execute("SELECT browser FROM procure.devices").fetchone()["browser"] == "other"
+def test_register_with_several_workspaces_requires_existing_workspace_id(conn, workspace):
+    other = f.make_workspace(conn, "DEMO 工作区 B")
+    for bad in (None, "", "abc", 999999, True, -1, 2 ** 70):
+        e = _err(devices.register, conn, TOKEN, workspace_id=bad)
+        assert e.code == "WORKSPACE_REQUIRED" and e.http_status == 409, bad
+        assert "工作区 ID" in e.message and "设置" in e.message
+    assert f.count(conn, "devices") == 0
+    out = devices.register(conn, TOKEN, workspace_id=str(other["id"]))
+    assert out["workspace_id"] == other["id"] and out["workspace_name"] == "DEMO 工作区 B"
+    mine = devices.register(conn, fx.device_token(), workspace_id=workspace["id"])
+    assert mine["workspace_id"] == workspace["id"]
+    # 工作区登记时确定，之后不变：换一个 workspace_id 再登记同一个令牌，还是原来那一行
+    assert devices.register(conn, TOKEN, workspace_id=workspace["id"])["workspace_id"] == other["id"]
+    assert [d["id"] for d in devices.list_devices(conn, other["id"])] == [out["device_id"]]
+    assert [d["id"] for d in devices.list_devices(conn, workspace["id"])] == [mine["device_id"]]
 
 
-def test_authenticate_unknown_empty_and_revoked(conn, workspace):
-    dev = fx.paired_device(conn, workspace)
+def test_register_refuses_beyond_max_devices_per_workspace(conn, workspace, monkeypatch):
+    _setting(monkeypatch, max_devices=2)
+    other = f.make_workspace(conn)
+    first = fx.device_token()
+    devices.register(conn, first, workspace_id=workspace["id"])
+    devices.register(conn, fx.device_token(), workspace_id=workspace["id"])
+    e = _err(devices.register, conn, TOKEN, workspace_id=workspace["id"])
+    assert e.code == "RATE_LIMITED" and e.http_status == 429 and e.detail == {}
+    # 说明里写的是所有者能做的事；「请稍后再试」是错的——等多久名额都不会自己空出来
+    assert e.message == devices.MAX_DEVICES_MESSAGE == \
+        "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES"
+    assert f.count(conn, "devices", "workspace_id = %s", (workspace["id"],)) == 2            # 被拒绝的没有留下行
+    assert devices.register(conn, first, workspace_id=workspace["id"])["created"] is False   # 已登记的不受影响
+    assert devices.register(conn, TOKEN, workspace_id=other["id"])["created"] is True        # 别的工作区另算
+    assert settings.get().max_devices == 2
+
+
+def test_concurrent_new_registrations_never_exceed_max_devices(clean_db, conn, workspace, monkeypatch):
+    """名额只剩一个时新浏览器同时登记：第一个还没提交，后来的排队等它；它提交后，另一个新令牌数到上限 → 429，
+    同一个令牌的并发重试认出已登记的那一行（created=false，不查上限）。以前后来的看不到第一个没提交的行、也数到
+    max−1，两个都插进去，工作区里比上限多出一行。"""
+    ws = workspace["id"]
+    _setting(monkeypatch, max_devices=2)
+    fx.registered_device(conn, workspace)
+    conn.commit()
+    tokens = {"other": fx.device_token(), "same": TOKEN}
+    results: dict = {}
+
+    def late(key):
+        try:
+            with db.pg_conn(clean_db, statement_timeout_s=20) as c:
+                results[key] = devices.register(c, tokens[key])
+        except Exception as exc:  # noqa: BLE001 - 带回主线程断言
+            results[key] = exc
+
+    with db.pg_conn(clean_db, statement_timeout_s=20) as first:
+        mine = devices.register(first, TOKEN)                                    # 占住最后一个名额，还没提交
+        assert mine["created"] is True
+        threads = {k: threading.Thread(target=late, args=(k,)) for k in tokens}
+        for t in threads.values():
+            t.start()
+        for t in threads.values():
+            t.join(timeout=1.0)
+        assert all(t.is_alive() for t in threads.values()), results              # 都排在第一个后面
+    for t in threads.values():
+        t.join(timeout=20)
+    assert isinstance(results["other"], DomainError), results
+    assert results["other"].code == "RATE_LIMITED" and results["other"].message == devices.MAX_DEVICES_MESSAGE
+    assert results["same"] == {**mine, "created": False}
+    assert f.count(conn, "devices", "workspace_id = %s", (ws,)) == 2
+    assert f.count(conn, "events", "kind = 'device.registered'") == 2
+
+
+def test_removing_a_browser_frees_a_slot_and_its_return_is_not_capped(conn, workspace, monkeypatch):
+    """上限只数没有被移除的浏览器：名额满了，所有者在控制台移除一个，马上就能再登记一个（不靠清扫删行，也不用改
+    配置）。被移除的浏览器再联系时回到列表、不查上限，所以显示出来的可以比上限多出回来的那几个；新令牌照样被拒绝。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    _setting(monkeypatch, max_devices=2)
+    keep = fx.registered_device(conn, workspace)
+    gone = fx.registered_device(conn, workspace)
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    devices.remove_device(conn, ws, gone["id"], uid)
+    assert [d["id"] for d in devices.list_devices(conn, ws)] == [keep["id"]]
+    assert execution.sweep(conn)["removed_devices"] == []                        # 行还在，只是不再占名额
+    new = devices.register(conn, TOKEN)
+    assert new["created"] is True
+    e = _err(devices.register, conn, fx.device_token())                          # 又满了
+    assert e.code == "RATE_LIMITED" and "稍后再试" not in e.message
+    # 被移除的那个再联系（心跳 / 登记都一样）：回到列表，不查上限
+    clock.freeze(NOW + timedelta(minutes=1))
+    assert devices.heartbeat(conn, gone)["device"]["id"] == gone["id"]
+    assert devices.register(conn, gone["token"])["created"] is False
+    assert sorted(d["id"] for d in devices.list_devices(conn, ws)) == sorted([keep["id"], gone["id"],
+                                                                              new["device_id"]])
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 再移除两个才低于上限
+    devices.remove_device(conn, ws, gone["id"], uid)
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    devices.remove_device(conn, ws, keep["id"], uid)
+    assert devices.register(conn, fx.device_token())["created"] is True
+
+
+def test_max_devices_ignores_browsers_not_seen_within_retention(conn, workspace, monkeypatch):
+    """换了令牌留下的旧行过了保留期（PC_DEVICE_RETENTION_DAYS 天没有联系）就不再占名额。执行过批次的旧行清扫不会删
+    （留给历史记录显示名称），以前它们永远占着名额：攒到上限后谁也登记不进来，而且等多久都没用。"""
+    ws = workspace["id"]
+    _setting(monkeypatch, max_devices=2)
+    days = settings.get().device_retention_days
+    acc = fx.exec_account(conn, ws)
+    stale = []
+    for i, hidden_at in enumerate((None, NOW)):
+        d = f.make_device(conn, ws, name=f"旧环境-DEMO-{i}", last_seen_at=NOW - timedelta(days=days + 1),
+                          hidden_at=hidden_at)
+        run = f.make_run(conn, ws, acc["id"], d["id"])
+        conn.execute("UPDATE procure.execution_runs SET ended_at = %s, end_reason = 'finished' WHERE id = %s",
+                     (NOW - timedelta(days=days + 1), run["id"]))
+        stale.append(d)
+    assert execution.sweep(conn)["removed_devices"] == []                        # 有批次的行留作历史
+    assert f.count(conn, "devices", "workspace_id = %s", (ws,)) == 2
+    first = devices.register(conn, TOKEN)
+    assert first["created"] is True                                              # 旧行不占名额
+    edge = f.make_device(conn, ws, name="正好 30 天", last_seen_at=NOW - timedelta(days=days))
+    assert devices.retention_cutoff(NOW) == NOW - timedelta(days=days)
+    e = _err(devices.register, conn, fx.device_token())                          # 刚登记的 + 正好在保留期边上的 = 2
+    assert e.code == "RATE_LIMITED" and e.http_status == 429 and e.message == devices.MAX_DEVICES_MESSAGE
+    clock.freeze(NOW + timedelta(seconds=1))                                     # 边上的那个过了保留期
+    assert devices.register(conn, fx.device_token())["created"] is True
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 从未联系过的按登记时间算
+    conn.execute("UPDATE procure.devices SET last_seen_at = NULL, created_at = %s WHERE id = %s",
+                 (NOW - timedelta(days=days + 5), first["device_id"]))
+    assert devices.register(conn, fx.device_token())["created"] is True
+    # 旧环境回来了：照常认它（不查上限），之后又算在用
+    row = devices.heartbeat(conn, {"id": stale[0]["id"], "workspace_id": ws})
+    assert row["device"]["id"] == stale[0]["id"]
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 清扫用的是同一个截止时刻：不再占名额的行里，没有历史的被删掉，有批次的留着
+    assert execution.sweep(conn)["removed_devices"] == sorted([edge["id"], first["device_id"]])
+    assert f.count(conn, "devices", "id = %s", (stale[1]["id"],)) == 1
+
+
+def test_default_limits_come_from_registry():
+    s = settings.get()
+    assert s.max_devices == 500 and s.device_retention_days == 30 and s.plugin_extension_ids == ()
+    assert not hasattr(s, "pairing_ttl_s") and not hasattr(s, "pair_fail_limit")
+
+
+@pytest.mark.parametrize("version", ["0.1.0", "0.1.9", "0.1", "0", "0.1.99.99"])
+def test_version_gate_blocks_outdated_plugin_on_register_and_heartbeat(conn, workspace, version):
+    e = _err(devices.register, conn, TOKEN, ext_version=version)
+    assert e.code == "PLUGIN_OUTDATED" and e.http_status == 409
+    assert e.message == "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）"
+    assert f.count(conn, "devices") == 0
+    dev = fx.registered_device(conn, workspace)
+    clock.freeze(NOW + timedelta(minutes=1))
+    for call in (lambda: devices.heartbeat(conn, dev, ext_version=version),
+                 lambda: devices.report_identity(conn, dev, fx.identity("A1DEMO00000"), ext_version=version)):
+        assert _err(call).code == "PLUGIN_OUTDATED"
+    row = devices.authenticate(conn, dev["token"])
+    assert row["last_seen_at"] == NOW and row["ext_version"] == "0.2.0" and row["identity"] is None
+
+
+@pytest.mark.parametrize("version", ["0.2.0", "0.2", "0.10.0", "1.0.0.5", None, "", "dev-build", "0.2.0-beta", 2])
+def test_version_gate_lets_current_missing_and_unparsable_versions_through(conn, workspace, version):
+    dev = fx.registered_device(conn, workspace)
+    assert devices.heartbeat(conn, dev, ext_version=version)["device"]["id"] == dev["id"]
+    assert devices.register(conn, dev["token"], ext_version=version)["created"] is False
+
+
+def test_authenticate_and_require_active(conn, workspace):
+    dev = fx.registered_device(conn, workspace)
     assert devices.authenticate(conn, dev["token"])["id"] == dev["id"]
     assert devices.authenticate(conn, "no-such-token") is None
     assert devices.authenticate(conn, "") is None and devices.authenticate(conn, None) is None
-    devices.revoke(conn, workspace["id"], dev["id"], workspace["user_id"])
+    assert devices.require_active(conn, dev)["id"] == dev["id"]
+    assert devices.require_active(conn, dev, lock=True)["id"] == dev["id"]
+    # 被移除的浏览器照样能认证（移除只清列表，不动令牌）
+    devices.remove_device(conn, workspace["id"], dev["id"], workspace["user_id"])
+    assert devices.authenticate(conn, dev["token"])["id"] == dev["id"]
+    # 行被清扫删掉之后：按「还没有登记」处理，插件会用同一个令牌重新登记
+    conn.execute("DELETE FROM procure.devices WHERE id = %s", (dev["id"],))
+    e = _err(devices.heartbeat, conn, dev)
+    assert e.code == "UNAUTHORIZED" and e.http_status == 401
+    assert e.message == devices.UNREGISTERED_MESSAGE == "这个浏览器还没有登记，插件会自动重新登记"
     assert devices.authenticate(conn, dev["token"]) is None
+    assert not any(hasattr(devices, name) for name in ("create_pairing_code", "pair", "revoke",
+                                                       "compute_identity_status", "effective_identity_status"))
+
+
+# ── 身份清洗 ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("A1DEMO00000", "A1DEMO00000"), ("  a1demo00000 ", "A1DEMO00000"), ("A1DEMO 000\t00", "A1DEMO00000"),
+    (None, None), ("", None), ("   ", None), ("not-an-id", None), ("B1DEMO00000", None), ("A1234567", None),
+    ("A1DEMO-0000", None), ("A" + "9" * 64, None), (12345678901, None), (["A1DEMO00000"], None),
+    ({"id": "A1DEMO00000"}, None), (True, None),
+])
+def test_clean_identity_customer_id_never_raises(raw, clean):
+    out = devices.clean_identity({"signed_in": True, "customer_id": raw, "site": "US", "page_url": None})
+    assert out["customer_id"] == clean
+    assert devices.login_customer_id(out) == clean
+
+
+def test_clean_identity_shape_flags_and_page_url():
+    out = devices.clean_identity({"signed_in": True, "customer_id": "A1DEMO00000", "site": "US-EAST-LONG",
+                                  "page_url": "https://www.amazon.com/gp/buy/spc?session=SECRET&x=1#frag",
+                                  "conflict": 1, "cookies": "never stored", "account_name": "Demo"})
+    assert out == {"signed_in": True, "customer_id": "A1DEMO00000", "site": "US-EAST-", "conflict": True,
+                   "page_url": "https://www.amazon.com/gp/buy/spc"}
+    assert devices.login_customer_id(out) is None                    # 有分歧时不能拿它领任务
+    assert devices.clean_identity({"signed_in": "true", "customer_id": "A1DEMO00000"})["signed_in"] is False
+    assert devices.clean_identity({})  == {"signed_in": False, "customer_id": None, "site": None, "page_url": None,
+                                           "conflict": False}
+    assert devices.clean_identity({"page_url": "/gp/css?x=1#y"})["page_url"] is None     # 没有主机：不存
+    assert devices.login_customer_id({"signed_in": False, "customer_id": "A1DEMO00000", "conflict": False}) is None
+    assert devices.login_customer_id(None) is None
+    for bad in ("signed in", None, ["x"], 5):
+        with pytest.raises(DomainError) as e:
+            devices.clean_identity(bad)
+        assert e.value.code == "VALIDATION"
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("https://www.amazon.com/gp/css/order-history", "https://www.amazon.com/gp/css/order-history"),
+    ("HTTPS://WWW.Amazon.COM:8443/Gp/Buy?x=1#y", "https://www.amazon.com:8443/Gp/Buy"),
+    ("http://www.amazon.com", "http://www.amazon.com"),
+    ("https://www.amazon.com/?ref=DEMO", "https://www.amazon.com/"),
+    # 用户名密码不存
+    ("https://demo-user:demo-pass@www.amazon.com/p?q=1", "https://www.amazon.com/p"),
+    ("https://demo-user@www.amazon.com:443/p", "https://www.amazon.com:443/p"),
+    ("http://[::1]:8790/a/b?x", "http://[::1]:8790/a/b"),
+    # IP 字面量的方括号原样拼回（IPvFuture 里没有冒号，也不能丢掉方括号变成一个主机名）
+    ("http://[v1.fe]/x?y", "http://[v1.fe]/x"), ("https://demo@[V1.FE]:8443/x", "https://[v1.fe]:8443/x"),
+    # 别的协议、没有主机、不是地址：当作没有
+    ("javascript:alert(1)", None), ("chrome-extension://abcdefghijklmnop/popup.html", None),
+    ("file:///etc/hosts", None), ("data:text/html,demo", None), ("about:blank", None), ("ftp://demo.example/x", None),
+    ("//www.amazon.com/gp/css", None), ("www.amazon.com/gp/css?x=1", None), ("https:///gp/css", None),
+    ("https://", None), ("", None), ("   ", None), (None, None), (5, None), (["https://www.amazon.com/"], None),
+    ({"href": "https://www.amazon.com/"}, None),
+    # 解析不了的（urlsplit 抛 ValueError）：当作没有，不是 500，也不退回去存原文
+    ("http://[::1", None), ("https://[amazon]/gp/css/order-history?session=DEMO", None),
+    ("https://www.amazon.com]/x", None), ("//[x/y", None), ("https://[zz]/x", None),
+    ("https://www.amazon.com:demo/x", None), ("https://www.amazon.com:99999/x", None),
+    # PostgreSQL 存不了的字符先去掉
+    ("https://www.amazon.com/a\x00b", "https://www.amazon.com/ab"),
+    ("https://www.amazon.com/a\ud800b?x=\udfff", "https://www.amazon.com/ab"),
+])
+def test_clean_identity_page_url_keeps_only_http_origin_and_path(raw, clean):
+    out = devices.clean_identity({"signed_in": True, "customer_id": "A1DEMO00000", "page_url": raw})
+    assert out["page_url"] == clean
+    assert out["customer_id"] == "A1DEMO00000" and out["signed_in"] is True      # 坏地址不连累别的字段
+
+
+def test_clean_identity_page_url_is_capped_at_500_chars():
+    out = devices.clean_identity({"page_url": "https://www.amazon.com/" + "a" * 3000})
+    assert len(out["page_url"]) == 500 and out["page_url"].startswith("https://www.amazon.com/aaa")
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("US\x00", "US"), ("\x00", None), ("U\x00S", "US"), ("\ud800", None), ("U\udc00S", "US"), (" US ", "US"),
+    ("\x00" * 20 + "US-EAST-LONG", "US-EAST-"), ("美国\x00", "美国"), ("😀\x00", "😀"),
+])
+def test_clean_identity_drops_characters_postgres_cannot_store(raw, clean):
+    """NUL（text 与 jsonb 都不收）与不成对的代理项（编不成 UTF-8）在入库前去掉；别的字符（含表情）原样保留。"""
+    assert devices.clean_identity({"site": raw})["site"] == clean
+    assert devices._short(raw, 8) == clean
+
+
+@pytest.mark.parametrize("field,value", [
+    ("site", "U\x00S"), ("site", "\ud800"), ("page_url", "https://www.amazon.com/a\x00b"),
+    ("page_url", "https://www.amazon.com/\ud800"), ("page_url", "http://[::1"), ("page_url", "javascript:alert(1)"),
+])
+def test_report_with_unstorable_text_is_cleaned_and_stored(conn, workspace, field, value):
+    """身份里带 NUL、不成对的代理项、解析不了的地址：照常存下（坏的部分去掉或当作没有），买家号与最近联系时间不丢。"""
+    acc = fx.exec_account(conn, workspace["id"])
+    dev = fx.registered_device(conn, workspace)
+    clock.freeze(NOW + timedelta(minutes=1))
+    out = devices.report_identity(conn, dev, {**fx.identity(acc["amazon_customer_id"]), field: value})
+    assert out["login"]["state"] == "ready" and out["login"]["customer_id"] == acc["amazon_customer_id"]
+    row = devices.authenticate(conn, dev["token"])
+    assert row["last_seen_at"] == NOW + timedelta(minutes=1)
+    stored = row["identity"][field]
+    assert stored is None or ("\x00" not in stored and "\ud800" not in stored)
+    conn.commit()                                                                # 真的写得进去
+
+
+@pytest.mark.parametrize("version", ["0.2.0\x00", "\x00", "a\x00b", "0.2.0\ud800", "\ud800"])
+def test_ext_version_and_user_agent_with_unstorable_characters_do_not_break_register_or_heartbeat(
+        conn, workspace, version):
+    clean = version.replace("\x00", "").replace("\ud800", "") or None
+    out = devices.register(conn, TOKEN, ext_version=version, user_agent="DEMO-UA\x00 \udfff尾")
+    row = devices.authenticate(conn, TOKEN)
+    assert out["created"] is True and row["ext_version"] == clean and row["user_agent"] == "DEMO-UA 尾"
+    assert _events(conn, row["id"], "device.registered")[0]["detail"] == {"ext_version": clean,
+                                                                          "user_agent": "DEMO-UA 尾"}
+    assert devices.heartbeat(conn, row, ext_version=version)["device"]["id"] == row["id"]
+    assert devices.report_identity(conn, row, fx.identity(None), ext_version=version)["login"]["state"] == "no_id"
+    assert devices.register(conn, TOKEN, ext_version=version)["created"] is False
+    assert devices.authenticate(conn, TOKEN)["ext_version"] == clean
+    assert not _events(conn, row["id"], "device.ext_version_changed")           # 清完是同一个版本，不算变化
+    conn.commit()
+
+
+@pytest.mark.parametrize("version", ["0.1.0\x00", "0.1.0\ud800", "0.\x001.0", "\udfff0.1"])
+def test_ext_version_gate_judges_the_version_that_would_be_stored(conn, workspace, version):
+    """版本里带 PostgreSQL 存不了的字符：闸门判定去掉它们之后的版本（也就是会存下来的那个）。以前原文解析不了就
+    放行，再以「0.1.0」入库；现在照样按过旧拦下，detail 里的版本也是清过的（写得进 JSON 响应）。"""
+    clean = version.replace("\x00", "").replace("\ud800", "").replace("\udfff", "")
+    for call in (lambda: devices.register(conn, TOKEN, ext_version=version),
+                 lambda: devices.check_ext_version(version)):
+        with pytest.raises(DomainError) as e:
+            call()
+        assert e.value.code == "PLUGIN_OUTDATED" and e.value.http_status == 409
+        assert e.value.detail == {"ext_version": clean, "min_ext_version": devices.MIN_EXT_VERSION}
+        json.dumps(e.value.detail, ensure_ascii=False).encode("utf-8")
+    assert devices.authenticate(conn, TOKEN) is None                            # 什么也没登记
+    dev = fx.registered_device(conn, workspace)
     with pytest.raises(DomainError) as e:
-        devices.heartbeat(conn, dev)
-    assert e.value.code == "UNAUTHORIZED" and e.value.http_status == 401
+        devices.heartbeat(conn, dev, ext_version=version)
+    assert e.value.code == "PLUGIN_OUTDATED"
+    assert devices.authenticate(conn, dev["token"])["ext_version"] == "0.2.0"    # 心跳被拦，什么也不记
 
 
-# ── 心跳与身份 ────────────────────────────────────────────────────────────────
+def test_report_with_bad_customer_id_is_stored_as_not_read(conn, workspace):
+    dev = fx.registered_device(conn, workspace)
+    out = devices.report_identity(conn, dev, fx.identity("<script>alert(1)</script>"))
+    assert out["login"] == {"state": "no_id", "customer_id": None, "at": NOW.isoformat(), "stale": False}
+    row = devices.authenticate(conn, dev["token"])
+    assert row["identity"]["customer_id"] is None and row["login_customer_id"] is None
+    assert row["identity"]["at"] == NOW.isoformat() and row["identity_at"] == NOW
+    assert _err(devices.report_identity, conn, dev, "signed in").code == "VALIDATION"
+    assert _err(devices.report_identity, conn, dev, None).code == "VALIDATION"
+
+
+# ── 登录状态与解析 ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("identity,login_id,state", [
+    (None, None, "unknown"),
+    ({}, None, "unknown"),
+    ({"signed_in": True, "customer_id": "A1DEMO00000", "conflict": True}, None, "conflict"),
+    ({"signed_in": False, "customer_id": None, "conflict": True}, None, "conflict"),
+    ({"signed_in": False, "customer_id": "A1DEMO00000", "conflict": False}, None, "signed_out"),
+    ({"signed_in": True, "customer_id": None, "conflict": False}, None, "no_id"),
+    ({"signed_in": True, "customer_id": "A1DEMO00000"}, "A1DEMO00000", "signed_in"),      # 旧库的身份没有 conflict 键
+    ({"signed_in": True, "customer_id": "A1DEMO00000", "conflict": False}, "A1DEMO00000", "signed_in"),
+])
+def test_login_state_is_a_pure_function_of_the_row(identity, login_id, state):
+    assert devices.login_state({"identity": identity, "login_customer_id": login_id}) == state
+    assert state in devices.LOGIN_STATES
+
+
+def test_plugin_states_full_set_through_heartbeat(conn, workspace):
+    """插件侧状态全集：unknown | signed_out | no_id | conflict | unregistered | ignored | ready。"""
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws, name="环境-DEMO-A")
+    cid = acc["amazon_customer_id"]
+    dev = fx.registered_device(conn, workspace)
+    seen = [devices.heartbeat(conn, dev)["login"]]
+    assert seen[0] == {"state": "unknown", "customer_id": None, "at": None, "stale": False}
+    stranger = fx.customer_id(777_001)
+    for ident in (fx.identity(None, signed_in=False), fx.identity(None), fx.identity(cid, conflict=True),
+                  fx.identity(stranger)):
+        seen.append(devices.heartbeat(conn, dev, identity=ident)["login"])
+    accounts.ignore_buyer_id(conn, ws, stranger, workspace["user_id"])
+    seen.append(devices.heartbeat(conn, dev)["login"])
+    out = devices.heartbeat(conn, dev, identity=fx.identity(cid.lower()))
+    seen.append(out["login"])
+    assert [s["state"] for s in seen] == ["unknown", "signed_out", "no_id", "conflict", "unregistered", "ignored",
+                                          "ready"]
+    assert set(s["state"] for s in seen) == set(devices.PLUGIN_STATES)
+    assert [s["customer_id"] for s in seen] == [None, None, None, None, stranger, stranger, cid]
+    assert out["account"]["id"] == acc["id"] and out["account"]["name"] == "环境-DEMO-A"
+    # account 只在 ready 时非空
+    assert devices.heartbeat(conn, dev, identity=fx.identity(stranger))["account"] is None
+    assert devices.heartbeat(conn, dev, identity=fx.identity(cid, conflict=True))["account"] is None
+
+
+def test_resolve_is_computed_every_time_and_scoped_to_the_browser_workspace(conn, workspace):
+    ws = workspace["id"]
+    cid = fx.customer_id()
+    other_ws = f.make_workspace(conn)
+    fx.exec_account(conn, other_ws["id"], amazon_customer_id=cid, name="别的工作区的账号")
+    dev = fx.registered_device(conn, workspace)
+    assert devices.report_identity(conn, dev, fx.identity(cid))["login"]["state"] == "unregistered"
+    row = devices.authenticate(conn, dev["token"])
+    assert devices.resolve_login(conn, row) == ("unregistered", None)
+    # 所有者登记了这个 ID：不用等下一次身份上报，下一次心跳就是 ready
+    acc = accounts.create(conn, ws, {"name": "环境-DEMO-新", "amazon_customer_id": cid}, workspace["user_id"])
+    state, got = devices.resolve_login(conn, row)
+    assert state == "ready" and got["id"] == acc["id"]
+    assert devices.heartbeat(conn, dev)["account"]["id"] == acc["id"]
+    # 改掉账号的 ID → 回到未登记；改回来、归档 → 未登记（已归档账号不算登记）
+    accounts.update(conn, ws, acc["id"], {"amazon_customer_id": fx.customer_id()}, workspace["user_id"])
+    assert devices.heartbeat(conn, dev)["login"]["state"] == "unregistered"
+    accounts.update(conn, ws, acc["id"], {"amazon_customer_id": cid}, workspace["user_id"])
+    assert devices.heartbeat(conn, dev)["login"]["state"] == "ready"
+    accounts.archive(conn, ws, acc["id"], workspace["user_id"])
+    out = devices.heartbeat(conn, dev)
+    assert out["login"]["state"] == "unregistered" and out["account"] is None
+    assert f.count(conn, "buyer_accounts", "workspace_id = %s", (ws,)) == 1          # 服务端不替插件建账号
+
+
+def test_login_stale_after_identity_fresh_window(conn, workspace):
+    acc = fx.exec_account(conn, workspace["id"])
+    dev = fx.logged_in_device(conn, workspace, account=acc)
+    fresh_s = settings.get().identity_fresh_s
+    assert fresh_s == 600
+    clock.freeze(NOW + timedelta(seconds=fresh_s))
+    assert devices.heartbeat(conn, dev)["login"]["stale"] is False
+    clock.freeze(NOW + timedelta(seconds=fresh_s + 1))
+    out = devices.heartbeat(conn, dev)                     # 心跳不带身份：不刷新 identity_at
+    assert out["login"] == {"state": "ready", "customer_id": acc["amazon_customer_id"], "at": NOW.isoformat(),
+                            "stale": True}
+    assert devices.list_devices(conn, workspace["id"])[0]["login"]["stale"] is True
+    out = devices.heartbeat(conn, dev, identity=fx.identity(acc["amazon_customer_id"]))
+    assert out["login"]["stale"] is False and out["login"]["at"] == (NOW + timedelta(seconds=fresh_s + 1)).isoformat()
+
+
+def test_identity_changed_event_only_when_state_or_id_changes(conn, workspace):
+    acc = fx.exec_account(conn, workspace["id"])
+    cid, other = acc["amazon_customer_id"], fx.customer_id(777_002)
+    dev = fx.registered_device(conn, workspace)
+    for ident in (fx.identity(cid), fx.identity(cid), fx.identity(other), fx.identity(other, conflict=True),
+                  fx.identity(None, signed_in=False), fx.identity(None, signed_in=False)):
+        devices.report_identity(conn, dev, ident)
+    evs = _events(conn, dev["id"], "device.identity_changed")
+    assert [e["detail"] for e in evs] == [
+        {"from": {"state": "unknown", "customer_id": None}, "to": {"state": "signed_in", "customer_id": cid}},
+        {"from": {"state": "signed_in", "customer_id": cid}, "to": {"state": "signed_in", "customer_id": other}},
+        {"from": {"state": "signed_in", "customer_id": other}, "to": {"state": "conflict", "customer_id": None}},
+        {"from": {"state": "conflict", "customer_id": None}, "to": {"state": "signed_out", "customer_id": None}},
+    ]
+    assert all(e["actor_kind"] == "device" and e["actor_id"] == dev["id"] for e in evs)
+
+
+# ── 心跳 ──────────────────────────────────────────────────────────────────────
 
 
 def test_heartbeat_shape_matches_contract(conn, workspace):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws, name="环境-DEMO", min_amount="20", max_amount="50", purchase_mode="scheduled",
-                          schedule_times=["14:00"])
-    dev = fx.paired_device(conn, workspace, account=acc, report=None)
+                          schedule_times=["14:00"], expected_card_last4="7860")
+    dev = fx.logged_in_device(conn, workspace, account=acc, report=None)
     clock.freeze(NOW + timedelta(seconds=30))
-    out = devices.heartbeat(conn, dev, ext_version="0.2.0", identity=fx.identity(acc["amazon_customer_id"]))
-    assert set(out) == {"device", "account", "identity_status", "server_time", "bj_date", "simulation_only",
-                        "active_run"}
-    assert out["device"] == {"id": dev["id"], "name": dev["name"], "bound_account_id": acc["id"]}
-    assert set(out["account"]) == set(devices.HEARTBEAT_ACCOUNT_KEYS)
+    out = devices.heartbeat(conn, dev, ext_version="0.2.1", identity=fx.identity(acc["amazon_customer_id"]))
+    assert set(out) == {"device", "login", "account", "device_run", "server_time", "bj_date", "simulation_only"}
+    assert out["device"] == {"id": dev["id"], "name": dev["name"]}
+    assert out["login"] == {"state": "ready", "customer_id": acc["amazon_customer_id"],
+                            "at": (NOW + timedelta(seconds=30)).isoformat(), "stale": False}
     a = out["account"]
-    assert a["name"] == "环境-DEMO" and a["min_amount"] == "20.00" and a["max_amount"] == "50.00"
-    assert a["schedule_times"] == ["14:00"] and a["effective_max_delivery_days"] == 10
+    assert set(a) == set(devices.HEARTBEAT_ACCOUNT_KEYS) == {
+        "id", "name", "amazon_customer_id", "purchase_enabled", "execution_paused", "pause_reason", "purchase_mode",
+        "schedule_times", "effective_max_delivery_days", "quota_today", "executable_today", "future_assigned",
+        "active_run"}
+    # 卡尾号与金额区间只在领取后的尝试载荷里，心跳不下发
+    assert not {"expected_card_last4", "min_amount", "max_amount", "daily_limit"} & set(a)
+    assert a["id"] == acc["id"] and a["name"] == "环境-DEMO" and a["amazon_customer_id"] == acc["amazon_customer_id"]
+    assert a["purchase_enabled"] is True and a["execution_paused"] is False and a["pause_reason"] is None
+    assert a["purchase_mode"] == "scheduled" and a["schedule_times"] == ["14:00"]
+    assert a["effective_max_delivery_days"] == 10
     assert a["quota_today"] == {"limit": 20, "used": 0, "planned": 0, "available": 20}
-    assert out["identity_status"] == "match" and out["simulation_only"] is True
+    assert a["executable_today"] == 0 and a["future_assigned"] == 0 and a["active_run"] is None
+    assert out["device_run"] is None and out["simulation_only"] is True
     assert out["bj_date"] == "2026-10-31" and datetime.fromisoformat(out["server_time"]) == NOW + timedelta(seconds=30)
-    assert out["active_run"] is None
     row = devices.authenticate(conn, dev["token"])
-    assert row["last_seen_at"] == NOW + timedelta(seconds=30) and row["ext_version"] == "0.2.0"
+    assert row["last_seen_at"] == NOW + timedelta(seconds=30) and row["ext_version"] == "0.2.1"
+    # 身份上报接口返回同一形状
+    again = devices.report_identity(conn, dev, fx.identity(acc["amazon_customer_id"]), ext_version="0.2.1")
+    assert again == out
+
+
+def test_heartbeat_counts_match_claim_rules_and_are_not_capped_by_quota(conn, workspace):
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws, daily_limit=1)
+    other = fx.exec_account(conn, ws)
+    today = clock.bj_today()
+    fx.assigned_order(conn, ws, acc)                                                  # 今天
+    fx.assigned_order(conn, ws, acc, suggested_purchase_date=today - timedelta(days=2))   # 过期未采，也算今天
+    fx.assigned_order(conn, ws, acc, suggested_purchase_date=today + timedelta(days=1))   # 未来
+    fx.assigned_order(conn, ws, acc, suggested_purchase_date=today + timedelta(days=3))   # 未来
+    held = fx.assigned_order(conn, ws, acc)
+    conn.execute("UPDATE procure.purchase_orders SET conflict = '{\"kind\": \"demo\"}' WHERE id = %s", (held["id"],))
+    fx.assigned_order(conn, ws, other)                                                # 别的账号的
+    f.ingest_ready_order(conn, ws)                                                    # 待分配的
+    dev = fx.logged_in_device(conn, workspace, account=acc)
+    a = devices.heartbeat(conn, dev)["account"]
+    assert a["executable_today"] == 2 and a["future_assigned"] == 2      # 额度只有 1，可执行笔数照实给 2
+    assert a["quota_today"]["limit"] == 1 and a["quota_today"]["used"] == 0
+    assert execution.claimable_counts(conn, ws, acc["id"]) == {"executable_today": 2, "future_assigned": 2}
     run_id = fx.start(conn, dev)
-    out = devices.heartbeat(conn, dev)
-    assert out["active_run"] == {"id": run_id, "device_id": dev["id"], "device_name": dev["name"], "is_mine": True}
-    other = fx.paired_device(conn, workspace, account=acc)
-    assert devices.heartbeat(conn, other)["active_run"]["is_mine"] is False
+    fx.claim(conn, dev, run_id)                                          # 领走一笔：在途的不再算可执行
+    a = devices.heartbeat(conn, dev)["account"]
+    assert a["executable_today"] == 1 and a["quota_today"]["used"] == 1
 
 
-def test_heartbeat_unbound_device(conn, workspace):
-    dev = fx.paired_device(conn, workspace)
-    out = devices.heartbeat(conn, dev)
-    assert out["account"] is None and out["active_run"] is None and out["identity_status"] == "unknown"
-    assert out["device"]["bound_account_id"] is None
-
-
-def test_identity_match_mismatch_signed_out_unknown(conn, workspace):
+def test_heartbeat_account_run_and_device_run(conn, workspace):
     ws = workspace["id"]
-    acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc, report=None)
-    cid = acc["amazon_customer_id"]
-    assert devices.report_identity(conn, dev, fx.identity(cid.lower())) == "match"
-    assert devices.report_identity(conn, dev, fx.identity("A9OTHER0001")) == "mismatch"
-    assert devices.report_identity(conn, dev, fx.identity(None, signed_in=False)) == "signed_out"
-    assert devices.report_identity(conn, dev, fx.identity(None)) == "unknown"
-    no_id = fx.exec_account(conn, ws, amazon_customer_id=None)
-    dev2 = fx.paired_device(conn, workspace, account=no_id, report=None)
-    assert devices.report_identity(conn, dev2, fx.identity("A9OTHER0001")) == "unknown"
-    row = devices.authenticate(conn, dev["token"])
-    assert row["identity"]["at"] == NOW.isoformat() and row["identity_at"] == NOW
-    assert row["identity"]["page_url"] == "https://www.amazon.com/gp/your-account/order-history"
+    acc_a = fx.exec_account(conn, ws, name="环境-DEMO-A")
+    acc_b = fx.exec_account(conn, ws, name="环境-DEMO-B")
+    mac = fx.logged_in_device(conn, workspace, account=acc_a, name="Mac-DEMO")
+    pc = fx.logged_in_device(conn, workspace, account=acc_a, name="PC-DEMO")
+    run_id = fx.start(conn, mac)
+    lease = fx.run_row(conn, run_id)["lease_expires_at"]
+    clock.freeze(NOW + timedelta(seconds=60))
+    out = devices.heartbeat(conn, mac)
+    assert out["account"]["active_run"] == {"id": run_id, "device_id": mac["id"], "device_name": "Mac-DEMO",
+                                            "started_at": NOW.isoformat(), "is_mine": True}
+    assert out["device_run"] == {"id": run_id, "account_id": acc_a["id"], "account_name": "环境-DEMO-A",
+                                 "started_at": NOW.isoformat()}
+    assert fx.run_row(conn, run_id)["lease_expires_at"] == lease          # 插件心跳不续批次租约
+    theirs = devices.heartbeat(conn, pc)
+    assert theirs["account"]["active_run"]["is_mine"] is False and theirs["device_run"] is None
+    # 这个浏览器换登了另一个买家号：account 跟着换，device_run 仍是它自己没结束的那个批次（不论账号）
+    out = devices.heartbeat(conn, mac, identity=fx.identity(acc_b["amazon_customer_id"]))
+    assert out["account"]["id"] == acc_b["id"] and out["account"]["active_run"] is None
+    assert out["device_run"]["id"] == run_id and out["device_run"]["account_name"] == "环境-DEMO-A"
+    execution.finish_run(conn, mac, run_id)
+    assert devices.heartbeat(conn, mac)["device_run"] is None
 
 
-def test_identity_event_only_on_status_change_and_page_url_stripped(conn, workspace):
-    acc = fx.exec_account(conn, workspace["id"])
-    dev = fx.paired_device(conn, workspace, account=acc, report=None)
-    ident = {**fx.identity(acc["amazon_customer_id"]), "page_url": "https://www.amazon.com/gp/buy?session=SECRET#x"}
-    devices.report_identity(conn, dev, ident)
-    devices.report_identity(conn, dev, ident)
-    devices.report_identity(conn, dev, fx.identity("A9OTHER0001"))
-    evs = _events(conn, dev["id"], "device.identity_changed")
-    assert [(e["detail"]["from"], e["detail"]["to"]) for e in evs] == [("unknown", "match"), ("match", "mismatch")]
-    devices.report_identity(conn, dev, ident)
-    assert devices.authenticate(conn, dev["token"])["identity"]["page_url"] == "https://www.amazon.com/gp/buy"
-    with pytest.raises(DomainError) as e:
-        devices.report_identity(conn, dev, "signed in")
-    assert e.value.code == "VALIDATION"
-
-
-def test_effective_identity_follows_account_customer_id_change(conn, workspace):
+def test_heartbeat_reflects_pause_and_purchase_switch(conn, workspace):
     ws = workspace["id"]
-    acc = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
-    accounts.update(conn, ws, acc["id"], {"amazon_customer_id": "A9OTHER0001"}, workspace["user_id"])
-    assert devices.list_devices(conn, ws)[0]["identity_status"] == "mismatch"
-    assert devices.heartbeat(conn, dev)["identity_status"] == "mismatch"
+    acc = fx.exec_account(conn, ws, purchase_enabled=False)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
+    accounts.pause(conn, ws, acc["id"], "DEMO 人工暂停", actor_kind="user", actor_id=workspace["user_id"])
+    a = devices.heartbeat(conn, dev)["account"]
+    assert a["purchase_enabled"] is False and a["execution_paused"] is True and a["pause_reason"] == "DEMO 人工暂停"
 
 
-# ── 列表、改绑、撤销 ──────────────────────────────────────────────────────────
+# ── 列表、改名、移除 ──────────────────────────────────────────────────────────
 
 
-def test_list_devices_shape_online_and_workspace_isolation(conn, workspace):
+def test_list_devices_shape_states_online_and_workspace_isolation(conn, workspace):
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws, name="环境-DEMO-LIST")
-    dev = fx.paired_device(conn, workspace, account=acc, name="Mac-DEMO-A")
-    old = fx.paired_device(conn, workspace, name="Mac-DEMO-B")
+    ready = fx.logged_in_device(conn, workspace, account=acc, name="A-就绪")
+    fx.registered_device(conn, workspace, name="B-未上报")
+    stranger = fx.logged_in_device(conn, workspace, account=acc, name="C-未登记", report="mismatch")
+    ignored = fx.registered_device(conn, workspace, name="D-已忽略")
+    ignored_id = fx.customer_id(777_003)
+    devices.report_identity(conn, ignored, fx.identity(ignored_id))
+    accounts.ignore_buyer_id(conn, ws, ignored_id, workspace["user_id"])
+    fx.logged_in_device(conn, workspace, account=acc, name="E-未登录", report="signed_out")
+    fx.logged_in_device(conn, workspace, account=acc, name="F-没读到", report="no_id")
+    fx.logged_in_device(conn, workspace, account=acc, name="G-不一致", report="conflict")
     other_ws = f.make_workspace(conn)
-    fx.paired_device(conn, other_ws, name="别人的设备")
+    fx.registered_device(conn, other_ws, name="别人的浏览器")
+    run_id = fx.start(conn, ready)
     rows = devices.list_devices(conn, ws)
-    assert [r["name"] for r in rows] == ["Mac-DEMO-A", "Mac-DEMO-B"]
+    assert [(r["name"], r["login"]["state"]) for r in rows] == [
+        ("A-就绪", "ready"), ("B-未上报", "unknown"), ("C-未登记", "unregistered"), ("D-已忽略", "ignored"),
+        ("E-未登录", "signed_out"), ("F-没读到", "no_id"), ("G-不一致", "conflict")]
     r = rows[0]
-    assert set(r) == {"id", "name", "browser", "ext_version", "bound_account", "online", "last_seen_at", "identity",
-                      "identity_status", "created_at", "revoked_at", "active_run"}
-    assert r["bound_account"] == {"id": acc["id"], "name": "环境-DEMO-LIST"}
-    assert r["online"] is True and r["identity_status"] == "match" and r["identity"]["customer_id"]
+    assert set(r) == {"id", "name", "ext_version", "online", "last_seen_at", "created_at", "hidden_at", "login",
+                      "account", "active_run"}
+    assert set(r["login"]) == {"state", "customer_id", "at", "stale"}
+    assert r["account"] == {"id": acc["id"], "name": "环境-DEMO-LIST"} and r["online"] is True
+    assert r["login"]["customer_id"] == acc["amazon_customer_id"] and r["hidden_at"] is None
+    assert r["active_run"] == {"id": run_id, "account_id": acc["id"], "started_at": NOW.isoformat(),
+                               "simulated": True}
+    assert rows[2]["account"] is None and rows[2]["login"]["customer_id"] == stranger["login_customer_id"]
+    assert rows[3]["login"]["customer_id"] == ignored_id and rows[1]["active_run"] is None
     clock.freeze(NOW + timedelta(seconds=181))
-    assert devices.get_device(conn, ws, old["id"])["online"] is False
-    with pytest.raises(DomainError) as e:
-        devices.get_device(conn, other_ws["id"], dev["id"])
-    assert e.value.code == "NOT_FOUND"
+    assert devices.get_device(conn, ws, ready["id"])["online"] is False
+    assert _err(devices.get_device, conn, other_ws["id"], ready["id"]).code == "NOT_FOUND"
+    assert _err(devices.get_device, conn, ws, "abc").code == "NOT_FOUND"
+    assert [d["name"] for d in devices.list_devices(conn, other_ws["id"])] == ["别人的浏览器"]
 
 
-def test_update_device_rename_bind_and_validation(conn, workspace):
+def test_update_device_only_renames(conn, workspace):
     ws = workspace["id"]
-    acc = fx.exec_account(conn, ws)
-    acc2 = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
-    out = devices.update_device(conn, ws, dev["id"], name="Mac-DEMO-改名", actor_user_id=workspace["user_id"])
-    assert out["name"] == "Mac-DEMO-改名" and out["bound_account"]["id"] == acc["id"]
-    # 改绑：按新账号重算身份（插件报的是 acc 的 ID → 对 acc2 不符）
-    out = devices.update_device(conn, ws, dev["id"], bound_account_id=acc2["id"], actor_user_id=workspace["user_id"])
-    assert out["bound_account"]["id"] == acc2["id"] and out["identity_status"] == "mismatch"
-    assert devices.authenticate(conn, dev["token"])["identity_status"] == "mismatch"
-    out = devices.update_device(conn, ws, dev["id"], bound_account_id=None, actor_user_id=workspace["user_id"])
-    assert out["bound_account"] is None and out["identity_status"] == "unknown"
+    dev = fx.registered_device(conn, workspace)
+    out = devices.update_device(conn, ws, dev["id"], name="  AdsPower-DEMO-改名 ", actor_user_id=workspace["user_id"])
+    assert out["name"] == "AdsPower-DEMO-改名"
+    assert devices.update_device(conn, ws, dev["id"], actor_user_id=workspace["user_id"])["name"] == out["name"]
+    assert [e["detail"] for e in _events(conn, dev["id"], "device.updated")] == [
+        {"changes": {"name": [dev["name"], "AdsPower-DEMO-改名"]}}]
+    for bad in (" ", "", None, 5, "长" * 65):
+        e = _err(devices.update_device, conn, ws, dev["id"], name=bad, actor_user_id=workspace["user_id"])
+        assert e.code == "VALIDATION" and e.detail["field"] == "name"
+    # 控制字符（NUL、换行、制表符、ESC、DEL、C1 …）与存不了的代理项：拒绝，不是 500，也不悄悄改掉
+    for bad in ("a\x00b", "\x00", "两行\n名称", "制表\t符", "回\r车", "\x1b[31m红", "DEL\x7f", "C\x851", "代理\ud800项",
+                "长" * 70 + "\x00"):
+        e = _err(devices.update_device, conn, ws, dev["id"], name=bad, actor_user_id=workspace["user_id"])
+        assert e.code == "VALIDATION" and e.http_status == 422 and e.detail == {"field": "name"}, repr(bad)
+        assert e.message == "浏览器名称不能包含换行、制表符等控制字符"
+    assert devices.get_device(conn, ws, dev["id"])["name"] == "AdsPower-DEMO-改名"
+    assert len(_events(conn, dev["id"], "device.updated")) == 1
+    # 首尾的空白（含换行）照旧去掉；中间的空格、中文标点、表情都可以
+    out = devices.update_device(conn, ws, dev["id"], name="\n Mac-DEMO 二号（备用）😀\t", actor_user_id=None)
+    assert out["name"] == "Mac-DEMO 二号（备用）😀"
     other_ws = f.make_workspace(conn)
-    foreign = fx.exec_account(conn, other_ws["id"])
-    with pytest.raises(DomainError) as e:
-        devices.update_device(conn, ws, dev["id"], bound_account_id=foreign["id"], actor_user_id=workspace["user_id"])
-    assert e.value.code == "VALIDATION"
-    with pytest.raises(DomainError) as e:
-        devices.update_device(conn, other_ws["id"], dev["id"], name="x", actor_user_id=other_ws["user_id"])
-    assert e.value.code == "NOT_FOUND"
-    with pytest.raises(DomainError) as e:
-        devices.update_device(conn, ws, dev["id"], name=" ", actor_user_id=workspace["user_id"])
-    assert e.value.code == "VALIDATION"
-    assert _events(conn, dev["id"], "device.updated")
+    e = _err(devices.update_device, conn, other_ws["id"], dev["id"], name="x", actor_user_id=other_ws["user_id"])
+    assert e.code == "NOT_FOUND"
+    with pytest.raises(TypeError):                         # 没有绑定账号这回事了
+        devices.update_device(conn, ws, dev["id"], bound_account_id=1, actor_user_id=workspace["user_id"])
 
 
-def test_rebinding_refused_while_device_has_active_run(conn, workspace):
-    ws = workspace["id"]
+def test_remove_only_hides_and_browser_comes_back_on_next_contact(conn, workspace):
+    ws, uid = workspace["id"], workspace["user_id"]
     acc = fx.exec_account(conn, ws)
-    acc2 = fx.exec_account(conn, ws)
-    dev = fx.paired_device(conn, workspace, account=acc)
-    run_id = fx.start(conn, dev)
-    with pytest.raises(DomainError) as e:
-        devices.update_device(conn, ws, dev["id"], bound_account_id=acc2["id"], actor_user_id=workspace["user_id"])
-    assert e.value.code == "CONFLICT" and e.value.http_status == 409
-    # 改名不受影响
-    assert devices.update_device(conn, ws, dev["id"], name="改名-DEMO", actor_user_id=workspace["user_id"])["name"]
-    execution.finish_run(conn, dev, run_id)
-    out = devices.update_device(conn, ws, dev["id"], bound_account_id=acc2["id"], actor_user_id=workspace["user_id"])
-    assert out["bound_account"]["id"] == acc2["id"]
-
-
-def test_revoke_nulls_token_ends_runs_and_is_idempotent(conn, workspace):
-    ws = workspace["id"]
-    acc = fx.exec_account(conn, ws, default_device_id=None)
-    dev = fx.paired_device(conn, workspace, account=acc)
-    accounts.update(conn, ws, acc["id"], {"default_device_id": dev["id"]}, workspace["user_id"])
-    order = fx.assigned_order(conn, ws, acc)
-    run_id = fx.start(conn, dev)
-    att = fx.claim(conn, dev, run_id)
-    out = devices.revoke(conn, ws, dev["id"], workspace["user_id"])
-    assert out["revoked_at"] == NOW.isoformat() and out["online"] is False
+    dev = fx.logged_in_device(conn, workspace, account=acc, name="Mac-DEMO")
+    assert overview.overview(conn, ws)["devices"] == {"total": 1, "online": 1}
+    out = devices.remove_device(conn, ws, dev["id"], uid)
+    assert out["hidden_at"] == NOW.isoformat() and out["id"] == dev["id"]
+    assert devices.remove_device(conn, ws, dev["id"], uid)["hidden_at"] == NOW.isoformat()      # 幂等
+    ev = _events(conn, dev["id"], "device.removed")
+    assert len(ev) == 1 and ev[0]["actor_kind"] == "user" and ev[0]["actor_id"] == uid
+    assert devices.list_devices(conn, ws) == []
+    assert [d["id"] for d in devices.list_devices(conn, ws, include_hidden=True)] == [dev["id"]]
+    assert devices.get_device(conn, ws, dev["id"])["hidden_at"] is not None
+    assert overview.overview(conn, ws)["devices"] == {"total": 0, "online": 0}
+    assert accounts.get(conn, ws, acc["id"])["browsers"] == []
     row = conn.execute("SELECT * FROM procure.devices WHERE id = %s", (dev["id"],)).fetchone()
-    assert row["token_hash"] is None
-    run = fx.run_row(conn, run_id)
-    assert run["ended_at"] == NOW and run["end_reason"] == "device_revoked"
-    assert fx.attempt_row(conn, att["attempt_id"])["status"] == "aborted"
-    o = fx.order_row(conn, order["id"])
-    assert o["status"] == "assigned" and o["assigned_account_id"] == acc["id"] and o["current_attempt_id"] is None
-    assert fx.account_row(conn, acc["id"])["default_device_id"] is None
-    again = devices.revoke(conn, ws, dev["id"], workspace["user_id"])
-    assert again["revoked_at"] == out["revoked_at"]
-    assert len(_events(conn, dev["id"], "device.revoked")) == 1
-    with pytest.raises(DomainError) as e:
-        devices.update_device(conn, ws, dev["id"], name="x", actor_user_id=workspace["user_id"])
-    assert e.value.code == "VALIDATION"
+    assert row["token_hash"] == dev["token_hash"]                        # 不动令牌
+    # 再次联系（心跳 / 身份上报 / 登记）自动回到列表，还是原来的 id
+    clock.freeze(NOW + timedelta(minutes=1))
+    assert devices.heartbeat(conn, dev)["device"] == {"id": dev["id"], "name": "Mac-DEMO"}
+    assert [d["id"] for d in devices.list_devices(conn, ws)] == [dev["id"]]
+    assert accounts.get(conn, ws, acc["id"])["browsers"][0]["id"] == dev["id"]
+    devices.remove_device(conn, ws, dev["id"], uid)
+    devices.report_identity(conn, dev, fx.identity(acc["amazon_customer_id"]))
+    assert devices.get_device(conn, ws, dev["id"])["hidden_at"] is None
+    devices.remove_device(conn, ws, dev["id"], uid)
+    assert devices.register(conn, dev["token"])["device_id"] == dev["id"]
+    assert devices.get_device(conn, ws, dev["id"])["hidden_at"] is None
+    assert len(_events(conn, dev["id"], "device.removed")) == 3
 
 
-def test_revoke_cross_workspace_is_not_found(conn, workspace):
-    dev = fx.paired_device(conn, workspace)
+def test_remove_refused_while_browser_has_active_run(conn, workspace):
+    ws, uid = workspace["id"], workspace["user_id"]
+    acc = fx.exec_account(conn, ws)
+    dev = fx.logged_in_device(conn, workspace, account=acc)
+    run_id = fx.start(conn, dev)
+    e = _err(devices.remove_device, conn, ws, dev["id"], uid)
+    assert e.code == "CONFLICT" and e.http_status == 409 and e.message == "这个浏览器正在执行，结束后才能移除"
+    assert e.detail["run_id"] == run_id
+    assert fx.run_row(conn, run_id)["ended_at"] is None and not _events(conn, dev["id"], "device.removed")
+    execution.finish_run(conn, dev, run_id)
+    assert devices.remove_device(conn, ws, dev["id"], uid)["hidden_at"] is not None
+
+
+def test_remove_cross_workspace_is_not_found(conn, workspace):
+    dev = fx.registered_device(conn, workspace)
     other = f.make_workspace(conn)
-    with pytest.raises(DomainError) as e:
-        devices.revoke(conn, other["id"], dev["id"], other["user_id"])
-    assert e.value.code == "NOT_FOUND"
-    assert devices.authenticate(conn, dev["token"]) is not None
+    assert _err(devices.remove_device, conn, other["id"], dev["id"], other["user_id"]).code == "NOT_FOUND"
+    assert devices.get_device(conn, workspace["id"], dev["id"])["hidden_at"] is None

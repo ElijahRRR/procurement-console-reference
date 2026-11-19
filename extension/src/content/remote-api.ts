@@ -1,4 +1,5 @@
-/** 内容脚本里的 RunApi：每一次协议调用都是发给后台的一条 `pc.api` 消息，由后台带上设备令牌转发。
+/** 内容脚本里的 RunApi：每一次协议调用都是发给后台的一条 `pc.api` 消息，由后台带上设备令牌转发
+ *  （还没登记上先登记；服务端回 401 时重新登记后再发一次）。
  *
  * 消息层的超时比后台单次请求的超时（15 秒 × 最多 3 次 + 退避）更长。消息层超时或后台没有响应时，
  * 一律按「没说上话」（network）返回 —— 对提交登记来说这意味着「可能已登记」，引擎会停下、不重试；
@@ -19,8 +20,8 @@ function call<T>(op: ApiOp, args: unknown[]): Promise<ApiResult<T>> {
 }
 
 export class RemoteApi implements RunApi {
-  startRun(trigger: Trigger): Promise<ApiResult<RunStartOut>> {
-    return call("startRun", [trigger]);
+  startRun(trigger: Trigger, customerId: string, slot: string | null = null): Promise<ApiResult<RunStartOut>> {
+    return call("startRun", [trigger, customerId, slot]);
   }
   runHeartbeat(runId: number): Promise<ApiResult<RunHeartbeatOut>> {
     return call("runHeartbeat", [runId]);

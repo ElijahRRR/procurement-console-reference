@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import Any
 
 from registry import settings
-from services import allocation, clock, devices, orders, settings_svc
+from services import accounts, allocation, clock, devices, orders, settings_svc
 from services.models import ORDER_STATUSES
 
 ONLINE_WINDOW = timedelta(seconds=devices.ONLINE_WINDOW_S)
@@ -15,11 +15,12 @@ RECENT_EXCEPTIONS = 5
 
 def overview(conn, workspace_id: int) -> dict[str, Any]:
     """输入：工作区 → 输出：{bj_date, counts, needs_attention, today_executable, future_assigned, accounts, devices,
-    recent_exceptions, last_allocation, simulation_only, feishu_configured}。
+    discovered_buyers, recent_exceptions, last_allocation, simulation_only, feishu_configured}。
 
     needs_attention = 置了「需要留意」提醒的任务数（不论状态）；today_executable = 已分配且建议采购日期 ≤ 北京今天（「today」视图）；future_assigned = 已分配且日期在今天之后；
-    accounts.enabled = 未归档且采购开关开启；accounts.paused = 未归档且暂停执行；devices 只计未撤销的，
-    online = 3 分钟内有心跳；recent_exceptions = 最近变为「异常」的任务（列表行形状）。
+    accounts.enabled = 未归档且采购开关开启；accounts.paused = 未归档且暂停执行；devices（浏览器）只计未移除的，
+    online = 3 分钟内有联系；discovered_buyers = 未忽略的待登记买家号个数（浏览器上报了、或来源给未采购任务指定了，
+    而还没有账号登记的买家号 ID，见 accounts.discovered）；recent_exceptions = 最近变为「异常」的任务（列表行形状）。
     """
     today = clock.bj_today()
     counts = {s: 0 for s in ORDER_STATUSES}
@@ -51,7 +52,7 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
     dev = conn.execute(
         """
         SELECT count(*) AS total, count(*) FILTER (WHERE last_seen_at >= %s) AS online
-        FROM procure.devices WHERE workspace_id = %s AND revoked_at IS NULL
+        FROM procure.devices WHERE workspace_id = %s AND hidden_at IS NULL
         """,
         (clock.now() - ONLINE_WINDOW, workspace_id),
     ).fetchone()
@@ -68,7 +69,8 @@ def overview(conn, workspace_id: int) -> dict[str, Any]:
         "future_assigned": int(dated["future_n"]),
         "accounts": {"total": int(acc["total"]), "enabled": int(acc["enabled"]), "paused": int(acc["paused"])},
         "devices": {"total": int(dev["total"]), "online": int(dev["online"])},
-        "recent_exceptions": [orders.order_row_out(r) for r in recent],
+        "discovered_buyers": accounts.discovered_count(conn, workspace_id),
+        "recent_exceptions": orders.rows_out(conn, workspace_id, recent),
         "last_allocation": allocation.last_run(conn, workspace_id),
         "simulation_only": settings_svc.simulation_only(conn, workspace_id),
         "feishu_configured": settings.get().feishu_configured,

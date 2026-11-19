@@ -10,6 +10,8 @@ import pytest
 from services import guard
 
 TODAY = date(2026, 10, 30)          # 站点（洛杉矶）今天
+BUYER = "A1DEMO000001"              # 批次账号登记的买家号 ID（虚构）
+OTHER_BUYER = "A2TEST000002"
 
 
 def _facts(**over):
@@ -19,6 +21,7 @@ def _facts(**over):
         "gift_card_amount": None, "currency": "USD",
         "delivery": {"text": "Arriving Nov 3", "date": (TODAY + timedelta(days=4)).isoformat(), "days": None},
         "ship_to": {"postal_code": "32960"}, "card_last4": "7860", "fulfillment": "amazon",
+        "customer_id": BUYER,
     }
     base.update(over)
     return base
@@ -27,7 +30,7 @@ def _facts(**over):
 def _eval(facts, **over):
     kw = dict(asin="B0DEMO0001", quantity=1, postal_code="32960", price_cap=Decimal("60.00"),
               amount_min=Decimal("20.00"), amount_max=Decimal("50.00"), max_delivery_days=10,
-              expected_card_last4=None, site_today=TODAY)
+              expected_card_last4=None, site_today=TODAY, expected_customer_id=BUYER)
     kw.update(over)
     return guard.evaluate(facts, **kw)
 
@@ -35,7 +38,9 @@ def _eval(facts, **over):
 def test_all_checks_pass_and_result_shape():
     v = _eval(_facts())
     assert v["verdict"] == "pass" and v["code"] is None and v["reasons"] == []
-    assert set(v["checks"]) == {"item", "zip", "subtotal", "price_cap", "delivery", "data", "card"}
+    assert set(v["checks"]) == {"buyer", "item", "zip", "subtotal", "price_cap", "delivery", "data", "card"}
+    assert [name for name, _ in guard.CHECK_ORDER][0] == "buyer"
+    assert v["checks"]["buyer"] == {"ok": True, "expected": BUYER, "actual": BUYER}
     assert all(c["ok"] is True for c in v["checks"].values())
     assert v["delivery_days"] == 4 and v["total_for_cap"] == "52.00" and v["fulfillment"] == "amazon"
     assert v["checks"]["subtotal"]["expected"] == {"min": "20.00", "max": "50.00"}
@@ -221,6 +226,9 @@ def test_price_cap_is_rounded_down_to_cents(cap, verdict):
     _facts(delivery={"date": None, "days": True}), _facts(delivery={"text": "x" * 5000, "days": 4}),
     _facts(ship_to="32960"), _facts(ship_to={"postal_code": 32960}), _facts(ship_to={"postal_code": ["32960"]}),
     _facts(fulfillment={"by": "amazon"}),
+    _facts(customer_id=None), _facts(customer_id=""), _facts(customer_id=f"  {BUYER.lower()} "),
+    _facts(customer_id=OTHER_BUYER), _facts(customer_id=123), _facts(customer_id={"id": BUYER}),
+    _facts(customer_id="not-an-id"), _facts(customer_id="A" + "9" * 80),
     "garbage", None,
 ])
 def test_sanitize_keeps_verdict(facts):
@@ -244,6 +252,54 @@ def test_sanitize_drops_unknown_keys_trims_card_and_text():
     assert clean["items"] == [{"asin": "B0DEMO0001", "quantity": 1, "unit_price": "48.00"}]
     assert guard.sanitize_facts({"total": float("inf")})["total"] == guard.INVALID
     assert len(guard.sanitize_facts(_facts(items=[{}] * 50))["items"]) == 20
+
+
+# ── buyer：结算页当场读到的买家号 ID 必须是批次账号登记的那个 ──────────────────────────────
+
+
+def test_buyer_same_id_passes_case_and_whitespace_insensitive():
+    for cid in (BUYER, BUYER.lower(), f"  {BUYER} ", "A1DEMO 000001"):
+        v = _eval(_facts(customer_id=cid))
+        assert v["verdict"] == "pass" and v["checks"]["buyer"]["actual"] == BUYER, cid
+
+
+def test_buyer_different_id_blocks_first_with_identity_mismatch():
+    """结算页登录的是另一个买家号：拦截码 IDENTITY_MISMATCH，排在其他检查前面（别的项不通过也先报它）。"""
+    v = _eval(_facts(customer_id=OTHER_BUYER))
+    assert v["verdict"] == "block" and v["code"] == "IDENTITY_MISMATCH"
+    assert v["checks"]["buyer"] == {"ok": False, "expected": BUYER, "actual": OTHER_BUYER}
+    assert v["reasons"] == [f"结算页登录的买家号（{OTHER_BUYER}）不是这个批次的买家号（{BUYER}）"]
+    both = _eval(_facts(customer_id=OTHER_BUYER, ship_to={"postal_code": "99999"}), price_cap=Decimal("1.00"))
+    assert both["code"] == "IDENTITY_MISMATCH" and len(both["reasons"]) == 3
+
+
+@pytest.mark.parametrize("cid", [None, "", "   ", "not-an-id", "B1DEMO000001", "A123", 12345, ["A1DEMO000001"],
+                                 "A" + "9" * 80])
+def test_buyer_missing_or_unreadable_blocks_as_data_unreliable_never_passes(cid):
+    """没读到、形状不对、类型不对：都按「没读到」，由 data 检查拦截（NULL 不放行）。"""
+    for facts in (_facts(customer_id=cid), guard.sanitize_facts(_facts(customer_id=cid))):
+        v = _eval(facts)
+        assert v["verdict"] == "block" and v["code"] == "DATA_UNRELIABLE"
+        assert v["checks"]["buyer"] == {"ok": None, "expected": BUYER, "actual": None}
+        assert "结算页没有读到买家号 ID" in v["reasons"][0]
+    absent = _facts()
+    del absent["customer_id"]
+    assert _eval(absent)["code"] == "DATA_UNRELIABLE"
+
+
+def test_buyer_account_without_registered_id_blocks():
+    v = _eval(_facts(), expected_customer_id=None)
+    assert v["verdict"] == "block" and v["code"] == "IDENTITY_MISMATCH"
+    assert v["checks"]["buyer"]["ok"] is False and "没有登记买家号 ID" in v["reasons"][0]
+
+
+def test_sanitize_keeps_customer_id_normalized_and_marks_bad_shapes_invalid():
+    assert "customer_id" in guard.FACT_KEYS
+    assert guard.sanitize_facts(_facts(customer_id=f" {BUYER.lower()} "))["customer_id"] == BUYER
+    assert guard.sanitize_facts(_facts(customer_id=None))["customer_id"] is None
+    assert guard.sanitize_facts(_facts(customer_id=""))["customer_id"] is None
+    assert guard.sanitize_facts(_facts(customer_id="not-an-id"))["customer_id"] == guard.INVALID
+    assert guard.sanitize_facts(_facts(customer_id=12345))["customer_id"] == guard.INVALID
 
 
 @pytest.mark.parametrize("total", ["5" * 30, 10 ** 40, 1e300, "9" * 25 + ".99"])

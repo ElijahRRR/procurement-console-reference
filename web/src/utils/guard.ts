@@ -1,7 +1,7 @@
 /**
  * 护栏裁决展示：把尝试的 guard_verdict（services/guard.evaluate 的输出）整理成逐项检查行。
  *
- * checks 是以检查名为键的对象 {item, zip, subtotal, price_cap, delivery, data, card}，每项 {ok, expected, actual}：
+ * checks 是以检查名为键的对象 {buyer, item, zip, subtotal, price_cap, delivery, data, card}，每项 {ok, expected, actual}：
  * ok 为 true 通过、false 不通过、null 缺数据无法判定（由 data 检查统一拦截）。配送方式 fulfillment 在裁决顶层，只记录不拦截。
  */
 import { GUARD_CHECK_KEYS, type GuardCheck, type GuardVerdict } from '@/api/types'
@@ -80,6 +80,10 @@ export function guardCheckDetail(key: string, c: GuardCheck): string {
     }
     case 'card':
       if (isBlank(exp)) return `账号未设置期望卡尾号，实际 ${isBlank(act) ? '读取不到' : text(act)}`
+      return `要求 ${text(exp)}，实际 ${isBlank(act) ? '读取不到' : text(act)}`
+    case 'buyer':
+      // 结算页登录的买家号 ID 必须是这个批次账号登记的买家号 ID
+      if (isBlank(exp)) return `账号没有登记买家号 ID，实际 ${isBlank(act) ? '读取不到' : text(act)}`
       return `要求 ${text(exp)}，实际 ${isBlank(act) ? '读取不到' : text(act)}`
     default: {
       const parts: string[] = []

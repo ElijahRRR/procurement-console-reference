@@ -4,6 +4,7 @@ import { ORDER_STATUSES } from '@/api/types'
 import { exceptionManual, preStartManual, uncoveredTitle } from '@/utils/overview'
 import type { Attempt, EventRecord, OrderConflict } from '@/api/types'
 import { isResultUnknownPause, resumeConfirmText, resumeNeedsCaution } from '@/utils/accounts'
+import { PLUGIN_ERROR_LABEL } from '@/utils/labels'
 import {
   STATUS_ALERT_TYPE,
   amazonOrderNoProblem,
@@ -99,7 +100,7 @@ function attempt(extra: Partial<Attempt> = {}): Attempt {
   }
 }
 function event(kind: string, detail: Record<string, unknown>, extra: Partial<EventRecord> = {}): EventRecord {
-  return { id: 1, entity: 'attempt', entity_id: 27, order_id: 7, at: '2026-11-05T02:00:00+00:00', actor_kind: 'device', actor_id: 7, actor_name: 'DEMO 设备', kind, detail, ...extra }
+  return { id: 1, entity: 'attempt', entity_id: 27, order_id: 7, at: '2026-11-05T02:00:00+00:00', actor_kind: 'device', actor_id: 7, actor_name: 'DEMO 浏览器', kind, detail, ...extra }
 }
 
 describe('事件摘要', () => {
@@ -111,7 +112,7 @@ describe('事件摘要', () => {
   })
   it('错误码、护栏拦截码显示中文；重复的文字只出现一次', () => {
     expect(eventSummary(event('attempt.aborted', { error_code: 'ABORTED_BY_SERVER', reason: '账号已暂停执行' }))).toBe(
-      '服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止 · 账号已暂停执行',
+      `${PLUGIN_ERROR_LABEL.ABORTED_BY_SERVER} · 账号已暂停执行`,
     )
     expect(eventSummary(event('attempt.guard_blocked', { code: 'PRICE_OVER_CAP', reasons: ['结算总额 $52.00 超过限价 $50.00'] }))).toBe('结算总额超过限价 · 结算总额 $52.00 超过限价 $50.00')
     expect(eventSummary(event('attempt.late_result', { amazon_order_no: 'SIM-20261105-27', reason: '插件迟到上报的结果：成功，亚马逊订单号 SIM-20261105-27，请据此核实' }))).toBe(
@@ -123,6 +124,14 @@ describe('事件摘要', () => {
     expect(eventSummary(event('order.override_set', { quantity: 2 }))).toBe('数量：2')
     // 对象不原样打印 JSON
     expect(eventSummary(event('order.something_new', { extra: { a: 1 }, count: 3 }))).toBe('count：3')
+  })
+  it('标记已处理（order.attention_cleared）写出清掉的原提醒；备注为空时摘要也不空', () => {
+    const prev = '账号暂停前的提醒：结果待核实 DEMO'
+    expect(eventSummary(event('order.attention_cleared', { note: null, previous: prev }))).toBe(`原提醒：${prev}`)
+    expect(eventSummary(event('order.attention_cleared', { note: '已在后台核对 DEMO', previous: prev }))).toBe(`已在后台核对 DEMO · 原提醒：${prev}`)
+    expect(eventSummary(event('order.attention_cleared', { note: '已在后台核对 DEMO', previous: null }))).toBe('已在后台核对 DEMO')
+    // 别的事件里同名的简单值照样按「字段：值」列出，不因来源指定事件用到这些键而被藏起来
+    expect(eventSummary(event('order.something_new', { previous: 'x1', stated: 'x2', current: 'x3' }))).toBe('previous：x1；stated：x2；current：x3')
   })
   it('来源、预览结论、状态与字段变化写成中文', () => {
     expect(eventSummary(event('order.created', { source: { kind: 'file', batch_id: 1, row_no: 6 }, verdict: 'new', status: 'pending_review' }))).toBe(

@@ -16,10 +16,13 @@ import {
 } from "../build/core/simulate.js";
 import {
   DEFAULT_SERVER_URL,
-  isValidPairingCode,
-  normalizePairingCode,
+  DEFAULT_SETTINGS,
+  ORDER_HISTORY_URL,
+  consoleAccountsUrl,
   normalizeSettings,
+  normalizeWorkspaceId,
   validateServerUrl,
+  validateWorkspaceIdText,
 } from "../build/core/settings.js";
 import { appendLog } from "../build/core/log.js";
 import { codeLabel } from "../build/core/codes.js";
@@ -55,6 +58,13 @@ test("送达日期 = 洛杉矶今天 + min(3, 上限)", () => {
 test("超限价：total = 限价 + 1；限价读不到时 total 为 null（交给服务端按数据不可靠拦截）", () => {
   assert.equal(buildCheckoutFacts(attempt(), "price_over_cap", NOW).total, "131.00");
   assert.equal(buildCheckoutFacts(attempt({ price_cap: null }), "price_over_cap", NOW).total, null);
+});
+
+test("结算事实带买家号 ID：取事实那一刻页面上的读数；读不到保持 null（服务端按数据不可靠拦截），不拿别的值顶替", () => {
+  assert.equal(buildCheckoutFacts(attempt(), "pass", NOW, "A1DEMO00000").customer_id, "A1DEMO00000");
+  assert.equal(buildCheckoutFacts(attempt(), "pass", NOW, null).customer_id, null);
+  assert.equal(buildCheckoutFacts(attempt(), "pass", NOW).customer_id, null, "没传就是没读到");
+  assert.equal(buildCheckoutFacts(attempt(), "price_over_cap", NOW, "A2TEST00000").customer_id, "A2TEST00000");
 });
 
 test("读不到的值保持 null，不当成 0", () => {
@@ -100,18 +110,47 @@ test("toCents / centsToStr", () => {
   assert.equal(normalizeOutcome("drop_table"), "pass");
 });
 
-test("设置：服务端地址只允许本机；配对码 8 位", () => {
+test("设置：零设置可用（服务端地址缺省 http://127.0.0.1:8790）；地址只允许本机；工作区 ID 是可选的正整数；没有配对码、设备名称、浏览器类型", () => {
+  assert.deepEqual(DEFAULT_SETTINGS, { serverUrl: "http://127.0.0.1:8790", simulationOutcome: "pass", workspaceId: null });
+  assert.deepEqual(normalizeSettings(undefined), DEFAULT_SETTINGS);
+  assert.deepEqual(Object.keys(normalizeSettings({ serverUrl: "http://localhost:9000/", deviceName: "x", browser: "chrome", code: "AB12CD34" })).sort(), ["serverUrl", "simulationOutcome", "workspaceId"]);
   assert.deepEqual(validateServerUrl("http://127.0.0.1:8790"), { ok: true });
   assert.deepEqual(validateServerUrl("http://localhost:9000/"), { ok: true });
   assert.equal(validateServerUrl("http://192.168.1.20:8790").ok, false);
   assert.equal(validateServerUrl("http://127.0.0.1:8790/api").ok, false);
   assert.equal(validateServerUrl("ftp://127.0.0.1").ok, false);
   assert.equal(validateServerUrl("nonsense").ok, false);
+  // 永远连不上的地址一律不收（保存它会白白换掉令牌）：清单只有 http 的主机权限；fetch 拒绝带用户名密码的地址；
+  // 查询串、片段会让请求拼成「/?x=1/plugin/v1/…」。只写一个 ? 或 # 时 URL 解析出的 search、hash 是空的，所以看文本。
+  for (const [u, reason] of [
+    ["http://127.0.0.1:8790?x=1", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790#frag", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790?", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790#", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790?@attacker.example/", "只填协议、主机和端口，不要带路径"],
+    // 反斜杠：URL 解析当成「/」（路径看着是「/」），请求却拼成「//plugin/v1/…」，服务端答「接口不存在」
+    ["http://127.0.0.1:8790\\", "只填协议、主机和端口，不要带路径"],
+    ["http://localhost:8790\\/", "只填协议、主机和端口，不要带路径"],
+    ["http://user:pw@127.0.0.1:8790", "地址里不要带用户名或密码"],
+    ["http://user@localhost:8790", "地址里不要带用户名或密码"],
+    ["https://localhost:8790", "只支持 http 地址，例如 http://127.0.0.1:8790"],
+    ["https://127.0.0.1", "只支持 http 地址，例如 http://127.0.0.1:8790"],
+  ]) {
+    assert.deepEqual(validateServerUrl(u), { ok: false, reason }, u);
+  }
+  assert.deepEqual(validateServerUrl(" http://localhost:8790/ "), { ok: true }, "首尾空白与末尾斜杠照旧去掉");
+  assert.equal(normalizeSettings({ serverUrl: "http://127.0.0.1:8790?x=1" }).serverUrl, DEFAULT_SERVER_URL, "存下的坏地址读出来是缺省地址");
   assert.equal(normalizeSettings({ serverUrl: "http://evil.example" }).serverUrl, DEFAULT_SERVER_URL);
   assert.equal(normalizeSettings(null).simulationOutcome, "pass");
-  assert.equal(normalizePairingCode(" AB12-CD34 "), "AB12CD34");
-  assert.equal(isValidPairingCode("AB12-CD34"), true);
-  assert.equal(isValidPairingCode("AB12CD3"), false);
+  for (const [v, want] of [[2, 2], ["7", 7], [" 12 ", 12], ["", null], [null, null], [0, null], [-3, null], [1.5, null], ["abc", null], ["1e3", null]]) {
+    assert.equal(normalizeWorkspaceId(v), want, JSON.stringify(v));
+  }
+  assert.equal(normalizeSettings({ workspaceId: "5" }).workspaceId, 5);
+  assert.deepEqual(validateWorkspaceIdText("  "), { ok: true, value: null }, "留空可以");
+  assert.deepEqual(validateWorkspaceIdText("3"), { ok: true, value: 3 });
+  assert.equal(validateWorkspaceIdText("x3").ok, false);
+  assert.equal(consoleAccountsUrl("http://127.0.0.1:8790/"), "http://127.0.0.1:8790/accounts", "「打开控制台」= 服务端地址 + /accounts");
+  assert.equal(ORDER_HISTORY_URL, "https://www.amazon.com/gp/css/order-history");
 });
 
 test("日志只保留最近 50 行；错误码都有中文说明", () => {
@@ -119,7 +158,8 @@ test("日志只保留最近 50 行；错误码都有中文说明", () => {
   for (let i = 0; i < 60; i++) lines = appendLog(lines, { at: i, level: "info", text: `第 ${i} 行` });
   assert.equal(lines.length, 50);
   assert.equal(lines[0].text, "第 10 行");
-  assert.match(codeLabel("ACCOUNT_BUSY"), /其他设备/);
+  assert.match(codeLabel("ACCOUNT_BUSY"), /另一个浏览器/);
+  assert.match(codeLabel("DEVICE_BUSY"), /这个浏览器上一个批次还没有结束/);
   assert.match(codeLabel("PRICE_OVER_CAP"), /限价/);
   assert.equal(codeLabel("SOMETHING_NEW"), "其他原因（插件不认识这个错误码）", "认不出的码也不原样显示");
 });

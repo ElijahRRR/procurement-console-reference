@@ -1,0 +1,80 @@
+<!doctype html>
+<!--
+  页面内容全部是虚构的演示数据（DEMO 名称、明显是假值的买家号 ID），不对应任何真实账号。
+
+================================================================================
+  FIXTURE: planted-customer-id.html  —  搜索结果页（已登录），页面文本里被植入了 customerId
+================================================================================
+
+  为什么有这张夹具
+  ---------------------------------------------------------------------------
+    买家号 ID（customerId）现在是「领谁的任务」的钥匙：读错不再是被服务端拒绝，而是去执行别的账号。
+    而页面上有三处文本不是亚马逊自己写的：
+      a) <title>            —— 搜索词会被回显进标题；
+      b) 搜索框的 value     —— 搜索词会被回显进输入框的属性；
+      c) 商品标题           —— 卖家写的。
+    任何人只要让买家的浏览器打开一条 /s?k=customerId:'A…' 这样的链接，或者上架一个标题里带
+    customerId: "A…" 的商品，就能往整页 HTML 里塞一个形状合格的「买家号 ID」。
+    在整页 HTML 上跑正则、取第一个匹配的实现（参考项目与本仓库的旧实现都是）会在这里读到植入的值。
+
+  本夹具里的值
+  ---------------------------------------------------------------------------
+    真值（内联脚本里）   : A1DEMO00000   —— 同一个值出现两次（两种写法），算一致
+    植入的假值           : A9PLANT00001（标题）、A9PLANT00002（搜索框 value）、A9PLANT00003（商品标题）、
+                           A9PLANT00004（data- 属性）、A9PLANT00005（HTML 注释）
+    三个假值都排在真值**前面**。
+
+  期望（dom/parse.readCustomerId）
+  ---------------------------------------------------------------------------
+    只在内联脚本（script:not([src])）的文本里找 → 读出 A1DEMO00000；植入的五个值一个都读不到。
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- ① 植入：搜索词回显进标题 -->
+  <title>Amazon.com : customerId: 'A9PLANT00001'</title>
+  <!-- ⑤ 植入：注释里的文本 customerId: "A9PLANT00005" -->
+</head>
+<body>
+
+<header id="navbar">
+  <div id="nav-belt">
+    <form id="nav-search-bar-form" action="/s" role="search">
+      <!-- ② 植入：搜索词回显进输入框的 value -->
+      <input type="text" id="twotabsearchtextbox" name="field-keywords" value="customerId: &quot;A9PLANT00002&quot;" aria-label="Search Amazon">
+    </form>
+    <div id="nav-tools">
+      <a href="/gp/css/homepage.html?ref_=nav_youraccount_btn" id="nav-link-accountList" data-nav-role="signin">
+        <div class="nav-line-1-container"><span id="nav-link-accountList-nav-line-1" class="nav-line-1">Hello, Demo</span></div>
+        <span class="nav-line-2">Account &amp; Lists</span>
+      </a>
+      <div id="nav-flyout-accountList" style="display:none">
+        <a id="nav-item-signout" href="/gp/flex/sign-out.html?action=sign-out"><span class="nav-text">Sign Out</span></a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="s-main-slot">
+  <!-- ④ 植入：属性里的文本 -->
+  <div data-component-type="s-search-result" data-asin="B0DEMO0001" data-note="customerId: 'A9PLANT00004'">
+    <!-- ③ 植入：卖家写的商品标题 -->
+    <h2><a href="/dp/B0DEMO0001"><span>Demo Desk Lamp customerId: "A9PLANT00003" Warm White</span></a></h2>
+    <span class="a-price"><span class="a-offscreen">$12.99</span></span>
+  </div>
+</div>
+
+<!-- 外链脚本：有 src 的 script 没有内联文本，不参与 -->
+<script src="https://images-na.ssl-images-amazon.example/demo.js"></script>
+
+<!-- 真值：内联脚本里，两种写法各一次，同一个值 -->
+<script type="text/javascript">
+  var uet_config = { customerId: "", sessionId: "000-0000000-0000000" };
+  var P_config = { 'obfuscatedMarketplaceId': 'ATVPDKIKX0DER', 'customerId': 'A1DEMO00000' };
+</script>
+<script type="text/javascript">
+  window.ue_ctx = { customerId: "A1DEMO00000", weblab: "DEMO_WEBLAB_0000" };
+</script>
+
+</body>
+</html>

@@ -367,6 +367,41 @@ def used_columns(field_map: dict[str, Any]) -> list[str]:
     return out
 
 
+#: 来源指定买家号用到的两个系统字段
+BUYER_FIELD_KEYS = ("external_buyer_account", "external_buyer_customer_id")
+
+
+def missing_buyer_columns(field_map: dict[str, Any], field_types: dict[str, int]) -> list[str]:
+    """输入：field_map、来源表的 {列名: 字段类型} → 输出：字段对应给「买家号」「买家号 ID」配了、而来源表里已经找不到的
+    列名（按对应顺序、去重）；都在、或这两个字段没配列 → []。
+
+    只管「配了却找不到」（列被改名或删除），给提示文案与「新记录暂不接收」用；没配列是所有者自己的设置，不在这里。
+    哪个字段这次没读到统一看 unread_buyer_keys。
+    """
+    out: list[str] = []
+    for key in BUYER_FIELD_KEYS:
+        for col in _candidates(field_map.get(key)):
+            if col not in field_types and col not in out:
+                out.append(col)
+    return out
+
+
+def unread_buyer_keys(field_map: dict[str, Any], field_types: dict[str, int]) -> tuple[str, ...]:
+    """输入：field_map、来源表的 {列名: 字段类型} → 输出：这次读取**没读到**的买家号字段（BUYER_FIELD_KEYS 里的名字，
+    同序；也是 SourceRef.buyer_unread 要的记录字段名）。
+
+    一个字段没读到 = 字段对应里**没给它配列**，或配的**任一候选列**（含回退列，如「买家号1」）在来源表里找不到：少了一列
+    候选，就说不准这个字段的值该是什么。按列判断：「买家号 ID」那一列不见了不影响「买家号」照常读取，反过来也一样。
+    没读到不等于清空（契约 §2.1）：没读到的字段既不设置也不清除任务上的指定；两个都在结果里 = 这次读取对来源指定不表态。
+    """
+    out: list[str] = []
+    for key in BUYER_FIELD_KEYS:
+        cols = _candidates(field_map.get(key))
+        if not cols or any(col not in field_types for col in cols):
+            out.append(key)
+    return tuple(out)
+
+
 def record_to_values(fields: dict[str, Any], field_map: dict[str, Any],
                      field_types: dict[str, int] | None = None) -> dict[str, Any]:
     """输入：一条记录的 fields、field_map、{列名: 字段类型} → 输出：{系统字段: Python 值}。

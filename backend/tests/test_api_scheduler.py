@@ -1,21 +1,33 @@
 """后台调度（scheduler.py，契约 §9）：run_jobs_once 依次跑清扫、每日分配、飞书读取、飞书写回且从不抛异常；
 到期连接按 poll_minutes 读取；每日分配北京时间 00:01 之后每个北京日期只跑一次；一个任务失败不影响其他任务；
-调度线程能启动并按停止事件退出。全部数据虚构。"""
+调度线程能启动并按停止事件退出；serve 启动前检查库结构（旧版 / 没建表 / 连不上 → 打印说明并以非零码退出）。
+全部数据虚构。"""
 
 from __future__ import annotations
 
+import dataclasses
+import os
+import socket
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 import scheduler
+from registry import paths, settings
 from services import clock, execution
 from services import feishu_connections as fc
 from tests import factories as f
 from tests import factories_exec as fx
 from tests import fake_feishu as ff
 from tests.api_helpers import tx
+from tests.conftest import ADMIN_DSN, run_schema
+
+SCHEMA_V1 = Path(__file__).resolve().parent / "data" / "schema_v1.sql"
+OUTDATED = "数据库结构是旧版：请先运行 python cli.py db_init"
 
 NOW = datetime(2026, 10, 31, 2, 0, tzinfo=timezone.utc)   # 北京 2026-10-31 10:00
 
@@ -43,7 +55,7 @@ def test_run_jobs_once_sweeps_reads_feishu_and_flushes(fake):
     ws = _workspace()
     with tx() as conn:
         acc = fx.exec_account(conn, ws["id"])
-        dev = fx.paired_device(conn, ws, account=acc)
+        dev = fx.logged_in_device(conn, ws, account=acc)
         run_id = fx.start(conn, dev)
         fake.add_record(ff.DEMO_APP, ff.DEMO_TABLE, "recDEMO0001", ff.order_fields("PO-DEMO-SCH01"))
         cid = ff.create_demo_connection(conn, ws["id"], fake)["id"]
@@ -54,6 +66,7 @@ def test_run_jobs_once_sweeps_reads_feishu_and_flushes(fake):
     assert set(out) == {"sweep", "daily_allocation", "feishu_intake", "feishu_writeback"}
     assert all("error" not in v for v in out.values()), out
     assert out["sweep"]["expired_runs"] == [run_id]
+    assert set(out["sweep"]) == {"expired_runs", "orphan_attempts", "removed_devices", "aborted", "unknown"}
     assert out["feishu_intake"]["due"] == 1 and out["feishu_intake"]["connections"][str(cid)]["new"] == 1
     assert out["feishu_writeback"]["due"] == 0
     assert out["daily_allocation"]["bj_date"] == "2026-10-31"
@@ -126,7 +139,7 @@ def test_scheduler_threads_start_and_stop(monkeypatch):
     def fake_sweep(now):
         calls.append("sweep")
         seen.set()
-        return {"expired_runs": [], "revoked_runs": [], "orphan_attempts": [], "aborted": 0, "unknown": 0}
+        return {"expired_runs": [], "orphan_attempts": [], "removed_devices": [], "aborted": 0, "unknown": 0}
 
     monkeypatch.setattr(scheduler, "run_sweep", fake_sweep)
     monkeypatch.setattr(scheduler, "run_feishu_intake", lambda now: {"due": 0, "connections": {}})
@@ -192,7 +205,7 @@ def test_scheduler_intake_interval_comes_from_settings(monkeypatch):
 def test_run_sweep_passes_its_now_to_the_sweep(monkeypatch):
     seen: list = []
     monkeypatch.setattr(execution, "sweep", lambda conn, now=None: seen.append(now) or {
-        "expired_runs": [], "revoked_runs": [], "orphan_attempts": [], "aborted": 0, "unknown": 0})
+        "expired_runs": [], "orphan_attempts": [], "removed_devices": [], "aborted": 0, "unknown": 0})
     at = NOW + timedelta(minutes=5)
     scheduler.run_sweep(at)
     scheduler.run_jobs_once(at)
@@ -217,3 +230,103 @@ def test_serve_allows_the_host_it_binds_to(monkeypatch):
         assert c.get("/healthz").status_code == 200
     with TestClient(seen["app"], base_url="http://evil.example") as c:
         assert c.get("/healthz").status_code == 403
+
+
+def test_served_app_keeps_the_plugin_gate_even_when_bound_to_another_address(monkeypatch):
+    """`serve -p host=X` 只让控制台接受发往 X 的请求；/plugin 仍然只认本机对端与本机 Host。"""
+    import uvicorn
+    from starlette.testclient import TestClient
+
+    seen: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(app=app, kw=kw))
+    scheduler.serve(host="192.0.2.20", port="8797", jobs="0")
+    assert seen["kw"]["proxy_headers"] is False            # 对端地址取真实的套接字对端，不信 X-Forwarded-For
+    body = {"device_token": fx.device_token(), "ext_version": "0.2.0"}
+    with TestClient(seen["app"], base_url="http://192.0.2.20:8797", client=("192.0.2.30", 50000)) as c:
+        assert c.get("/healthz").status_code == 200
+        r = c.post("/plugin/v1/register", json=body)
+        assert r.status_code == 403 and "本机" in r.json()["message"]
+    with TestClient(seen["app"], base_url="http://192.0.2.20:8797", client=("127.0.0.1", 50000)) as c:
+        assert c.post("/plugin/v1/register", json=body).status_code == 403          # 本机对端，但 Host 不是本机名
+    _workspace()
+    with TestClient(seen["app"], base_url="http://127.0.0.1:8797", client=("127.0.0.1", 50000)) as c:
+        assert c.post("/plugin/v1/register", json=body).status_code == 200
+
+
+# ── serve 启动前的库结构检查（契约 §1「启动检查」）────────────────────────────
+
+
+def _point_settings_at(monkeypatch, dsn: str) -> None:
+    monkeypatch.setattr(settings, "_loaded", dataclasses.replace(settings.get(), pg_dsn=dsn))
+
+
+def _never_run(monkeypatch) -> list:
+    """把 uvicorn.run 与后台调度换成记录器：启动检查不通过时，它们都不该被调用。"""
+    import uvicorn
+
+    calls: list = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: calls.append("uvicorn"))
+    monkeypatch.setattr(scheduler.Scheduler, "start", lambda self: calls.append("scheduler"))
+    return calls
+
+
+def test_serve_refuses_to_start_on_an_old_schema(scratch_db, monkeypatch, capsys):
+    run_schema(scratch_db, SCHEMA_V1)
+    _point_settings_at(monkeypatch, scratch_db)
+    calls = _never_run(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        scheduler.serve(jobs="1")
+    assert e.value.code == OUTDATED                       # SystemExit(字符串)：解释器把它打印到标准错误输出，退出码 1
+    assert calls == []
+    # 升级之后就能启动
+    run_schema(scratch_db)
+    scheduler.serve(jobs="1")
+    assert calls == ["scheduler", "uvicorn"]
+    capsys.readouterr()
+
+
+def test_serve_refuses_to_start_before_db_init(scratch_db, monkeypatch):
+    _point_settings_at(monkeypatch, scratch_db)
+    calls = _never_run(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        scheduler.serve(jobs="0")
+    assert e.value.code == "数据库还没有建表：请先运行 python cli.py db_init" and calls == []
+
+
+def test_serve_refuses_to_start_when_the_database_is_unreachable(monkeypatch):
+    from psycopg.conninfo import make_conninfo
+
+    _point_settings_at(monkeypatch, make_conninfo(ADMIN_DSN, dbname="procure_demo_no_such_database"))
+    calls = _never_run(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        scheduler.serve(jobs="0")
+    assert str(e.value.code).startswith("启动失败：连不上数据库") and "python cli.py db_init" in str(e.value.code)
+    assert "\n" not in str(e.value.code) and calls == []
+
+
+def test_cli_serve_main_exits_non_zero_on_an_old_schema(scratch_db, monkeypatch):
+    import cli
+
+    run_schema(scratch_db, SCHEMA_V1)
+    _point_settings_at(monkeypatch, scratch_db)
+    calls = _never_run(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["serve", "-p", "jobs=0"])
+    assert e.value.code == OUTDATED and e.value.code != 0 and calls == []
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_cli_serve_process_prints_the_reason_and_exits_non_zero_on_an_old_schema(scratch_db):
+    """真的起一个进程：`python cli.py serve` 在旧结构的库上打印说明并以非零码退出，而不是带着旧结构跑起来。"""
+    run_schema(scratch_db, SCHEMA_V1)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PC_", "FEISHU_"))}
+    env["PC_PG_DSN"] = scratch_db
+    proc = subprocess.run([sys.executable, "cli.py", "serve", "-p", f"port={_free_port()}", "-p", "jobs=0"],
+                          cwd=paths.BACKEND_DIR, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert OUTDATED in proc.stderr and "Traceback" not in proc.stderr

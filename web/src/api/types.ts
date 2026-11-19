@@ -66,14 +66,19 @@ export type ReviewSource = (typeof REVIEW_SOURCES)[number]
 export const SOURCE_KINDS = ['feishu', 'file'] as const
 export type SourceKind = (typeof SOURCE_KINDS)[number]
 
-export const ASSIGNMENT_KINDS = ['auto', 'manual'] as const
+/** 分配方式：auto 自动分配 / manual 人工改派（固定）/ source 来源指定（飞书或上传的表格里写了买家号） */
+export const ASSIGNMENT_KINDS = ['auto', 'manual', 'source'] as const
 export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number]
 
 export const SUGGESTED_DATE_BASES = ['source', 'computed'] as const
 export type SuggestedDateBasis = (typeof SUGGESTED_DATE_BASES)[number]
 
-export const IDENTITY_STATUSES = ['unknown', 'match', 'mismatch', 'signed_out'] as const
-export type IdentityStatus = (typeof IDENTITY_STATUSES)[number]
+/**
+ * 浏览器的登录状态（GET /devices 的 login.state，含解析结果；插件心跳用同一套取值）：
+ * 还没有上报 / 未登录 / 已登录但没读到买家号 ID / 各标签页读数不一致 / 买家号还没登记 / 买家号已忽略 / 已登记（对应一个账号）。
+ */
+export const LOGIN_STATES = ['unknown', 'signed_out', 'no_id', 'conflict', 'unregistered', 'ignored', 'ready'] as const
+export type LoginState = (typeof LOGIN_STATES)[number]
 
 export const PURCHASE_MODES = ['manual', 'scheduled'] as const
 export type PurchaseMode = (typeof PURCHASE_MODES)[number]
@@ -99,8 +104,11 @@ export type SyncTrigger = (typeof SYNC_TRIGGERS)[number]
 export const RUN_TRIGGERS = ['manual', 'scheduled'] as const
 export type RunTrigger = (typeof RUN_TRIGGERS)[number]
 
-export const RUN_END_REASONS = ['finished', 'lease_expired', 'device_revoked', 'simulation_reset'] as const
+export const RUN_END_REASONS = ['finished', 'lease_expired', 'simulation_reset', 'identity_mismatch'] as const
 export type RunEndReason = (typeof RUN_END_REASONS)[number]
+/** 现在不再产生、但历史批次上还留着的结束原因（标签保留，旧记录还要显示） */
+export const LEGACY_RUN_END_REASONS = ['device_revoked'] as const
+export type LegacyRunEndReason = (typeof LEGACY_RUN_END_REASONS)[number]
 
 export const ALLOCATION_TRIGGERS = ['intake', 'import', 'manual', 'account_change', 'daily'] as const
 export type AllocationTrigger = (typeof ALLOCATION_TRIGGERS)[number]
@@ -169,7 +177,7 @@ export const PLUGIN_ERROR_CODES = [
 ] as const
 export type PluginErrorCode = (typeof PLUGIN_ERROR_CODES)[number]
 
-/** 统一错误码（§8） */
+/** 统一错误码（§8；顺序与契约、插件的 SERVER_CODE_LABEL 相同） */
 export const API_ERROR_CODES = [
   'UNAUTHORIZED',
   'FORBIDDEN',
@@ -177,12 +185,16 @@ export const API_ERROR_CODES = [
   'VALIDATION',
   'CONFLICT',
   'ACCOUNT_BUSY',
+  'DEVICE_BUSY',
   'ATTEMPT_IN_FLIGHT',
   'IDENTITY_MISMATCH',
-  'NOT_BOUND',
+  'ACCOUNT_NOT_REGISTERED',
   'ACCOUNT_PAUSED',
   'REAL_PURCHASE_DISABLED',
   'LEASE_LOST',
+  'SLOT_DONE',
+  'WORKSPACE_REQUIRED',
+  'PLUGIN_OUTDATED',
   'FEISHU_NOT_CONFIGURED',
   'FEISHU_ERROR',
   'INVALID_TRANSITION',
@@ -266,6 +278,17 @@ export interface LatestAttempt {
   finished_at: Timestamp | null
 }
 
+/**
+ * 来源指定的买家号（任务行与详情的 designated_buyer；两列都空时整项为 null）：来源行没有可信的 AMZ 订单号、
+ * 又填了「买家号 ID」或「买家号」时，这一行指定了采购账号。account 是此刻解析到的未归档账号（解析不出为 null；
+ * 旧服务端不给这个键）。
+ */
+export interface DesignatedBuyer {
+  customer_id: string | null
+  name: string | null
+  account?: Ref | null
+}
+
 export interface OrderRow {
   id: number
   upstream_order_no: string
@@ -295,6 +318,8 @@ export interface OrderRow {
   assigned_account: Ref | null
   assignment_kind: AssignmentKind | null
   assignment_note: string | null
+  /** 来源指定的买家号；没有指定为 null（旧服务端不给这个键，按没有指定处理） */
+  designated_buyer?: DesignatedBuyer | null
   primary_source_kind: SourceKind
   source_kinds: SourceKind[]
   latest_attempt: LatestAttempt | null
@@ -379,8 +404,8 @@ export interface OrderSource {
   snapshot: Record<string, unknown>
 }
 
-/** 护栏检查项（services/guard.CHECK_ORDER 的顺序） */
-export const GUARD_CHECK_KEYS = ['item', 'zip', 'subtotal', 'price_cap', 'delivery', 'data', 'card'] as const
+/** 护栏检查项（services/guard.CHECK_ORDER 的顺序）；buyer = 结算页登录的买家号必须是批次账号登记的买家号 ID */
+export const GUARD_CHECK_KEYS = ['buyer', 'item', 'zip', 'subtotal', 'price_cap', 'delivery', 'data', 'card'] as const
 export type GuardCheckKey = (typeof GUARD_CHECK_KEYS)[number]
 
 /** 护栏单项结果（services/guard.evaluate）：ok 为 true 通过 / false 不通过 / null 缺数据无法判定 */
@@ -508,9 +533,14 @@ export interface AllocationSummary {
   bj_date: DateStr
   at: Timestamp
   trigger: AllocationTrigger | string
-  stats: { considered: number; assigned: number; coverage: number; fill: number; unassigned: number }
+  /**
+   * assigned = coverage + fill + designated。designated 是按来源指定分出的笔数；升级前存下的分配记录没有这个键，
+   * 显示时按 0 处理。
+   */
+  stats: { considered: number; assigned: number; coverage: number; fill: number; designated?: number; unassigned: number }
   uncovered: { account_id: number; name: string; date: DateStr; reason: string }[]
-  unassigned: { order_id: number; upstream_order_no: string; reason: string }[]
+  /** designated = 这一笔是来源指定了买家号而没分出去的（不会自动分给别的账号） */
+  unassigned: { order_id: number; upstream_order_no: string; reason: string; designated?: boolean }[]
 }
 
 // ── 概览 ──────────────────────────────────────────────────────────────────────
@@ -523,14 +553,17 @@ export interface Overview {
   today_executable: number
   future_assigned: number
   accounts: { total: number; enabled: number; paused: number }
+  /** 装了插件的浏览器（只算没有移除的） */
   devices: { total: number; online: number }
+  /** 还没登记也没忽略的买家号个数：插件读到的与来源指定的合在一起算 */
+  discovered_buyers?: number
   recent_exceptions: OrderRow[]
   last_allocation: AllocationSummary | null
   simulation_only: boolean
   feishu_configured: boolean
 }
 
-// ── 账号与设备 ────────────────────────────────────────────────────────────────
+// ── 账号与浏览器 ──────────────────────────────────────────────────────────────
 
 export interface QuotaToday {
   limit: number
@@ -539,11 +572,11 @@ export interface QuotaToday {
   available: number
 }
 
-export interface AccountDevice {
+/** 一个装了插件的浏览器的简要信息（账号的「所在浏览器」、待登记买家号的来源浏览器） */
+export interface BrowserRef {
   id: number
   name: string
   online: boolean
-  identity_status: IdentityStatus
   last_seen_at: Timestamp | null
 }
 
@@ -576,11 +609,11 @@ export interface Account {
   open_result_unknown?: number
   purchase_mode: PurchaseMode
   schedule_times: string[]
-  default_device_id: number | null
   expected_card_last4: string | null
   notes: string | null
   quota_today: QuotaToday
-  devices: AccountDevice[]
+  /** 当前登录着这个账号的买家号的浏览器（没有移除的）；账号没登记买家号 ID 时为空 */
+  browsers: BrowserRef[]
   active_run: ActiveRun | null
   created_at: Timestamp
   updated_at: Timestamp
@@ -599,36 +632,56 @@ export interface AccountInput {
   sync_enabled?: boolean
   purchase_mode?: PurchaseMode
   schedule_times?: string[]
-  default_device_id?: number | null
   expected_card_last4?: string | null
   notes?: string | null
 }
 
-export interface DeviceIdentity {
-  signed_in: boolean
-  customer_id: string | null
-  site: string | null
-  page_url: string | null
-  at: Timestamp | null
+/**
+ * 还没登记到任何账号的买家号（GET /accounts/discovered 的一项）：插件在浏览器里读到的，加上来源指定给未采购任务、
+ * 还没有账号登记的买家号 ID；按买家号 ID 聚合。browsers 是当前登录着它的浏览器（只来自来源的项为空，
+ * last_reported_at 为 null），name_hint 是来源数据里这个 ID 最近用过的「买家号」名称（查不到为 null）。
+ * include_ignored 时带上忽略名单里的全部 ID（不要求此刻有浏览器登录着）。
+ */
+export interface DiscoveredBuyer {
+  customer_id: string
+  ignored: boolean
+  browsers: BrowserRef[]
+  last_reported_at: Timestamp | null
+  name_hint: string | null
+  /** 来源指定了这个买家号 ID 的未采购任务数；0 = 只来自浏览器（旧服务端不给这个键，按 0 处理） */
+  source_orders?: number
 }
 
+/** 浏览器当前的登录状态：state 含解析结果；stale = 太久没有上报（执行前要重新上报） */
+export interface DeviceLogin {
+  state: LoginState
+  customer_id: string | null
+  at: Timestamp | null
+  stale: boolean
+}
+
+/** 浏览器上未结束的执行批次 */
+export interface DeviceRun {
+  id: number
+  account_id: number
+  started_at: Timestamp
+  simulated: boolean
+}
+
+/** 一个装了插件的浏览器（接口路径与字段沿用 device） */
 export interface Device {
   id: number
   name: string
-  browser: string | null
   ext_version: string | null
-  bound_account: Ref | null
   online: boolean
   last_seen_at: Timestamp | null
-  identity: DeviceIdentity | null
-  identity_status: IdentityStatus
   created_at: Timestamp
-  revoked_at: Timestamp | null
-}
-
-export interface PairingCode {
-  code: string
-  expires_at: Timestamp
+  /** 从列表里移除的时刻；没有移除为 null（插件再次联系服务端时自动清空） */
+  hidden_at: Timestamp | null
+  login: DeviceLogin
+  /** login.state = ready 时对应的账号；execution_paused 服务端给了就用，没给时由页面按账号列表补 */
+  account: (Ref & { execution_paused?: boolean }) | null
+  active_run: DeviceRun | null
 }
 
 // ── 设置 ──────────────────────────────────────────────────────────────────────
@@ -698,7 +751,11 @@ export interface FeishuConnection {
   last_sync_at: Timestamp | null
   last_sync_ok_at: Timestamp | null
   last_error: string | null
-  last_stats: Record<string, number> | null
+  /**
+   * 最近一次成功读取的统计；那次读取有说整个连接的问题（scope = 'connection'，如来源表里找不到买家号列）时
+   * 另带 problems（只有连接级的），没有就不带这个键（services/feishu_intake.run_connection）
+   */
+  last_stats: SyncStats | null
   created_at: Timestamp
   updated_at: Timestamp
 }
@@ -784,6 +841,13 @@ export interface FeishuPreviewInput {
   limit: number
 }
 
+/**
+ * 读取统计：{read, new, update, unchanged, conflict, historical, skipped, invalid} 各项条数（旧记录可能缺键）；
+ * 带问题样本时另有 problems：读取记录里是这次读取的全部问题样本（连接级的在最前面，记录级的最多 100 条），
+ * 连接的 last_stats 里只有连接级的。
+ */
+export type SyncStats = { [key: string]: number | SyncProblem[] | undefined } & { problems?: SyncProblem[] }
+
 export interface SyncRun {
   id: number
   connection_id: number
@@ -791,16 +855,21 @@ export interface SyncRun {
   started_at: Timestamp
   finished_at: Timestamp | null
   ok: boolean | null
-  stats: Record<string, number> | null
+  stats: SyncStats | null
   error: string | null
 }
 
-/** 读取中有问题的记录样本（跳过、无效、待核实） */
+/**
+ * 读取中有问题的记录样本（跳过、无效、待核实）。scope = 'connection' 的一条说的是整个连接而不是某条记录
+ * （如「来源表里找不到买家号列「…」，这一列的指定保持上次读到的内容，新记录暂不接收」）：record_id 为 null，
+ * 不计入 skipped 等统计；它同时带在连接的 last_stats.problems 里，连接卡片据此提示。
+ */
 export interface SyncProblem {
-  record_id: string
+  record_id: string | null
   upstream_order_no: string | null
   verdict: FeishuVerdict
   reason: string | null
+  scope?: 'connection' | string | null
 }
 
 /** POST /feishu/connections/{id}/sync 的结果（services/feishu_intake.run_connection） */

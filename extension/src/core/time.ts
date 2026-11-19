@@ -52,6 +52,14 @@ export function bjShort(v: number | string | null | undefined): string | null {
   return `${pad(p.mo)}-${pad(p.d)} ${pad(p.h)}:${pad(p.mi)}`;
 }
 
+/** 输入：epoch 毫秒或 ISO 字符串 → 输出：北京时间 `HH:MM`；解析不了返回 null。 */
+export function bjHm(v: number | string | null | undefined): string | null {
+  const ms = typeof v === "number" ? v : parseIsoMs(v);
+  if (ms === null || !Number.isFinite(ms)) return null;
+  const p = bjParts(ms);
+  return `${pad(p.h)}:${pad(p.mi)}`;
+}
+
 /** 输入：北京日期 `YYYY-MM-DD` → 输出：这一天北京时间 00:00 的 epoch 毫秒；格式不对返回 null。 */
 export function bjMidnight(date: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);

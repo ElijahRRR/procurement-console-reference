@@ -50,6 +50,11 @@ ATTEMPT_INFLIGHT = frozenset({"claimed", "checking", "guard_passed", "submitting
 #: 不占额度的尝试结局
 ATTEMPT_QUOTA_FREE = frozenset({"failed", "aborted"})
 
+# ── 买家号 ID ─────────────────────────────────────────────────────────────────
+#: 亚马逊 customerId 的形状（库里 buyer_accounts.amazon_customer_id 的 CHECK 同一条）。买家号的身份就是它：
+#: 账号登记、插件上报、开始批次、护栏 buyer 项都按这个形状校验；一律先去空白、转大写再比。
+CUSTOMER_ID_RE = re.compile(r"^A[0-9A-Z]{8,}$")
+
 # ── 执行所需字段（缺一即 needs_info）────────────────────────────────────────────
 
 REQUIRED_FOR_EXECUTION = (
@@ -74,7 +79,10 @@ EXECUTION_FIELDS = (
 
 # ── 插件错误码 ────────────────────────────────────────────────────────────────
 # category：task = 本任务转异常；account = 暂停账号执行、任务保留；retry_once = 提交前页面错误自动重试一次；
-#           abort = 插件按服务端指示中止；guard = 服务端护栏拦截（按 task 处理）。
+#           abort = 未提交前中止（任务回已分配、不暂停账号、不占额度）；guard = 服务端护栏拦截（按 task 处理）。
+# IDENTITY_MISMATCH 是中止类：执行中途换了买家号不是账号的问题，不暂停账号；它同时是护栏 buyer 项的拦截码
+# （结算页登录的买家号不是批次的买家号，见 services/guard）。护栏在这一项拦下时落地也是中止类（尝试 aborted、任务回
+# 已分配、不进异常），服务端同时把批次结束（end_reason = identity_mismatch，见 services/execution._buyer_blocked）。
 
 
 @dataclass(frozen=True)
@@ -95,10 +103,10 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("ACCOUNT_RESTRICTED", "account", "买家账号受限"),
     ErrorCode("CARD_DECLINED", "account", "银行卡被拒付"),
     ErrorCode("CAPTCHA_ENCOUNTERED", "account", "遇到验证码或风控验证，需要人工处理"),
-    ErrorCode("IDENTITY_MISMATCH", "account", "浏览器登录的买家账号与绑定不符"),
+    ErrorCode("IDENTITY_MISMATCH", "abort", "执行中途浏览器登录的买家号变了"),
     ErrorCode("ABORTED_UPSTREAM_CANCELLED", "abort", "上游已取消，已中止"),
     ErrorCode("ABORTED_BY_USER", "abort", "插件端人工中止"),
-    ErrorCode("ABORTED_BY_SERVER", "abort", "服务端要求中止（账号暂停或归档、身份不符或过期、来源有变化），未提交前中止"),
+    ErrorCode("ABORTED_BY_SERVER", "abort", "服务端要求中止（账号暂停或归档、浏览器登录的买家号变了或登录状态过期、来源有变化），未提交前中止"),
     ErrorCode("ITEM_MISMATCH", "guard", "结算商品或数量与任务不一致"),
     ErrorCode("ZIP_MISMATCH", "guard", "收货邮编与任务不一致"),
     ErrorCode("SUBTOTAL_OUT_OF_RANGE", "guard", "商品小计不在账号金额区间内"),
@@ -111,6 +119,17 @@ ERROR_CODES: dict[str, ErrorCode] = {e.code: e for e in (
     ErrorCode("SUBMIT_REJECTED", "task", "服务端拒绝了提交登记"),
     ErrorCode("PLUGIN_SIMULATION_ONLY", "account", "插件只执行模拟任务，却领到了真实任务"),
 )}
+
+
+# ── 接口统一错误码 ────────────────────────────────────────────────────────────
+#: 接口错误体 {code, message, detail} 里 code 的全部取值（契约 §8）。顺序与契约、web/src/api/types.ts 的
+#: API_ERROR_CODES、extension/src/core/codes.ts 的 SERVER_CODE_LABEL 相同；服务层抛出的 DomainError 只用这里的码。
+API_ERROR_CODES: tuple[str, ...] = (
+    "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION", "CONFLICT", "ACCOUNT_BUSY", "DEVICE_BUSY",
+    "ATTEMPT_IN_FLIGHT", "IDENTITY_MISMATCH", "ACCOUNT_NOT_REGISTERED", "ACCOUNT_PAUSED", "REAL_PURCHASE_DISABLED",
+    "LEASE_LOST", "SLOT_DONE", "WORKSPACE_REQUIRED", "PLUGIN_OUTDATED", "FEISHU_NOT_CONFIGURED", "FEISHU_ERROR",
+    "INVALID_TRANSITION", "SOURCE_CHANGED", "GUARD_BLOCKED", "RATE_LIMITED", "METHOD_NOT_ALLOWED", "INTERNAL",
+)
 
 
 # ── 上游记录与来源引用 ────────────────────────────────────────────────────────
@@ -184,9 +203,23 @@ class UpstreamRecord:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+#: 上游记录里承载来源指定的两个字段（买家号 ID、买家号；services/designation.RECORD_KEYS 就是它）
+BUYER_RECORD_KEYS = ("external_buyer_customer_id", "external_buyer_account")
+
+
 @dataclass
 class SourceRef:
-    """一条上游记录来自哪里。飞书：connection_id + record_id；文件：batch_id + row_no。"""
+    """一条上游记录来自哪里。飞书：connection_id + record_id；文件：batch_id + row_no。
+
+    来源这次读没读到「买家号」「买家号 ID」是**按列**说的（没读到不等于清空，契约 §2.1）：
+
+    - buyer_unread：这次**没读到**的记录字段名（BUYER_RECORD_KEYS 里的名字）。飞书：字段对应里没给它配列，或配的任一
+      候选列在来源表里找不到（被改名或删除）；文件：批次的列对应里没有对应到这个字段。没读到的字段这次既不设置也不清除
+      任务上的指定，来源关联里沿用上次读到的值。
+    - buyer_readable=False：两个字段都没读到（等同 buyer_unread 列全两个），这次读取对来源指定不表态。
+
+    两者合起来的结果统一用 services/designation.unread_keys(source) 取，别处不要各自拼。
+    """
 
     kind: str                               # feishu / file
     snapshot: dict[str, Any]                # 来源原始字段 → 值（已转成可 JSON 的形式）
@@ -194,8 +227,14 @@ class SourceRef:
     record_id: str | None = None
     batch_id: int | None = None
     row_no: int | None = None
+    buyer_readable: bool = True
+    buyer_unread: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        self.buyer_unread = tuple(self.buyer_unread or ())
+        unknown = [k for k in self.buyer_unread if k not in BUYER_RECORD_KEYS]
+        if unknown:
+            raise ValueError(f"buyer_unread 里有未知的字段名 {unknown}")
         if self.kind == "feishu" and (self.connection_id is None or not self.record_id):
             raise ValueError("飞书来源需要 connection_id 与 record_id")
         if self.kind == "file" and (self.batch_id is None or self.row_no is None):

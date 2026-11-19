@@ -1,10 +1,12 @@
-/** 两道闸（移植自早期实现 core/serial.ts 与 core/singleflight.ts），都不碰 chrome API。
+/** 三道闸（前两道移植自早期实现 core/serial.ts 与 core/singleflight.ts），都不碰 chrome API。
  *
  * 分工：
  *   · `SingleFlight`：同一时刻只允许一件事在跑，第二件**直接挡掉**
  *     （本标签页已经在执行，再点一次「开始执行」或定时到点都不再开第二个）；
  *   · `Serial`：把异步动作排成一条队，第二件**排队等**
- *     （两条租约请求都要有答复，只是不许同时「读存储 → 裁决 → 写存储」）。
+ *     （两条租约请求都要有答复，只是不许同时「读存储 → 裁决 → 写存储」）；
+ *   · `SharedFlight`：同一时刻只有一件在跑，后到的**搭同一班**、拿同一个结果
+ *     （心跳、身份上报、协议转发同时发现要登记时，只发一个登记请求）。
  */
 
 /** 单飞闸。**检查与置位之间一个 await 都不许有**：中间只要夹一次 await，
@@ -26,6 +28,26 @@ export class SingleFlight {
     } finally {
       this.inFlight = false;
     }
+  }
+}
+
+/** 共享单飞闸：有一件在跑时，后到的不另起一件，等同一个结果（成功、失败都一样）。 */
+export class SharedFlight<T> {
+  private flying: Promise<T> | null = null;
+
+  get busy(): boolean {
+    return this.flying !== null;
+  }
+
+  /** 输入：一件要干的活 → 输出：它的结果；已经有一件在跑时返回那一件的结果，传进来的这件不执行。 */
+  run(job: () => Promise<T>): Promise<T> {
+    if (this.flying) return this.flying;
+    // 置位之前不能有 await：job() 同步返回 Promise，赋值在同一个同步段里完成。
+    const p = (async () => job())().finally(() => {
+      if (this.flying === p) this.flying = null;
+    });
+    this.flying = p;
+    return p;
   }
 }
 

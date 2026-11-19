@@ -10,6 +10,7 @@ import type {
   AllocationSummary,
   Attempt,
   Device,
+  DiscoveredBuyer,
   EventRecord,
   FeishuConnection,
   FeishuFieldsResult,
@@ -26,6 +27,7 @@ import type {
   Overview,
   ResolvedLink,
   Settings,
+  SyncProblem,
   SyncRun,
   SystemFields,
   UploadResult,
@@ -38,7 +40,13 @@ export interface Fixtures {
   me: Me
   settings: Settings
   accounts: Account[]
+  /** 装了插件的浏览器（含一条已移除的） */
   devices: Device[]
+  /**
+   * 还没登记的买家号：插件读到的两个、只来自来源指定的一个（没有浏览器登录着），
+   * 外加忽略名单里的两个（一个有浏览器登录着，一个没有）
+   */
+  discovered: DiscoveredBuyer[]
   orders: OrderRow[]
   details: Record<number, OrderDetail>
   lastAllocation: AllocationSummary
@@ -89,74 +97,153 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     },
   }
 
-  // ── 设备与账号 ──────────────────────────────────────────────────────────────
+  // ── 浏览器与账号 ────────────────────────────────────────────────────────────
+  // 买家号 ID 全部虚构：已登记的用 A1DEMO…，还没登记的（插件读到的、来源指定的）用 A2TEST…
 
   const devices: Device[] = [
     {
+      // 登录着已登记的买家号，正在执行
       id: 5,
       name: 'Mac-AdsPower-DEMO-01',
-      browser: 'adspower',
-      ext_version: '0.1.0',
-      bound_account: { id: 3, name: '环境-DEMO-01' },
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(0.5),
-      identity: { signed_in: true, customer_id: 'A1DEMO00001', site: 'US', page_url: 'https://www.amazon.com/gp/css/homepage.html', at: ago(1) },
-      identity_status: 'match',
       created_at: ago(60 * 24 * 6),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00001', at: ago(1), stale: false },
+      account: { id: 3, name: '环境-DEMO-01' },
+      active_run: { id: 9, account_id: 3, started_at: ago(6), simulated: true },
     },
     {
+      // 离线：上报已过期
       id: 6,
       name: 'Mac-Chrome-DEMO-02',
-      browser: 'chrome',
-      ext_version: '0.1.0',
-      bound_account: { id: 4, name: '环境-DEMO-02' },
+      ext_version: '0.2.0',
       online: false,
       last_seen_at: ago(60 * 5),
-      identity: { signed_in: true, customer_id: 'A1DEMO00002', site: 'US', page_url: 'https://www.amazon.com/', at: ago(60 * 5) },
-      identity_status: 'match',
       created_at: ago(60 * 24 * 4),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00002', at: ago(60 * 5), stale: true },
+      account: { id: 4, name: '环境-DEMO-02' },
+      active_run: null,
     },
     {
+      // 对应的账号已暂停执行
       id: 7,
       name: 'Win-AdsPower-DEMO-03',
-      browser: 'adspower',
-      ext_version: '0.1.0',
-      bound_account: { id: 7, name: '环境-DEMO-03' },
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(1),
-      identity: { signed_in: true, customer_id: 'A9OTHER0099', site: 'US', page_url: 'https://www.amazon.com/', at: ago(2) },
-      identity_status: 'mismatch',
       created_at: ago(60 * 24 * 2),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'ready', customer_id: 'A1DEMO00003', at: ago(2), stale: false },
+      account: { id: 7, name: '环境-DEMO-03' },
+      active_run: null,
     },
     {
+      // 已从列表移除（「显示已移除」时才出现）
       id: 8,
       name: 'Mac-Chrome-DEMO-旧环境',
-      browser: 'chrome',
-      ext_version: '0.0.9',
-      bound_account: null,
+      ext_version: '0.1.0',
       online: false,
       last_seen_at: ago(60 * 24 * 9),
-      identity: null,
-      identity_status: 'unknown',
       created_at: ago(60 * 24 * 20),
-      revoked_at: ago(60 * 24 * 8),
+      hidden_at: ago(60 * 24 * 8),
+      login: { state: 'unknown', customer_id: null, at: null, stale: true },
+      account: null,
+      active_run: null,
     },
     {
       id: 9,
-      name: 'Mac-Chrome-DEMO-新装',
-      browser: 'chrome',
-      ext_version: '0.1.0',
-      bound_account: null,
+      name: '浏览器 9',
+      ext_version: '0.2.0',
       online: true,
       last_seen_at: ago(0.2),
-      identity: { signed_in: false, customer_id: null, site: 'US', page_url: 'https://www.amazon.com/ap/signin', at: ago(0.3) },
-      identity_status: 'signed_out',
       created_at: ago(12),
-      revoked_at: null,
+      hidden_at: null,
+      login: { state: 'signed_out', customer_id: null, at: ago(0.3), stale: false },
+      account: null,
+      active_run: null,
     },
+    {
+      // 读到了还没登记的买家号
+      id: 10,
+      name: '浏览器 10',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.4),
+      created_at: ago(9),
+      hidden_at: null,
+      login: { state: 'unregistered', customer_id: 'A2TEST00005', at: ago(1), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      // 还没登记的买家号，来源里的名称与一个没登记 ID 的账号同名
+      id: 11,
+      name: '浏览器 11',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.6),
+      created_at: ago(8),
+      hidden_at: null,
+      login: { state: 'unregistered', customer_id: 'A2TEST00004', at: ago(3), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 12,
+      name: '浏览器 12',
+      ext_version: '0.2.0',
+      online: false,
+      last_seen_at: ago(60 * 10),
+      created_at: ago(60 * 24),
+      hidden_at: null,
+      login: { state: 'ignored', customer_id: 'A2TEST00099', at: ago(60 * 10), stale: true },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 13,
+      name: '浏览器 13',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.3),
+      created_at: ago(30),
+      hidden_at: null,
+      login: { state: 'no_id', customer_id: null, at: ago(0.5), stale: false },
+      account: null,
+      active_run: null,
+    },
+    {
+      id: 14,
+      name: '浏览器 14',
+      ext_version: '0.2.0',
+      online: true,
+      last_seen_at: ago(0.1),
+      created_at: ago(45),
+      hidden_at: null,
+      login: { state: 'conflict', customer_id: null, at: ago(0.2), stale: false },
+      account: null,
+      active_run: null,
+    },
+  ]
+
+  const browserRef = (id: number) => {
+    const d = devices.find((x) => x.id === id)!
+    return { id: d.id, name: d.name, online: d.online, last_seen_at: d.last_seen_at }
+  }
+
+  // source_orders = 来源指定了这个 ID 的未采购任务数（与下面任务夹具里的指定对得上）
+  const discovered: DiscoveredBuyer[] = [
+    // 浏览器登录着，来源也指定了一笔任务给它
+    { customer_id: 'A2TEST00005', ignored: false, browsers: [browserRef(10)], last_reported_at: ago(1), name_hint: '环境-DEMO-05', source_orders: 1 },
+    { customer_id: 'A2TEST00004', ignored: false, browsers: [browserRef(11)], last_reported_at: ago(3), name_hint: '环境-DEMO-04', source_orders: 0 },
+    { customer_id: 'A2TEST00099', ignored: true, browsers: [browserRef(12)], last_reported_at: ago(60 * 10), name_hint: null, source_orders: 0 },
+    // 只来自来源指定：没有浏览器登录着这个买家号（没有上报时间的排在后面）
+    { customer_id: 'A2TEST00007', ignored: false, browsers: [], last_reported_at: null, name_hint: '环境-DEMO-07', source_orders: 2 },
+    // 忽略名单里的 ID 此刻没有浏览器登录着也要列出来，否则无处恢复
+    { customer_id: 'A2TEST00098', ignored: true, browsers: [], last_reported_at: null, name_hint: null, source_orders: 0 },
   ]
 
   const accounts: Account[] = [
@@ -180,11 +267,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'scheduled',
       schedule_times: ['14:00', '16:30'],
-      default_device_id: 5,
       expected_card_last4: '1234',
       notes: null,
       quota_today: { limit: 20, used: 3, planned: 5, available: 12 },
-      devices: [{ id: 5, name: 'Mac-AdsPower-DEMO-01', online: true, identity_status: 'match', last_seen_at: ago(0.5) }],
+      browsers: [browserRef(5)],
       active_run: { id: 9, device_id: 5, device_name: 'Mac-AdsPower-DEMO-01', started_at: ago(6) },
       created_at: ago(60 * 24 * 10),
       updated_at: ago(60 * 3),
@@ -209,11 +295,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
-      default_device_id: null,
       expected_card_last4: null,
       notes: '只接 FBA 商品',
       quota_today: { limit: 15, used: 15, planned: 0, available: 0 },
-      devices: [{ id: 6, name: 'Mac-Chrome-DEMO-02', online: false, identity_status: 'match', last_seen_at: ago(60 * 5) }],
+      browsers: [browserRef(6)],
       active_run: null,
       created_at: ago(60 * 24 * 9),
       updated_at: ago(60 * 20),
@@ -239,11 +324,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 1,
       purchase_mode: 'scheduled',
       schedule_times: ['15:00'],
-      default_device_id: 7,
       expected_card_last4: null,
       notes: null,
       quota_today: { limit: 10, used: 1, planned: 2, available: 7 },
-      devices: [{ id: 7, name: 'Win-AdsPower-DEMO-03', online: true, identity_status: 'mismatch', last_seen_at: ago(1) }],
+      browsers: [browserRef(7)],
       active_run: null,
       created_at: ago(60 * 24 * 8),
       updated_at: ago(95),
@@ -268,11 +352,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       open_result_unknown: 0,
       purchase_mode: 'manual',
       schedule_times: [],
-      default_device_id: null,
       expected_card_last4: null,
       notes: '新账号，暂不接单',
       quota_today: { limit: 20, used: 0, planned: 0, available: 20 },
-      devices: [],
+      browsers: [],
       active_run: null,
       created_at: ago(60 * 24),
       updated_at: ago(60 * 24),
@@ -303,8 +386,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     cap: string | null
     date: number | null
     account?: number
-    kind?: 'auto' | 'manual'
+    kind?: 'auto' | 'manual' | 'source'
     note?: string | null
+    /** 来源指定的买家号：买家号 ID、买家号（名称）、解析到的账号 id（解析不出为 null） */
+    designated?: { id?: string | null; name?: string | null; account?: number | null }
     reason?: string | null
     missing?: string[]
     review?: 'approved' | 'rejected' | 'unknown'
@@ -352,6 +437,9 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       assigned_account: spec.account ? acc(spec.account) : null,
       assignment_kind: spec.account ? (spec.kind ?? 'auto') : null,
       assignment_note: spec.note ?? null,
+      designated_buyer: spec.designated
+        ? { customer_id: spec.designated.id ?? null, name: spec.designated.name ?? null, account: spec.designated.account ? acc(spec.designated.account) : null }
+        : null,
       primary_source_kind: sources[0],
       source_kinds: sources,
       latest_attempt: spec.attempt ?? null,
@@ -468,6 +556,42 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       attempt: { id: 33, status: 'aborted', amazon_order_no: null, total: null, simulated: true, error_code: 'ABORTED_UPSTREAM_CANCELLED', finished_at: ago(70) },
     }),
     row({ status: 'closed', unit: '26.00', qty: 1, cap: '33.00', date: -4, reason: '人工决定不重采' }),
+    // ── 来源指定买家号（新任务加在末尾，前面任务的 id 不变）──
+    // 按来源的买家号 ID 分给登记了它的账号
+    row({
+      status: 'assigned', unit: '36.80', qty: 1, cap: '46.00', date: 0, account: 4, kind: 'source',
+      note: '按来源的买家号 ID A1DEMO00002', designated: { id: 'A1DEMO00002', name: '环境-DEMO-02', account: 4 },
+    }),
+    // 只填了买家号：按名称宽松匹配到账号（来源里多写了空格）
+    row({
+      status: 'assigned', unit: '25.60', qty: 1, cap: '33.00', date: 1, account: 3, kind: 'source', sources: ['file'],
+      note: '按来源的买家号「环境 - DEMO - 01」（对应账号 环境-DEMO-01）', designated: { name: '环境 - DEMO - 01', account: 3 },
+    }),
+    // 来源指定了 环境-DEMO-01，人工改派到了 环境-DEMO-02：留在改派账号期间不跟随来源。
+    // 后来上传的文件里同一订单写了另一个买家号：文件不是主来源，没有采用（时间线上有一条 order.designation_not_adopted）
+    row({
+      status: 'assigned', unit: '27.30', qty: 1, cap: '35.00', date: 0, account: 4, kind: 'manual', sources: ['feishu', 'file'],
+      note: '人工改派', designated: { id: 'A1DEMO00001', name: '环境-DEMO-01', account: 3 },
+    }),
+    // 指定的买家号 ID 还没有登记（浏览器登录着它，见待登记的买家号）
+    row({
+      status: 'queued', unit: '22.40', qty: 1, cap: '29.00', date: 0, designated: { id: 'A2TEST00005', name: '环境-DEMO-05', account: null },
+      reason: '来源指定的买家号 ID A2TEST00005（买家号「环境-DEMO-05」）还没有登记为账号；在「账号与浏览器」登记后会自动分配',
+    }),
+    // 指定的买家号 ID 只出现在来源里：两笔任务在等它
+    row({
+      status: 'queued', unit: '31.50', qty: 1, cap: '40.00', date: 0, designated: { id: 'A2TEST00007', name: '环境-DEMO-07', account: null },
+      reason: '来源指定的买家号 ID A2TEST00007（买家号「环境-DEMO-07」）还没有登记为账号；在「账号与浏览器」登记后会自动分配',
+    }),
+    row({
+      status: 'queued', unit: '18.90', qty: 1, cap: '25.00', date: 1, sources: ['file'], designated: { id: 'A2TEST00007', account: null },
+      reason: '来源指定的买家号 ID A2TEST00007 还没有登记为账号；在「账号与浏览器」登记后会自动分配',
+    }),
+    // 指定的账号接不了：金额不在它的区间内，不会自动分给别的账号
+    row({
+      status: 'queued', unit: '58.00', qty: 1, cap: '72.00', date: 0, designated: { name: '环境-DEMO-01', account: 3 },
+      reason: '金额 $58.00 不在来源指定的账号 环境-DEMO-01 的区间 $20.00–$30.00 内；调整账号的金额区间，或改派到其他账号',
+    }),
   ]
 
   // 执行模块暂停账号时写「结果待核实：<平台订单号>」
@@ -631,9 +755,36 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       kind,
       detail,
     })
-    // kind 与服务端 events.record 的取值一致（order.* / attempt.*）；操作者名由服务端按用户或设备填 actor_name
+    // kind 与服务端 events.record 的取值一致（order.* / attempt.*）；操作者名由服务端按用户或浏览器填 actor_name
     const list: EventRecord[] = [ev(r.id * 10 + 1, 60 * 30, 'order.created', 'source', null, { from: null, to: 'queued' })]
-    if (r.assigned_account) list.push(ev(r.id * 10 + 2, 60 * 29, 'order.assigned', 'system', null, { account_name: r.assigned_account.name, reason: r.assignment_note, kind: 'auto' }))
+    const des = r.designated_buyer
+    if (des) {
+      // 来源指定的买家号变化：扁平键 [旧, 新]，空 = 没有指定（services/orders.ingest）
+      const feishu = r.primary_source_kind === 'feishu'
+      list.push(ev(r.id * 10, 60 * 29.5, 'order.designation_changed', 'source', null, {
+        changes: {
+          ...(des.customer_id ? { designated_customer_id: [null, des.customer_id] } : {}),
+          ...(des.name ? { designated_buyer_name: [null, des.name] } : {}),
+        },
+        source: feishu ? { kind: 'feishu', connection_id: 1, record_id: `recDEMO${String(r.id).padStart(6, '0')}` } : { kind: 'file', batch_id: 41, row_no: 3 + (r.id % 17) },
+      }))
+      if (feishu && r.source_kinds.includes('file')) {
+        // 文件来源写了另一个买家号，任务已有飞书写的指定、文件不是主来源：没有采用（services/orders._designation_change）
+        list.push(ev(90_000 + r.id, 60 * 5 - 3, 'order.designation_not_adopted', 'source', null, {
+          source: { kind: 'file', batch_id: 41, row_no: 3 + (r.id % 17) },
+          stated: { customer_id: null, name: '环境-DEMO-02' },
+          previous: null,
+          current: { customer_id: des.customer_id, name: des.name },
+        }))
+      }
+    }
+    if (r.assigned_account) {
+      const manual = r.assignment_kind === 'manual'
+      // 人工改派由用户操作；自动与来源指定由分配写（detail.kind 与任务的分配方式一致）
+      list.push(ev(r.id * 10 + 2, 60 * 29, 'order.assigned', manual ? 'user' : 'system', manual ? 'DEMO 所有者' : null, {
+        account_name: r.assigned_account.name, note: r.assignment_note, kind: r.assignment_kind ?? 'auto',
+      }))
+    }
     if (r.has_override) list.push(ev(r.id * 10 + 3, 60 * 4, 'order.override_set', 'user', 'DEMO 所有者', { note: '上游限价与结算口径不一致，按 $50.00 执行' }))
     const la = r.latest_attempt
     if (la) list.push(ev(r.id * 10 + 4, 60, 'attempt.claimed', 'device', 'Mac-AdsPower-DEMO-01', { run_id: 9, attempt_no: 1, kind: 'auto', simulated: la.simulated }, la.id))
@@ -778,17 +929,25 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
   // ── 分配与概览 ──────────────────────────────────────────────────────────────
 
   const queued = orders.filter((o) => o.status === 'queued')
+  // 分出 = 来源指定 + 保底 + 按优先级填充（services/allocation 的 stats）；人工改派的任务不参与
+  const bySource = orders.filter((o) => o.status === 'assigned' && o.assignment_kind === 'source').length
   const lastAllocation: AllocationSummary = {
     id: 57,
     bj_date: bjToday,
     at: ago(18),
     trigger: 'intake',
-    stats: { considered: 9, assigned: 7, coverage: 3, fill: 4, unassigned: queued.length },
+    stats: { considered: 7 + bySource + queued.length, assigned: 7 + bySource, coverage: 3, fill: 4, designated: bySource, unassigned: queued.length },
     uncovered: [
       { account_id: 8, name: '环境-DEMO-04', date: bjToday, reason: '没有金额匹配的订单' },
       { account_id: 4, name: '环境-DEMO-02', date: bjToday, reason: '当天额度已用完' },
     ],
-    unassigned: queued.map((o) => ({ order_id: o.id, upstream_order_no: o.upstream_order_no, reason: o.status_reason ?? '' })),
+    // 来源指定了买家号而没分出去的带 designated 标记：它们不会自动分给别的账号
+    unassigned: queued.map((o) => ({
+      order_id: o.id,
+      upstream_order_no: o.upstream_order_no,
+      reason: o.status_reason ?? '',
+      ...(o.designated_buyer ? { designated: true } : {}),
+    })),
   }
 
   const counts: Partial<Record<OrderStatus, number>> = {}
@@ -800,7 +959,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     today_executable: assigned.filter((o) => (o.suggested_purchase_date ?? '9999') <= bjToday).length,
     future_assigned: assigned.filter((o) => (o.suggested_purchase_date ?? '') > bjToday).length,
     accounts: { total: accounts.length, enabled: accounts.filter((a) => a.purchase_enabled).length, paused: accounts.filter((a) => a.execution_paused).length },
-    devices: { total: devices.filter((d) => !d.revoked_at).length, online: devices.filter((d) => !d.revoked_at && d.online).length },
+    devices: { total: devices.filter((d) => !d.hidden_at).length, online: devices.filter((d) => !d.hidden_at && d.online).length },
+    discovered_buyers: discovered.filter((x) => !x.ignored).length,
     needs_attention: orders.filter((o) => o.needs_attention).length,
     // 同服务端 overview：最近变为「异常」的任务（结果待核实单独提示）
     recent_exceptions: orders.filter((o) => o.status === 'exception'),
@@ -810,6 +970,35 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
   }
 
   // ── 飞书 ────────────────────────────────────────────────────────────────────
+
+  /**
+   * 连接级问题（services/feishu_intake.buyer_columns_problem）：来源表里的「买家号id」列被改了名。
+   * 读取结果与读取记录的 problems 最前面各有一条，连接的 last_stats.problems 里也带着它（连接卡片据此提醒）。
+   */
+  const missingBuyerColumn: SyncProblem = {
+    record_id: null,
+    upstream_order_no: '买家号列',
+    verdict: 'skipped',
+    reason: '来源表里找不到买家号列「买家号id」，这一列的指定保持上次读到的内容，新记录暂不接收',
+    scope: 'connection',
+  }
+  /** 买家号列读不到时，没有可信 AMZ 订单号的新记录不接收（services/feishu_intake.new_record_hold_reason） */
+  const heldNewRecord = (no: number): SyncProblem => ({
+    record_id: `recDEMO004${String(no).padStart(3, '0')}`,
+    upstream_order_no: `PO-DEMO-20261118-SKU${no}`,
+    verdict: 'skipped',
+    reason: '来源表里找不到买家号列「买家号id」，读不出这一行有没有指定买家号，暂不接收；恢复这一列或改字段对应后会自动接收',
+  })
+  /** 订单中心最近一次读取的问题样本：6 条跳过、1 条待核实（读取记录对话框先列 5 条，其余可展开） */
+  const recentSamples: SyncProblem[] = [
+    ...[11, 12, 13, 14, 15, 16].map((n): SyncProblem => ({
+      record_id: `recDEMO001${n}`,
+      upstream_order_no: n === 16 ? null : `PO-DEMO-20261118-SKU${n}`,
+      verdict: 'skipped',
+      reason: n === 16 ? '缺少平台订单号' : '采购方不是本系统接的采购方',
+    })),
+    { record_id: 'recDEMO00117', upstream_order_no: 'PO-DEMO-20261118-SKU17', verdict: 'conflict', reason: '飞书记录的数量与任务不同，采购已开始，等待核实' },
+  ]
 
   const connections: FeishuConnection[] = [
     {
@@ -840,7 +1029,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       last_sync_at: ago(4),
       last_sync_ok_at: ago(4),
       last_error: null,
-      last_stats: { read: 128, new: 6, update: 3, unchanged: 112, conflict: 1, historical: 4, skipped: 2, invalid: 0 },
+      last_stats: { read: 128, new: 6, update: 3, unchanged: 108, conflict: 1, historical: 4, skipped: 6, invalid: 0 },
       created_at: ago(60 * 24 * 7),
       updated_at: ago(60 * 24),
     },
@@ -868,6 +1057,31 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       created_at: ago(60 * 24 * 3),
       updated_at: ago(25),
     },
+    {
+      // 来源表里的「买家号id」列被改了名：读取照常成功（状态点「读取正常」），卡片上提醒（last_stats.problems）
+      id: 4,
+      name: '补充订单表（DEMO）',
+      link: 'https://demo-tenant.feishu.cn/base/bascnDEMO0000000000000004?table=tblDEMOsource04',
+      app_token: 'bascnDEMO0000000000000004',
+      source_table_id: 'tblDEMOsource04',
+      source_view_id: null,
+      result_table_id: 'tblDEMOsource04',
+      field_map: { upstream_order_no: '平台订单号', asin: 'ASIN', quantity: '数量', unit_price: '采购单价', external_buyer_account: '买家号', external_buyer_customer_id: '买家号id' },
+      admission: { approved_values: ['通过'] },
+      writeback_map: {},
+      writeback_enabled: false,
+      writeback_verified_at: null,
+      writeback_state: 'disabled',
+      writeback_test_record: null,
+      poll_minutes: 15,
+      enabled: true,
+      last_sync_at: ago(7),
+      last_sync_ok_at: ago(7),
+      last_error: null,
+      last_stats: { read: 36, new: 0, update: 1, unchanged: 33, conflict: 0, historical: 0, skipped: 2, invalid: 0, problems: [missingBuyerColumn] },
+      created_at: ago(60 * 24 * 2),
+      updated_at: ago(60 * 24),
+    },
   ]
 
   const syncRuns: Record<number, SyncRun[]> = {
@@ -878,11 +1092,27 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       started_at: ago(4 + m),
       finished_at: ago(4 + m - 0.2),
       ok: true,
-      stats: { read: 128, new: i === 0 ? 6 : 0, update: i === 0 ? 3 : 1, unchanged: 118, conflict: i === 0 ? 1 : 0 },
+      // 最近一次有问题样本（6 条跳过、1 条待核实）；之前几次没有
+      stats: i === 0
+        ? { read: 128, new: 6, update: 3, unchanged: 108, conflict: 1, historical: 4, skipped: 6, invalid: 0, problems: recentSamples }
+        : { read: 128, new: 0, update: 1, unchanged: 127, conflict: 0 },
       error: null,
     })),
     2: [
       { id: 210, connection_id: 2, trigger: 'schedule', started_at: ago(25), finished_at: ago(24.9), ok: false, stats: null, error: '飞书接口返回 91403：应用没有该数据表的读取权限' },
+    ],
+    4: [
+      {
+        id: 420, connection_id: 4, trigger: 'schedule', started_at: ago(7), finished_at: ago(6.9), ok: true,
+        stats: { read: 36, new: 0, update: 1, unchanged: 33, conflict: 0, historical: 0, skipped: 2, invalid: 0, problems: [missingBuyerColumn, heldNewRecord(81), heldNewRecord(82)] },
+        error: null,
+      },
+      {
+        // 列被改名之前的读取：没有问题
+        id: 410, connection_id: 4, trigger: 'schedule', started_at: ago(22), finished_at: ago(21.9), ok: true,
+        stats: { read: 34, new: 2, update: 0, unchanged: 32, conflict: 0, historical: 0, skipped: 0, invalid: 0 },
+        error: null,
+      },
     ],
   }
 
@@ -915,6 +1145,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       { key: 'after_sale_value', label: '售后状态' },
       { key: 'external_amz_order_no', label: 'AMZ订单号' },
       { key: 'external_buyer_account', label: '买家号' },
+      { key: 'external_buyer_customer_id', label: '买家号ID' },
     ],
     result_fields: [
       { key: 'buyer_account', label: '买家号' },
@@ -953,13 +1184,14 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     ['收货人姓名', 1, 'Text', true],
     ['邮编', 1, 'Text', true],
     ['买家号', 1, 'Text', true],
+    ['买家号id', 1, 'Text', true],
     ['AMZ订单号', 1, 'Text', true],
     ['税前总额USD', 2, 'Number', true],
     ['店铺名称', 19, 'Lookup', false],
   ]
   const feishuFields: FeishuFieldsResult = {
     fields: fieldNames.map(([n, type, ui, writable], i) => ({ field_id: `fldDEMO${String(i).padStart(4, '0')}`, field_name: n, type, ui_type: ui, is_primary: i === 0, writable })),
-    suggested_field_map: { upstream_order_no: '平台订单号', asin: ['ASIN', '来源码'], quantity: ['数量', '数量1'], unit_price: '采购单价', price_cap: '限价', order_time: '下单时间', suggested_purchase_date: '建议采购日期', review_value: '人工审核', purchaser: '采购方', purchase_status_value: '采购状态', recipient_name: '收货人姓名', postal_code: '邮编' },
+    suggested_field_map: { upstream_order_no: '平台订单号', asin: ['ASIN', '来源码'], quantity: ['数量', '数量1'], unit_price: '采购单价', price_cap: '限价', order_time: '下单时间', suggested_purchase_date: '建议采购日期', review_value: '人工审核', purchaser: '采购方', purchase_status_value: '采购状态', recipient_name: '收货人姓名', postal_code: '邮编', external_amz_order_no: 'AMZ订单号', external_buyer_account: '买家号', external_buyer_customer_id: '买家号id' },
     suggested_writeback_map: { buyer_account: '买家号', amazon_order_no: 'AMZ订单号', purchase_status: '采购状态', total_before_tax: '税前总额USD' },
   }
 
@@ -968,9 +1200,14 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     records: orders.slice(0, 8).map((o, i) => ({
       record_id: `recDEMO${String(9000 + i)}`,
       verdict: (['new', 'new', 'update', 'unchanged', 'historical', 'skipped', 'new', 'new'] as const)[i],
-      reason: i === 4 ? '已有 AMZ 订单号，记为历史采购' : i === 5 ? '采购方不是本系统负责的取值' : null,
-      record: { upstream_order_no: o.upstream_order_no, asin: o.asin, quantity: o.quantity, price_cap: o.price_cap },
-      issues: i === 7 ? ['缺少收货人电话'] : [],
+      // 只有指定变了的更新，原因写明旧值与新值（services/orders.ingest）
+      reason: i === 2 ? '来源指定的买家号由「（未指定）」改为「A1DEMO00002」' : i === 4 ? '已有 AMZ 订单号，记为历史采购' : i === 5 ? '采购方不是本系统负责的取值' : null,
+      record: {
+        upstream_order_no: o.upstream_order_no, asin: o.asin, quantity: o.quantity, price_cap: o.price_cap,
+        ...(i === 2 ? { external_buyer_customer_id: 'A1DEMO00002', external_buyer_account: '环境-DEMO-02' } : {}),
+      },
+      // 占位写法按没写处理；格式不对的买家号 ID 在预览里就提示
+      issues: i === 6 ? ['买家号「—」不是买家号，按没有指定处理'] : i === 7 ? ['缺少收货人电话', '买家号 ID「A1-DEMO」格式不对，这笔任务会停在待分配'] : [],
     })),
   }
 
@@ -1102,7 +1339,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     { id: 1, name: '小蜜蜂导出', mapping: { 平台订单号: 'upstream_order_no', 买家号1: 'external_buyer_account', 数量1: 'quantity' }, created_at: ago(60 * 24 * 3), created_by_name: 'DEMO 所有者' },
   ]
 
-  const headers = ['平台订单号', 'ASIN', '数量', '采购单价', '限价', '下单时间', '配送天数', '人工审核', '收货人姓名', '收货人地址', '收货人城市', '收货人州/省', '邮编', '收货人电话', '备注']
+  const headers = ['平台订单号', 'ASIN', '数量', '采购单价', '限价', '下单时间', '配送天数', '人工审核', '收货人姓名', '收货人地址', '收货人城市', '收货人州/省', '邮编', '收货人电话', '买家号', '买家号ID', '备注']
   const suggested: Record<string, string | null> = {
     平台订单号: 'upstream_order_no',
     ASIN: 'asin',
@@ -1118,6 +1355,8 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     '收货人州/省': 'state',
     邮编: 'postal_code',
     收货人电话: 'phone',
+    买家号: 'external_buyer_account',
+    买家号ID: 'external_buyer_customer_id',
     备注: null,
   }
   const upload: UploadResult = {
@@ -1149,11 +1388,23 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
             ? ['缺少人审结果 → 待确认']
             : i === 7
               ? ['缺少收货人电话 → 资料待补齐']
-              : [],
-    reason: v === 'invalid' ? '与第 2 行的平台订单号重复，同一批次只导入第一行' : v === 'historical' ? '带 AMZ 订单号，按历史采购登记' : null,
+              : i === 9
+                ? ['买家号 ID「A1-DEMO」格式不对，这笔任务会停在待分配']
+                : [],
+    reason:
+      v === 'invalid'
+        ? '与第 2 行的平台订单号重复，同一批次只导入第一行'
+        : v === 'historical'
+          ? '带 AMZ 订单号，按历史采购登记'
+          : v === 'update'
+            ? '来源指定的买家号由「环境-DEMO-01」改为「环境-DEMO-02」'
+            : null,
     status: v === 'invalid' ? null : v === 'historical' ? 'purchased' : i === 3 ? 'pending_review' : i === 7 ? 'needs_info' : 'queued',
     upstream_order_no: `PO-DEMO-${20261200 + (v === 'invalid' ? 1 : i + 1)}-SKU${String(i + 1).padStart(2, '0')}`,
-    normalized: { asin: `B0DEMO${String(200 + i).padStart(4, '0')}`, quantity: 1 + (i % 2), price_cap: (25 + i * 3.5).toFixed(2) },
+    normalized: {
+      asin: `B0DEMO${String(200 + i).padStart(4, '0')}`, quantity: 1 + (i % 2), price_cap: (25 + i * 3.5).toFixed(2),
+      ...(v === 'update' ? { external_buyer_account: '环境-DEMO-02' } : i === 9 ? { external_buyer_customer_id: 'A1-DEMO' } : {}),
+    },
     raw: { 平台订单号: `PO-DEMO-${20261200 + i + 1}`, 数量: String(1 + (i % 2)) },
   }))
 
@@ -1179,6 +1430,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
     settings,
     accounts,
     devices,
+    discovered,
     orders,
     details,
     lastAllocation,

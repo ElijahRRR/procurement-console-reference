@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { GUARD_CHECK_KEYS, type GuardVerdict } from '@/api/types'
 import { guardCheckDetail, normalizeGuardChecks } from '@/utils/guard'
-import { GUARD_CHECK_LABEL } from '@/utils/labels'
+import { GUARD_CHECK_LABEL, guardCodeLabel } from '@/utils/labels'
 
 /** 与 services/guard.evaluate 的输出同形：checks 以检查名为键 */
 const blocked: GuardVerdict = {
@@ -18,6 +18,7 @@ const blocked: GuardVerdict = {
     delivery: { ok: true, expected: 10, actual: 4 },
     data: { ok: false, expected: 'USD；小计、总额可解析；配送天数可得', actual: ['结算总额读取不到或格式不对'] },
     card: { ok: true, expected: null, actual: '7860' },
+    buyer: { ok: true, expected: 'A1DEMO00001', actual: 'A1DEMO00001' },
   },
   delivery_days: 4,
   total_for_cap: null,
@@ -28,7 +29,8 @@ describe('护栏逐项结果（services/guard.evaluate 的对象写法）', () =
   it('按契约 §4 的顺序列出全部检查，配送方式只记录、排在最后', () => {
     const rows = normalizeGuardChecks(blocked)
     expect(rows.map((r) => r.key)).toEqual([...GUARD_CHECK_KEYS, 'fulfillment'])
-    expect(rows.map((r) => r.label)).toEqual(['商品', '邮编', '金额区间', '限价', '配送时长', '数据可靠', '卡尾号', '配送方式'])
+    expect(rows.map((r) => r.label)).toEqual([...GUARD_CHECK_KEYS.map((k) => GUARD_CHECK_LABEL[k]), '配送方式'])
+    expect([...rows.map((r) => r.label)].sort()).toEqual(['商品', '邮编', '金额区间', '限价', '配送时长', '数据可靠', '卡尾号', '买家号', '配送方式'].sort())
   })
 
   it('ok 为 true / false / null 分别显示「通过」「不通过」「无法判定」', () => {
@@ -48,6 +50,19 @@ describe('护栏逐项结果（services/guard.evaluate 的对象写法）', () =
     expect(by.delivery).toBe('要求 ≤ 10 天，实际 4 天')
     expect(by.data).toBe('结算总额读取不到或格式不对')
     expect(by.card).toBe('账号未设置期望卡尾号，实际 7860')
+    expect(by.buyer).toBe('要求 A1DEMO00001，实际 A1DEMO00001')
+  })
+
+  it('买家号检查：结算页登录的买家号不是批次的买家号、或没读到时写明', () => {
+    expect(guardCheckDetail('buyer', { ok: false, expected: 'A1DEMO00001', actual: 'A2TEST00009' })).toBe('要求 A1DEMO00001，实际 A2TEST00009')
+    expect(guardCheckDetail('buyer', { ok: null, expected: 'A1DEMO00001', actual: null })).toBe('要求 A1DEMO00001，实际 读取不到')
+    const rows = normalizeGuardChecks({ verdict: 'block', code: 'IDENTITY_MISMATCH', reasons: [], checks: { buyer: { ok: false, expected: 'A1DEMO00001', actual: 'A2TEST00009' } } })
+    expect(rows).toEqual([{ key: 'buyer', label: '买家号', ok: false, state: 'fail', stateText: '不通过', detail: '要求 A1DEMO00001，实际 A2TEST00009' }])
+    // 买家号一项的拦截码是 IDENTITY_MISMATCH：按护栏的说法显示，不显示原始码
+    expect(guardCodeLabel('IDENTITY_MISMATCH')).toBe('结算页登录的买家号不是这个批次的买家号')
+    expect(guardCodeLabel('PRICE_OVER_CAP')).toBe('结算总额超过限价')
+    expect(guardCodeLabel('NEW_CODE')).toBe('NEW_CODE')
+    expect(guardCodeLabel(null)).toBe('—')
   })
 
   it('商品检查：结算页不止一种商品时写明数量', () => {

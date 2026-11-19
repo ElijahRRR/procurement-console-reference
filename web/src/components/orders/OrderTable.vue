@@ -18,10 +18,12 @@ const props = withDefaults(
     mode?: 'pending' | 'records' | 'exceptions' | 'compact'
     selectable?: boolean
     showMissing?: boolean
+    /** 这一页的任务都还没分配（「待分配」）：不显示账号列，把宽度让给说明（来源指定的原因要写明下一步，比较长） */
+    wideNote?: boolean
     emptyTitle?: string
     emptyDescription?: string
   }>(),
-  { loading: false, mode: 'pending', selectable: false, showMissing: false, emptyTitle: '没有任务', emptyDescription: '' },
+  { loading: false, mode: 'pending', selectable: false, showMissing: false, wideNote: false, emptyTitle: '没有任务', emptyDescription: '' },
 )
 const emit = defineEmits<{ open: [row: OrderRow]; selection: [rows: OrderRow[]] }>()
 
@@ -93,7 +95,7 @@ function onRowClick(row: OrderRow, _col: unknown, event: Event) {
     <el-table-column v-if="!showAttempt && !compact" label="建议采购日期" width="112">
       <template #default="{ row }">{{ formatDate(row.suggested_purchase_date) }}</template>
     </el-table-column>
-    <el-table-column v-if="showAssign || showAttempt" label="账号" min-width="136">
+    <el-table-column v-if="(showAssign && !wideNote) || showAttempt" label="账号" min-width="136">
       <template #default="{ row }">
         <template v-if="row.assigned_account">
           <div class="whitespace-nowrap text-gray-900 dark:text-gray-100">{{ row.assigned_account.name }}</div>
@@ -137,7 +139,7 @@ function onRowClick(row: OrderRow, _col: unknown, event: Event) {
         <span class="text-gray-700 dark:text-gray-300">{{ reasonOf(row as OrderRow) || '—' }}</span>
       </template>
     </el-table-column>
-    <el-table-column v-else-if="!showAttempt" label="说明" min-width="136">
+    <el-table-column v-else-if="!showAttempt" label="说明" :min-width="wideNote ? 272 : 136">
       <template #default="{ row }">
         <span class="text-gray-700 dark:text-gray-300">{{ noteOf(row as OrderRow) || '—' }}</span>
       </template>
