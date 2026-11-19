@@ -2,13 +2,14 @@
 /**
  * 新建 / 编辑买家账号：买家号 ID、金额区间、每日额度、优先级、配送上限（留空继承全局）、执行模式与时间、卡尾号、开关。
  * 带 preset 打开 = 登记一个待登记的买家号（插件读到的或来源指定的）：买家号 ID 已填好（不可改），名称用来源里的名称预填，提交走新建接口。
- * 账号名称是来源按「买家号」指定时对应账号的依据，名称下面写明改名的影响。
+ * 已有与来源名称同名、还没登记 ID 的账号时，对话框顶部提示并给出「填到「名称」」（交给上层走填到已有账号），不必再建一个。
+ * 账号名称是来源按「买家号」指定时对应账号的依据，名称下面写明改名的影响；每段说明放在各自输入框下面（窄屏单列时也不错位）。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import type { Account, AccountInput, PurchaseMode } from '@/api/types'
 import * as accountsApi from '@/api/accounts'
-import { customerIdProblem, normalizeCustomerId, registerHelpText } from '@/utils/accounts'
+import { customerIdProblem, normalizeCustomerId, registerHelpText, sameNameHint } from '@/utils/accounts'
 import { ACCOUNT_NAME_HELP } from '@/utils/designation'
 import { blankToNull, hasAtMostTwoDecimals, normalizeMoneyInput, parseAmount } from '@/utils/format'
 import { notifyFailure, notifySuccess } from '@/utils/feedback'
@@ -22,11 +23,17 @@ export interface AccountPreset {
   sourceOrders?: number | null
   /** 有没有浏览器登录着这个买家号；不给时按有 */
   hasBrowser?: boolean
+  /** 与来源里的名称同名、还没登记买家号 ID 的账号（多半就是它）；没有为 null */
+  fillTarget?: Pick<Account, 'id' | 'name'> | null
 }
 
 const props = defineProps<{ account: Account | null; preset?: AccountPreset | null; defaultMaxDays: number | null }>()
 const visible = defineModel<boolean>({ default: false })
-const emit = defineEmits<{ saved: [account: Account] }>()
+const emit = defineEmits<{
+  saved: [account: Account]
+  /** 登记时选了「填到同名账号」：上层把这个买家号 ID 填到该账号上（不新建） */
+  fill: [accountId: number]
+}>()
 
 const formRef = ref<FormInstance>()
 const busy = ref(false)
@@ -59,6 +66,15 @@ const title = computed(() => {
   return registering.value ? `登记买家号 · ${props.preset?.customerId}` : '新建买家账号'
 })
 const actionName = computed(() => (editing.value ? '保存账号' : registering.value ? '登记买家号' : '创建账号'))
+/** 登记时可以直接填进去的同名账号 */
+const fillTarget = computed(() => (registering.value ? (props.preset?.fillTarget ?? null) : null))
+
+function fillInstead() {
+  const t = fillTarget.value
+  if (!t) return
+  visible.value = false
+  emit('fill', t.id)
+}
 
 const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`)
 
@@ -166,24 +182,29 @@ async function submit() {
 
 <template>
   <el-dialog v-model="visible" :title="title" width="760px" top="5vh" append-to-body :close-on-click-modal="false">
+    <el-alert v-if="fillTarget" type="warning" show-icon :closable="false" class="mb-4" data-testid="register-same-name">
+      <template #title>{{ sameNameHint(preset?.name?.trim() || fillTarget.name) }}</template>
+      <template #default>
+        <el-button size="small" class="mt-2" @click="fillInstead">填到「{{ fillTarget.name }}」</el-button>
+      </template>
+    </el-alert>
     <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
+      <!-- 每段说明放在它的输入框所在的 el-form-item 里：两列时各在各的输入框下，窄屏单列时也紧跟着自己的输入框 -->
       <div class="grid gap-x-6 md:grid-cols-2">
         <el-form-item label="账号名称" prop="name">
           <el-input v-model="form.name" placeholder="与飞书「买家号」一致，如 环境-DEMO-01" />
+          <p class="mt-1 w-full text-xs leading-5 text-gray-500 dark:text-dark-400" data-testid="account-name-help">{{ ACCOUNT_NAME_HELP }}</p>
         </el-form-item>
         <el-form-item :label="registering ? '买家号 ID' : '买家号 ID（可选）'" prop="amazon_customer_id">
           <el-input v-model="form.amazon_customer_id" class="font-mono" :readonly="registering" placeholder="A 开头，如 A1DEMO00000" aria-label="买家号 ID" />
+          <p class="mt-1 w-full text-xs leading-5 text-gray-500 dark:text-dark-400" data-testid="customer-id-help">
+            <template v-if="registering">{{ registerHelpText(preset) }}</template>
+            <template v-else>亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。</template>
+            <span v-if="customerIdChanged" class="mt-1 block text-amber-700 dark:text-amber-400">
+              修改买家号 ID 后，这个账号的任务改由登录着新买家号的浏览器执行；账号正在执行或有结果待核实的采购时不能修改。
+            </span>
+          </p>
         </el-form-item>
-      </div>
-      <div class="-mt-3 mb-4 grid gap-x-6 gap-y-1 text-xs text-gray-500 dark:text-dark-400 md:grid-cols-2">
-        <p data-testid="account-name-help">{{ ACCOUNT_NAME_HELP }}</p>
-        <p>
-          <template v-if="registering">{{ registerHelpText(preset) }}</template>
-          <template v-else>亚马逊 customerId。留空也可以：登录着这个买家号的浏览器装上插件后，会出现在上面的待登记列表里。</template>
-          <span v-if="customerIdChanged" class="mt-1 block text-amber-700 dark:text-amber-400">
-            修改买家号 ID 后，这个账号的任务改由登录着新买家号的浏览器执行；账号正在执行或有结果待核实的采购时不能修改。
-          </span>
-        </p>
       </div>
       <div class="grid gap-x-6 md:grid-cols-4">
         <el-form-item label="金额下限（USD）" prop="min_amount">

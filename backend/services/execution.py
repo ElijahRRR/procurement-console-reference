@@ -352,7 +352,7 @@ def _identity_stale(dev: dict[str, Any]) -> str | None:
 
 # ── 执行闸门（清除模拟结果 ↔ 开始批次 / 领取）──────────────────────────────────
 
-_LOCK_NS = 7_310_433          # pg_advisory_xact_lock 命名空间（allocation 用 7_310_431、feishu_intake 用 7_310_432）
+_LOCK_NS = 7_310_433          # pg_advisory_xact_lock 命名空间（allocation 用 7_310_431、feishu_intake 用 7_310_432、devices 登记用 7_310_434）
 
 
 def execution_gate(conn, workspace_id: int, *, exclusive: bool = False) -> None:
@@ -1117,8 +1117,9 @@ def _start_conflict(conn, dev: dict[str, Any], acc: dict[str, Any], today: date,
     2. …_per_device → DEVICE_BUSY。
     3. 其余（…_per_account、…_slot_once 及认不出的）：账号此刻有未结束的批次 → ACCOUNT_BUSY（带持有者）。撞上的
        正是同一个时间点还在执行的批次时也走这里——它还没跑完，不能说「已经执行过」。
-    4. 已经没有持有者了：撞的是 …_slot_once → SLOT_DONE（占着时间点的批次在这两句之间结束了）；否则 ACCOUNT_BUSY
-       （不带持有者）。
+    4. 已经没有持有者了（撞上的批次在这几句之间结束了）：再查一次时间点——它以 finished 结束 → SLOT_DONE；
+       没跑完就结束（时间点又空出来）或撞的不是时间点 → ACCOUNT_BUSY（不带持有者，插件下一分钟再问时就能开始）。
+       不按索引名直接回 SLOT_DONE：那样会让插件把一个刚空出来的时间点记成今天已处理。
     """
     ws = dev["workspace_id"]
     if scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
@@ -1126,7 +1127,7 @@ def _start_conflict(conn, dev: dict[str, Any], acc: dict[str, Any], today: date,
     if constraint == "execution_runs_one_active_per_device":
         return _device_busy(_device_run(conn, dev))
     holder = _holder(conn, ws, acc["id"])
-    if holder is None and constraint == "execution_runs_slot_once":
+    if holder is None and scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
         return _slot_done()
     return _busy(holder, acc["name"])
 

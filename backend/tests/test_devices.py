@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -160,6 +161,42 @@ def test_register_refuses_beyond_max_devices_per_workspace(conn, workspace, monk
     assert devices.register(conn, first, workspace_id=workspace["id"])["created"] is False   # 已登记的不受影响
     assert devices.register(conn, TOKEN, workspace_id=other["id"])["created"] is True        # 别的工作区另算
     assert settings.get().max_devices == 2
+
+
+def test_concurrent_new_registrations_never_exceed_max_devices(clean_db, conn, workspace, monkeypatch):
+    """名额只剩一个时新浏览器同时登记：第一个还没提交，后来的排队等它；它提交后，另一个新令牌数到上限 → 429，
+    同一个令牌的并发重试认出已登记的那一行（created=false，不查上限）。以前后来的看不到第一个没提交的行、也数到
+    max−1，两个都插进去，工作区里比上限多出一行。"""
+    ws = workspace["id"]
+    _setting(monkeypatch, max_devices=2)
+    fx.registered_device(conn, workspace)
+    conn.commit()
+    tokens = {"other": fx.device_token(), "same": TOKEN}
+    results: dict = {}
+
+    def late(key):
+        try:
+            with db.pg_conn(clean_db, statement_timeout_s=20) as c:
+                results[key] = devices.register(c, tokens[key])
+        except Exception as exc:  # noqa: BLE001 - 带回主线程断言
+            results[key] = exc
+
+    with db.pg_conn(clean_db, statement_timeout_s=20) as first:
+        mine = devices.register(first, TOKEN)                                    # 占住最后一个名额，还没提交
+        assert mine["created"] is True
+        threads = {k: threading.Thread(target=late, args=(k,)) for k in tokens}
+        for t in threads.values():
+            t.start()
+        for t in threads.values():
+            t.join(timeout=1.0)
+        assert all(t.is_alive() for t in threads.values()), results              # 都排在第一个后面
+    for t in threads.values():
+        t.join(timeout=20)
+    assert isinstance(results["other"], DomainError), results
+    assert results["other"].code == "RATE_LIMITED" and results["other"].message == devices.MAX_DEVICES_MESSAGE
+    assert results["same"] == {**mine, "created": False}
+    assert f.count(conn, "devices", "workspace_id = %s", (ws,)) == 2
+    assert f.count(conn, "events", "kind = 'device.registered'") == 2
 
 
 def test_removing_a_browser_frees_a_slot_and_its_return_is_not_capped(conn, workspace, monkeypatch):
@@ -321,6 +358,8 @@ def test_clean_identity_shape_flags_and_page_url():
     ("https://demo-user:demo-pass@www.amazon.com/p?q=1", "https://www.amazon.com/p"),
     ("https://demo-user@www.amazon.com:443/p", "https://www.amazon.com:443/p"),
     ("http://[::1]:8790/a/b?x", "http://[::1]:8790/a/b"),
+    # IP 字面量的方括号原样拼回（IPvFuture 里没有冒号，也不能丢掉方括号变成一个主机名）
+    ("http://[v1.fe]/x?y", "http://[v1.fe]/x"), ("https://demo@[V1.FE]:8443/x", "https://[v1.fe]:8443/x"),
     # 别的协议、没有主机、不是地址：当作没有
     ("javascript:alert(1)", None), ("chrome-extension://abcdefghijklmnop/popup.html", None),
     ("file:///etc/hosts", None), ("data:text/html,demo", None), ("about:blank", None), ("ftp://demo.example/x", None),
@@ -389,6 +428,26 @@ def test_ext_version_and_user_agent_with_unstorable_characters_do_not_break_regi
     assert devices.authenticate(conn, TOKEN)["ext_version"] == clean
     assert not _events(conn, row["id"], "device.ext_version_changed")           # 清完是同一个版本，不算变化
     conn.commit()
+
+
+@pytest.mark.parametrize("version", ["0.1.0\x00", "0.1.0\ud800", "0.\x001.0", "\udfff0.1"])
+def test_ext_version_gate_judges_the_version_that_would_be_stored(conn, workspace, version):
+    """版本里带 PostgreSQL 存不了的字符：闸门判定去掉它们之后的版本（也就是会存下来的那个）。以前原文解析不了就
+    放行，再以「0.1.0」入库；现在照样按过旧拦下，detail 里的版本也是清过的（写得进 JSON 响应）。"""
+    clean = version.replace("\x00", "").replace("\ud800", "").replace("\udfff", "")
+    for call in (lambda: devices.register(conn, TOKEN, ext_version=version),
+                 lambda: devices.check_ext_version(version)):
+        with pytest.raises(DomainError) as e:
+            call()
+        assert e.value.code == "PLUGIN_OUTDATED" and e.value.http_status == 409
+        assert e.value.detail == {"ext_version": clean, "min_ext_version": devices.MIN_EXT_VERSION}
+        json.dumps(e.value.detail, ensure_ascii=False).encode("utf-8")
+    assert devices.authenticate(conn, TOKEN) is None                            # 什么也没登记
+    dev = fx.registered_device(conn, workspace)
+    with pytest.raises(DomainError) as e:
+        devices.heartbeat(conn, dev, ext_version=version)
+    assert e.value.code == "PLUGIN_OUTDATED"
+    assert devices.authenticate(conn, dev["token"])["ext_version"] == "0.2.0"    # 心跳被拦，什么也不记
 
 
 def test_report_with_bad_customer_id_is_stored_as_not_read(conn, workspace):

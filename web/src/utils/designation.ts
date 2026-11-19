@@ -34,7 +34,10 @@ export function hasDesignation(o: WithDesignation | null | undefined): boolean {
   return designationOf(o) !== null
 }
 
-/** 输入：任务行或详情 → 输出：文案里引用的「名或 ID」：有买家号（名称）用名称，否则用买家号 ID；没有指定为空串 */
+/**
+ * 输入：任务行或详情 → 输出：只要一个短标签时的「名或 ID」：有买家号（名称）用名称，否则用买家号 ID；没有指定为空串。
+ * 确认框与改派说明不用它（两列都填时对应账号的是 ID），改用 designationText 的「名称（ID）」。
+ */
 export function designationName(o: WithDesignation | null | undefined): string {
   const d = designationOf(o)
   return d ? (d.name ?? d.customer_id ?? '') : ''
@@ -82,9 +85,21 @@ export const REALLOCATE_CONFIRM_TEXT =
 export const UNASSIGNED_EMPTY_TEXT =
   '分不出去的任务会写明原因：金额不在任何启用账号的区间内、匹配账号当天额度已满，或来源指定的买家号暂时接不了。'
 
-/** 两个字段对应向导（飞书、文件）帮助段落里关于买家号两列的一句 */
+/**
+ * 两个字段对应向导（飞书、文件）帮助段落里关于买家号两列的一句。两列都填而买家号对应到另一个账号时 ID 并不「胜出」：
+ * 任务停在待分配，写明两边不是同一个账号（方案 v2「两列都填以 ID 为准，名称指向另一个账号时不分配」）。
+ */
 export const DESIGNATION_MAPPING_HELP =
-  '「买家号」「买家号 ID」填了，这笔订单就指定给对应的账号（买家号按账号名称对应，买家号 ID 按账号登记的 ID 对应，都填以 ID 为准）；留空由系统自动分配。已有 AMZ 订单号的行，这两列只当作历史采购记录。'
+  '「买家号」「买家号 ID」填了，这笔订单就指定给对应的账号（买家号按账号名称对应，买家号 ID 按账号登记的 ID 对应；都填时以 ID 为准，买家号对应到另一个账号时不分配，停在待分配）；留空由系统自动分配。已有 AMZ 订单号的行，这两列只当作历史采购记录。'
+
+/**
+ * 文件导入向导多一句：每次上传都是一批新的行，空格子读不出「以前填过、现在清掉了」，所以已导入过的订单空着重新上传
+ * 不会清除指定（飞书来源清空格子会清除，飞书向导不加这一句）。
+ */
+export const FILE_DESIGNATION_NOTE = '已导入过的订单，这两列空着重新上传不会清除指定。'
+
+/** 文件导入向导字段对应一步的买家号两列说明 = 共用的一句 + 文件独有的一句 */
+export const FILE_DESIGNATION_MAPPING_HELP = `${DESIGNATION_MAPPING_HELP}${FILE_DESIGNATION_NOTE}`
 
 /** 账号对话框「账号名称」的帮助文字 */
 export const ACCOUNT_NAME_HELP = '来源按「买家号」指定时靠名称对应账号，改名后这些任务会回到待分配。'
@@ -92,16 +107,19 @@ export const ACCOUNT_NAME_HELP = '来源按「买家号」指定时靠名称对�
 /** 没有指定的任务的「解除分配」确认文案 */
 export const UNASSIGN_CONFIRM_TEXT = '确定要解除这笔任务的账号分配吗？任务会回到待分配。'
 
-/** 输入：任务详情 → 输出：「解除分配」的确认文案；来源指定了买家号时说明下次分配会再分给它 */
+/**
+ * 输入：任务详情 → 输出：「解除分配」的确认文案。来源指定了买家号时说明下次分配仍按来源指定：这句话对「指定的账号接得了」
+ * 与「指定解析不到账号 / 接不了」两种情况都成立（不承诺一定分给它）；引用「名称（ID）」，两列都填时 ID 才是对应账号的依据。
+ */
 export function unassignConfirmText(o: WithDesignation | null | undefined): string {
-  const name = designationName(o)
-  if (!name) return UNASSIGN_CONFIRM_TEXT
-  return `确定要解除这笔任务的账号分配吗？来源指定了买家号「${name}」，下次分配时会再分给它；要换账号请用「改派账号」。`
+  const text = designationText(o)
+  if (!text) return UNASSIGN_CONFIRM_TEXT
+  return `确定要解除这笔任务的账号分配吗？来源指定了买家号「${text}」，下次分配仍按来源指定：接得了就分给它，接不了就停在待分配并写明原因；要换账号请用「改派账号」。`
 }
 
-/** 输入：任务详情 → 输出：改派对话框里放在原说明之前的一段；没有指定为空串 */
+/** 输入：任务详情 → 输出：改派对话框里放在原说明之前的一段（引用「名称（ID）」）；没有指定为空串 */
 export function assignDesignationNote(o: WithDesignation | null | undefined): string {
-  const name = designationName(o)
-  if (!name) return ''
-  return `来源给这笔任务指定了买家号「${name}」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。`
+  const text = designationText(o)
+  if (!text) return ''
+  return `来源给这笔任务指定了买家号「${text}」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。`
 }

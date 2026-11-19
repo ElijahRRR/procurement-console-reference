@@ -286,13 +286,14 @@ export interface LeaseReply {
 /** 「开始执行」那一步的结论：面板的手动开始、后台的定时触发都拿它。 */
 export interface ScheduledReply {
   /** started：已开始。
-   *  busy：这个买家号正在别的浏览器里执行（ACCOUNT_BUSY），或本浏览器还有批次没结束（DEVICE_BUSY、另一个标签页在执行）。
+   *  busy：这个买家号正在别的浏览器里执行（ACCOUNT_BUSY，包括同一个时间点的定时批次还没执行完），或本浏览器还有批次没结束
+   *  （DEVICE_BUSY、另一个标签页在执行）。
    *  rejected：服务端明确拒绝（见 code）。
    *  network：没说上话。 not_ready：还没连上服务端、后台没有响应。
    *  identity：这个浏览器的登录状态对不上（没登录、标签页读数有分歧、读数还没报上去）。
    *  next_tab：这一页开始不了（没读到买家号 ID，或登的不是定时所属的买家号），定时触发时换下一个标签页。
    *
-   *  定时触发怎么记「今天这个时间点处理过了」（规格 §3）：started 记；rejected 且 code 是 SLOT_DONE、
+   *  定时触发怎么记「今天这个时间点处理过了」（规格 §3）：started 记；rejected 且 code 是 SLOT_DONE（今天已有正常结束的批次）、
    *  VALIDATION（422：先刷新配置）、ACCOUNT_PAUSED 记；其余（busy、network、not_ready、identity……）都不记，
    *  下一分钟再问 —— 去重的权威在服务端。 */
   result: "started" | "busy" | "rejected" | "network" | "not_ready" | "identity" | "next_tab";

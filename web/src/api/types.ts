@@ -751,7 +751,11 @@ export interface FeishuConnection {
   last_sync_at: Timestamp | null
   last_sync_ok_at: Timestamp | null
   last_error: string | null
-  last_stats: Record<string, number> | null
+  /**
+   * 最近一次成功读取的统计；那次读取有说整个连接的问题（scope = 'connection'，如来源表里找不到买家号列）时
+   * 另带 problems（只有连接级的），没有就不带这个键（services/feishu_intake.run_connection）
+   */
+  last_stats: SyncStats | null
   created_at: Timestamp
   updated_at: Timestamp
 }
@@ -837,6 +841,13 @@ export interface FeishuPreviewInput {
   limit: number
 }
 
+/**
+ * 读取统计：{read, new, update, unchanged, conflict, historical, skipped, invalid} 各项条数（旧记录可能缺键）；
+ * 带问题样本时另有 problems：读取记录里是这次读取的全部问题样本（连接级的在最前面，记录级的最多 100 条），
+ * 连接的 last_stats 里只有连接级的。
+ */
+export type SyncStats = { [key: string]: number | SyncProblem[] | undefined } & { problems?: SyncProblem[] }
+
 export interface SyncRun {
   id: number
   connection_id: number
@@ -844,13 +855,14 @@ export interface SyncRun {
   started_at: Timestamp
   finished_at: Timestamp | null
   ok: boolean | null
-  stats: Record<string, number> | null
+  stats: SyncStats | null
   error: string | null
 }
 
 /**
  * 读取中有问题的记录样本（跳过、无效、待核实）。scope = 'connection' 的一条说的是整个连接而不是某条记录
- * （如「来源表里找不到买家号列…，本次没有更新指定」）：record_id 为 null，不计入 skipped 等统计。
+ * （如「来源表里找不到买家号列「…」，这一列的指定保持上次读到的内容，新记录暂不接收」）：record_id 为 null，
+ * 不计入 skipped 等统计；它同时带在连接的 last_stats.problems 里，连接卡片据此提示。
  */
 export interface SyncProblem {
   record_id: string | null

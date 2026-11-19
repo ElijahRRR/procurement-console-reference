@@ -62,9 +62,10 @@ export function replyFromNotice(n: StartNotice): ScheduledReply {
 export type ScheduleVerdict = "done" | "refresh" | "later" | "next_tab";
 
 /** 输入：内容脚本对定时触发的答复 → 输出：怎么办（规格 §3）。
- *  已开始 → 记；SLOT_DONE（服务端说这个时间点今天执行过）→ 记；422 → 刷新配置后记；账号已暂停 → 记
- *  （今天这次不执行）；ACCOUNT_BUSY / DEVICE_BUSY、没说上话、登录状态对不上、别的拒绝 → 不记：
- *  去重的权威在服务端，本地记录只用来少发请求，拿不准就再问一次。 */
+ *  已开始 → 记；SLOT_DONE（服务端说这个时间点今天已有正常结束的批次）→ 记；422 → 刷新配置后记；账号已暂停 → 记
+ *  （今天这次不执行）；ACCOUNT_BUSY（含同一个时间点的批次还在别处执行：它可能没跑完就结束，时间点会重新空出来）/
+ *  DEVICE_BUSY、没说上话、登录状态对不上、别的拒绝 → 不记：去重的权威在服务端，本地记录只用来少发请求，
+ *  拿不准就再问一次。 */
 export function scheduleVerdict(r: Pick<ScheduledReply, "result" | "code">): ScheduleVerdict {
   if (r.result === "next_tab") return "next_tab";
   if (r.result === "started") return "done";

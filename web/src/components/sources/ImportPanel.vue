@@ -32,7 +32,7 @@ import {
   templateOverwriteMessage,
 } from '@/utils/importWizard'
 import { commitSummary } from '@/utils/results'
-import { DESIGNATION_MAPPING_HELP } from '@/utils/designation'
+import { FILE_DESIGNATION_MAPPING_HELP } from '@/utils/designation'
 import { confirmAction, notifyFailure, notifySuccess, notifySummary, promptText, runDownload, toast } from '@/utils/feedback'
 
 const emit = defineEmits<{ changed: [] }>()
@@ -452,7 +452,7 @@ function rowIssues(r: ImportRow): string {
         />
         <p class="mb-3 text-xs text-gray-500 dark:text-dark-400">
           已对应 {{ formatNumber(mappedCount) }}/{{ formatNumber(headers.length) }} 列。没有对应的列不导入；除平台订单号外不强制必填，缺人审结果的行停在「待确认」，缺执行字段的停在「资料待补齐」。
-          <span class="mt-1 block" data-testid="designation-help">{{ DESIGNATION_MAPPING_HELP }}</span>
+          <span class="mt-1 block" data-testid="designation-help">{{ FILE_DESIGNATION_MAPPING_HELP }}</span>
         </p>
         <el-alert v-if="requiredMissing.length" :title="`还没有对应：${requiredMissing.join('、')}`" type="warning" show-icon :closable="false" class="mb-3" />
 

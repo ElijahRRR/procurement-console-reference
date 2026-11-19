@@ -472,6 +472,7 @@ export const EVENT_KIND_LABEL: Record<string, string> = {
   'order.status_changed': '状态变化',
   'order.source_updated': '来源更新',
   'order.designation_changed': '来源指定的买家号变了',
+  'order.designation_not_adopted': '来源指定未采用',
   'order.source_conflict': '来源内容冲突',
   'order.source_review_conflict': '来源人审结论冲突',
   'order.source_key_changed': '来源记录的平台订单号变了',

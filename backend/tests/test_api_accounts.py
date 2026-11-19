@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-from tests.api_helpers import (IMPORT_HEADERS, api, bearer, create_account, err, identity, import_orders,  # noqa: F401
-                               import_row, ok, owner, plugin_client, register_device, run_body, xlsx_bytes)
+from tests.api_helpers import (IMPORT_HEADERS, api, bearer, create_account, err, find_order,  # noqa: F401
+                               identity, import_orders, import_row, ok, owner, plugin_client, register_device,
+                               run_body, xlsx_bytes)
 
 DEVICE_KEYS = {"id", "name", "ext_version", "online", "last_seen_at", "created_at", "hidden_at", "login", "account",
                "active_run"}
@@ -224,6 +225,47 @@ def test_discovered_buyers_register_fill_ignore_and_restore(owner, api):
     err(owner.get("/api/v1/accounts/discovered", params={"include_ignored": "maybe"}), 422, "VALIDATION")
     kinds = [e["kind"] for e in ok(owner.get("/api/v1/events", params={"entity": "account", "page_size": 200}))["rows"]]
     assert kinds.count("account.buyer_id_ignored") == 2 and kinds.count("account.buyer_id_unignored") == 1
+
+
+def test_ignore_and_unignore_refresh_the_unassigned_reason(owner):
+    """忽略 / 恢复一个被来源指定的买家号 ID：待分配原因立即跟着变，不用再点「重新分配」；重复操作、没有任务指定的 ID
+    不触发分配。"""
+    cid = "A1DEMO999999"
+    plain = f"来源指定的买家号 ID {cid} 还没有登记为账号；在「账号与浏览器」登记后会自动分配"
+    tail = "（这个买家号 ID 已被忽略，恢复后才能登记）"
+    create_account(owner, name="环境-DEMO-A")
+    import_orders(owner, data=xlsx_bytes([import_row("PO-DEMO-IG01", 买家号ID=cid)],
+                                         headers=[*IMPORT_HEADERS, "买家号ID"]))
+
+    def reason() -> str:
+        r = find_order(owner, "PO-DEMO-IG01")
+        assert (r["status"], r["assigned_account"]) == ("queued", None)
+        return r["status_reason"]
+
+    def order_events() -> list[str]:
+        rows = ok(owner.get("/api/v1/events", params={"entity": "order", "page_size": 200}))["rows"]
+        return [e["kind"] for e in rows]
+
+    assert reason() == plain
+    before = order_events()
+    first = ok(owner.get("/api/v1/allocation/last"))["id"]
+
+    assert ok(owner.post("/api/v1/accounts/discovered/ignore", json={"customer_id": cid})) == {"ok": True}
+    assert reason() == plain + tail
+    last = ok(owner.get("/api/v1/allocation/last"))
+    assert last["trigger"] == "account_change" and last["id"] != first
+    assert [u["reason"] for u in last["unassigned"]] == [plain + tail]
+    ok(owner.post("/api/v1/accounts/discovered/ignore", json={"customer_id": cid}))              # 重复：不分配
+    ok(owner.post("/api/v1/accounts/discovered/ignore", json={"customer_id": "A1DEMO888888"}))   # 没有任务指定
+    assert ok(owner.get("/api/v1/allocation/last"))["id"] == last["id"]
+
+    assert ok(owner.post("/api/v1/accounts/discovered/unignore", json={"customer_id": cid})) == {"ok": True}
+    assert reason() == plain
+    again = ok(owner.get("/api/v1/allocation/last"))
+    assert again["trigger"] == "account_change" and again["id"] != last["id"]
+    ok(owner.post("/api/v1/accounts/discovered/unignore", json={"customer_id": cid}))            # 没忽略着：不分配
+    assert ok(owner.get("/api/v1/allocation/last"))["id"] == again["id"]
+    assert order_events() == before                                                            # 只改了原因
 
 
 def test_new_console_routes_need_a_session_and_the_csrf_header(owner, api):

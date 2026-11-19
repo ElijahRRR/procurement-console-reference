@@ -120,6 +120,26 @@ test("设置：零设置可用（服务端地址缺省 http://127.0.0.1:8790）�
   assert.equal(validateServerUrl("http://127.0.0.1:8790/api").ok, false);
   assert.equal(validateServerUrl("ftp://127.0.0.1").ok, false);
   assert.equal(validateServerUrl("nonsense").ok, false);
+  // 永远连不上的地址一律不收（保存它会白白换掉令牌）：清单只有 http 的主机权限；fetch 拒绝带用户名密码的地址；
+  // 查询串、片段会让请求拼成「/?x=1/plugin/v1/…」。只写一个 ? 或 # 时 URL 解析出的 search、hash 是空的，所以看文本。
+  for (const [u, reason] of [
+    ["http://127.0.0.1:8790?x=1", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790#frag", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790?", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790#", "只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790?@attacker.example/", "只填协议、主机和端口，不要带路径"],
+    // 反斜杠：URL 解析当成「/」（路径看着是「/」），请求却拼成「//plugin/v1/…」，服务端答「接口不存在」
+    ["http://127.0.0.1:8790\\", "只填协议、主机和端口，不要带路径"],
+    ["http://localhost:8790\\/", "只填协议、主机和端口，不要带路径"],
+    ["http://user:pw@127.0.0.1:8790", "地址里不要带用户名或密码"],
+    ["http://user@localhost:8790", "地址里不要带用户名或密码"],
+    ["https://localhost:8790", "只支持 http 地址，例如 http://127.0.0.1:8790"],
+    ["https://127.0.0.1", "只支持 http 地址，例如 http://127.0.0.1:8790"],
+  ]) {
+    assert.deepEqual(validateServerUrl(u), { ok: false, reason }, u);
+  }
+  assert.deepEqual(validateServerUrl(" http://localhost:8790/ "), { ok: true }, "首尾空白与末尾斜杠照旧去掉");
+  assert.equal(normalizeSettings({ serverUrl: "http://127.0.0.1:8790?x=1" }).serverUrl, DEFAULT_SERVER_URL, "存下的坏地址读出来是缺省地址");
   assert.equal(normalizeSettings({ serverUrl: "http://evil.example" }).serverUrl, DEFAULT_SERVER_URL);
   assert.equal(normalizeSettings(null).simulationOutcome, "pass");
   for (const [v, want] of [[2, 2], ["7", 7], [" 12 ", 12], ["", null], [null, null], [0, null], [-3, null], [1.5, null], ["abc", null], ["1e3", null]]) {

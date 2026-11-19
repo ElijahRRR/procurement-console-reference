@@ -110,3 +110,17 @@ def test_admin_conn_targets_maintenance_db_with_same_conninfo(clean_db):
     with db.admin_conn(clean_db) as admin:
         assert admin.execute("SELECT current_database() AS d").fetchone()["d"] == db.MAINTENANCE_DB
         assert admin.autocommit is True
+
+
+def test_db_init_run_returns_the_documented_summary(scratch_db, capsys):
+    """db_init.run 的摘要键与文档字符串写的一致（契约 §0）；标准错误输出说「建表或升级到当前结构」。"""
+    from workflows import db_init
+
+    out = db_init.run(dsn=scratch_db)
+    keys = {"schema", "ok", "database", "database_created", "designations_backfilled"}
+    assert set(out) == keys
+    assert out["schema"] == "schema.sql" and out["designations_backfilled"] == 0
+    summary = db_init.run.__doc__.split("\n", 1)[0]
+    assert all(k in summary for k in keys), summary
+    err = capsys.readouterr().err
+    assert "已按 schema.sql 建表或升级到当前结构" in err and "已有的表不受影响" not in err

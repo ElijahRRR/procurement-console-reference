@@ -4,7 +4,7 @@
  * - 账号：恢复执行前重新读账号，按 pause_cause / open_result_unknown 提醒结果待核实，不再另查任务列表；
  * - 异常处理：「需要留意」的数字取概览的 needs_attention；
  * - 登录：429 显示「登录失败：尝试次数过多，请稍后再试」；
- * - 飞书连接：写回验收后没能恢复原值时在连接卡片上醒目提示；
+ * - 飞书连接：写回验收后没能恢复原值时在连接卡片上醒目提示；定时读取找不到买家号列时卡片与读取记录都提示；
  * - 文件导入：「继续」按原文件的表头顺序与工作表列表恢复。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -12,7 +12,7 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import ElementPlus, { ElSelect } from 'element-plus'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { defineComponent, h, type Component, type DefineComponent } from 'vue'
-import type { Account, Attempt, FeishuConnection, ImportBatch, OrderDetail, Overview } from '@/api/types'
+import type { Account, Attempt, FeishuConnection, ImportBatch, OrderDetail, Overview, SyncProblem, SyncRun } from '@/api/types'
 
 const ordersApi = vi.hoisted(() => ({
   listOrders: vi.fn(),
@@ -382,6 +382,100 @@ describe('飞书连接：写回验收没能恢复原值', () => {
     buttons('写回验收')[0].click()
     await flushPromises()
     expect(feedback.notifyFailure).toHaveBeenCalledWith('写回验收', e)
+  })
+})
+
+describe('飞书连接：读取中的问题', () => {
+  const MISSING = '来源表里找不到买家号列「买家号id」，这一列的指定保持上次读到的内容，新记录暂不接收'
+  const missing: SyncProblem = { record_id: null, upstream_order_no: '买家号列', verdict: 'skipped', reason: MISSING, scope: 'connection' }
+  const held = (n: number): SyncProblem => ({
+    record_id: `recDEMO${n}`, upstream_order_no: `PO-DEMO-${n}`, verdict: 'skipped',
+    reason: '来源表里找不到买家号列「买家号id」，读不出这一行有没有指定买家号，暂不接收；恢复这一列或改字段对应后会自动接收',
+  })
+  const conn = {
+    id: 6, name: '演示连接 DEMO', link: 'https://demo.feishu.cn/base/bascnDEMO?table=tblDEMO', app_token: 'bascnDEMO',
+    source_table_id: 'tblDEMO', source_view_id: null, result_table_id: 'tblDEMO', field_map: {}, admission: {},
+    writeback_map: {}, writeback_enabled: false, writeback_verified_at: null, writeback_state: 'disabled',
+    writeback_test_record: null, poll_minutes: 10, enabled: true, last_sync_at: '2026-11-18T02:00:00+00:00', last_sync_ok_at: '2026-11-18T02:00:00+00:00',
+    last_error: null, last_stats: { read: 1, unchanged: 1, problems: [missing] }, created_at: '', updated_at: '',
+  } as FeishuConnection
+  const run = (id: number, stats: SyncRun['stats'], trigger: SyncRun['trigger'] = 'schedule'): SyncRun => ({
+    id, connection_id: 6, trigger, started_at: '2026-11-18T02:00:00+00:00', finished_at: '2026-11-18T02:00:05+00:00', ok: true, stats, error: null,
+  })
+
+  beforeEach(() => {
+    feishuApi.getFeishuStatus.mockResolvedValue({ configured: true })
+  })
+
+  it('FeishuPanel: 定时读取找不到买家号列时卡片与读取记录都提示', async () => {
+    feishuApi.listConnections.mockResolvedValue({ total: 1, rows: [conn] })
+    feishuApi.listSyncRuns.mockResolvedValue({ total: 1, rows: [run(2, { read: 1, unchanged: 1, skipped: 1, problems: [missing, held(1)] })] })
+    await mountWith(FeishuPanel)
+    // 卡片：读取照常成功，状态点仍是「读取正常」，下面多一条提醒
+    expect(bodyText()).toContain('读取正常')
+    const alert = document.body.querySelector('[data-testid="connection-problem"]') as HTMLElement
+    expect(alert.textContent).toContain(MISSING)
+    expect(alert.outerHTML).toContain('el-alert--warning')
+    // 上次结果只列数字，不把 problems 当统计项
+    expect(bodyText()).toContain('读取 1 · 无变化 1')
+    buttons('查看读取记录')[0].click()
+    await flushPromises()
+    expect(feishuApi.listSyncRuns).toHaveBeenCalledWith(6)
+    const cell = document.body.querySelector('.el-dialog [data-testid="run-problems"]') as HTMLElement
+    expect(cell.textContent).toContain(MISSING)
+    // 记录级的与立即同步的提示同一格式
+    expect(cell.textContent).toContain('PO-DEMO-1：跳过，来源表里找不到买家号列「买家号id」，读不出这一行有没有指定买家号，暂不接收')
+  })
+
+  it('没有连接级问题时卡片上不提醒；读取记录的问题样本超过 5 条时先列 5 条，可以展开其余的', async () => {
+    feishuApi.listConnections.mockResolvedValue({ total: 1, rows: [{ ...conn, last_stats: { read: 9, unchanged: 2, skipped: 7 } }] })
+    feishuApi.listSyncRuns.mockResolvedValue({
+      total: 2,
+      rows: [run(3, { read: 9, unchanged: 2, skipped: 7, problems: [1, 2, 3, 4, 5, 6, 7].map(held) }), run(1, { read: 9, unchanged: 9 }, 'manual')],
+    })
+    await mountWith(FeishuPanel)
+    expect(document.body.querySelector('[data-testid="connection-problem"]')).toBeNull()
+    expect(bodyText()).not.toContain('来源表里找不到买家号列')
+    buttons('查看读取记录')[0].click()
+    await flushPromises()
+    const cell = () => document.body.querySelector('.el-dialog [data-testid="run-problems"]') as HTMLElement
+    expect(cell().querySelectorAll('li')).toHaveLength(5)
+    expect(cell().textContent).not.toContain('PO-DEMO-6')
+    buttons('展开其余 2 条')[0].click()
+    await flushPromises()
+    expect(cell().querySelectorAll('li')).toHaveLength(7)
+    expect(cell().textContent).toContain('PO-DEMO-7：跳过')
+    buttons('收起')[0].click()
+    await flushPromises()
+    expect(cell().querySelectorAll('li')).toHaveLength(5)
+  })
+
+  it('读取记录：失败的读取写出错误；没有读取记录时写明', async () => {
+    feishuApi.listConnections.mockResolvedValue({ total: 1, rows: [conn] })
+    feishuApi.listSyncRuns.mockResolvedValue({ total: 1, rows: [{ ...run(5, null), ok: false, error: '飞书接口返回 91403：应用没有该数据表的读取权限' }] })
+    await mountWith(FeishuPanel)
+    buttons('查看读取记录')[0].click()
+    await flushPromises()
+    const list = document.body.querySelector('.el-dialog [data-testid="sync-runs"]') as HTMLElement
+    expect(list.textContent).toContain('定时读取')
+    expect(list.textContent).toContain('失败')
+    expect(list.textContent).toContain('飞书接口返回 91403：应用没有该数据表的读取权限')
+    expect(list.querySelector('[data-testid="run-problems"]')).toBeNull()
+    feishuApi.listSyncRuns.mockResolvedValue({ total: 0, rows: [] })
+    buttons('关闭').at(-1)!.click()
+    buttons('查看读取记录')[0].click()
+    await flushPromises()
+    expect(document.body.querySelector('.el-dialog [data-testid="sync-runs"]')).toBeNull()
+    expect(bodyText()).toContain('还没有读取记录')
+  })
+
+  it('读取记录只保留了一部分样本时写明其余的条数', async () => {
+    feishuApi.listConnections.mockResolvedValue({ total: 1, rows: [conn] })
+    feishuApi.listSyncRuns.mockResolvedValue({ total: 1, rows: [run(4, { read: 300, skipped: 103, problems: [missing, held(1), held(2), held(3)] })] })
+    await mountWith(FeishuPanel)
+    buttons('查看读取记录')[0].click()
+    await flushPromises()
+    expect((document.body.querySelector('.el-dialog [data-testid="run-problems"]') as HTMLElement).textContent).toContain('另有 100 条有问题的记录没有保留明细')
   })
 })
 

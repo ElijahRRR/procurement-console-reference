@@ -10,7 +10,8 @@
  * 结论都一样 —— 不依赖闹钟准时。
  *
  * 「一个时间点一天只执行一次」的权威在服务端：定时批次带着时间点（`POST /runs {trigger: "scheduled", slot}`），
- * 服务端按（账号、北京日期、时间点）去重，重复时回 SLOT_DONE。本地的当天记录只用来少发请求，
+ * 服务端按（账号、北京日期、时间点）去重：这个时间点今天已有正常结束（finished）的批次时回 SLOT_DONE；
+ * 它的批次还在执行时回 ACCOUNT_BUSY（下一分钟再问：那个批次没跑完就结束的话时间点会重新空出来）。本地的当天记录只用来少发请求，
  * 而且**按买家号 ID 分键**（ScheduleBook）：同一个浏览器当天先后登录两个买家号时，一个账号处理过的
  * 时间点不能算到另一个账号头上。
  */
@@ -130,7 +131,7 @@ const isDayState = (v: unknown): v is ScheduleDayState =>
   !!v && typeof v === "object" && typeof (v as ScheduleDayState).bj_date === "string";
 
 /** 输入：存下来的任意值 → 输出：合法的记录本。旧版（不分买家号的单份记录，顶层就有 bj_date）整份作废：
- *  不知道它是哪个买家号的，宁可多问服务端一次（它会回 SLOT_DONE），也不把一个账号的记录算给另一个。 */
+ *  不知道它是哪个买家号的，宁可多问服务端一次（执行过的它会回 SLOT_DONE），也不把一个账号的记录算给另一个。 */
 export function normalizeBook(v: unknown): ScheduleBook {
   if (!v || typeof v !== "object" || Array.isArray(v) || isDayState(v)) return {};
   const out: ScheduleBook = {};
@@ -155,7 +156,7 @@ export function bookPut(book: ScheduleBook | null | undefined, customerId: strin
 
 /** 输入：今天到期的时间点（升序）→ 输出：向服务端申请定时批次时带哪一个时间点：最晚的那个。
  *  一个批次会把今天能执行的任务都跑掉，错过的几个时间点合成一次；各浏览器都报最晚的那个，
- *  服务端对它去重（SLOT_DONE），不会因为各自报了不同的时间点而各跑一次。没有到期的返回 null。 */
+ *  服务端对它去重（SLOT_DONE / ACCOUNT_BUSY），不会因为各自报了不同的时间点而各跑一次。没有到期的返回 null。 */
 export function slotToClaim(due: readonly string[]): string | null {
   return due.length ? due[due.length - 1]! : null;
 }

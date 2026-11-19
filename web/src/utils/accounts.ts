@@ -189,6 +189,11 @@ export function suggestedFillTarget(accounts: readonly Account[], item: Pick<Dis
   return accounts.find((a) => !a.amazon_customer_id && a.name === hint) ?? null
 }
 
+/** 输入：来源里这个买家号的名称 → 输出：已有同名、还没登记 ID 的账号时的提示（待登记列表的行里与登记对话框里同一句） */
+export function sameNameHint(nameHint: string): string {
+  return `来源里这个买家号叫「${nameHint}」，已有同名账号还没登记买家号 ID，可以直接填到它上面。`
+}
+
 /** 输入：待登记的买家号、目标账号 → 输出：「填到已有账号」的确认文案 */
 export function fillConfirmText(customerId: string, accountName: string): string {
   return `确定要把买家号 ID ${customerId} 登记到「${accountName}」吗？`

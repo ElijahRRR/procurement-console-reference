@@ -96,7 +96,11 @@ def temp_database(prefix: str = "procure_tmp") -> Iterator[str]:
 
 
 def run_schema(dsn: str, script_path: Path | None = None) -> None:
-    """输入：DSN、建表脚本路径（缺省当前的 refdata/schema.sql）→ 输出：无（与 db_init 相同的方式整份执行一遍）。"""
+    """输入：DSN、建表脚本路径（缺省当前的 refdata/schema.sql）→ 输出：无（整份脚本作为一条多语句查询在 autocommit
+    连接上执行一遍：脚本本身要么全部生效、要么全不生效）。
+
+    只执行脚本：不建库，也不做 db_init 的来源指定回填（db_init.run 把脚本和回填放在同一个事务里，要测回填用它）。
+    """
     script = (script_path or paths.SCHEMA_SQL).read_text(encoding="utf-8")
     with db.pg_conn(dsn, autocommit=True, statement_timeout_s=0) as conn:
         conn.execute(script)

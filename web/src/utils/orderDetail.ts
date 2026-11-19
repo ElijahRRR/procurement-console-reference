@@ -63,7 +63,11 @@ export function showStatusReason(o: Pick<OrderRow, 'status' | 'status_reason' | 
 
 /** 事件 detail 里直接显示的文字键（按顺序） */
 const EVENT_TEXT_KEYS = ['reason', 'cause', 'note', 'message', 'account_name', 'amazon_order_no'] as const
-/** 摘要里另行处理、不再按「键：值」列出的键 */
+/**
+ * 摘要里另行处理、不再按「键：值」列出的键（所有事件通用）。
+ * 只对某一种事件有意义的键不放这里，否则别的事件同名的键会被藏起来
+ * （例如 order.attention_cleared 的 previous 是原提醒，order.designation_not_adopted 的 previous 是对象，各自单独处理）。
+ */
 const EVENT_HANDLED_KEYS = new Set<string>([
   ...EVENT_TEXT_KEYS, 'from', 'to', 'source', 'status', 'verdict', 'changes', 'fields', 'notes', 'error_code', 'code', 'reasons',
   'stage', 'continue', 'cancel_reason', 'cancel_code', 'detail',
@@ -111,9 +115,37 @@ export function changesText(v: unknown): string {
     .join('；')
 }
 
+/** 输入：事件里的一个指定 {customer_id, name} → 输出：「名称（ID）」，缺哪个省哪个；都没有（或不是对象）为「未指定」 */
+function designationPairText(v: unknown): string {
+  const o = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+  const part = (x: unknown) => (typeof x === 'string' && x.trim() ? x.trim() : null)
+  const id = part(o.customer_id)
+  const name = part(o.name)
+  if (id && name) return `${name}（${id}）`
+  return name ?? id ?? NOT_DESIGNATED_TEXT
+}
+
+/**
+ * 输入：order.designation_not_adopted 事件的 detail {stated, previous, current} → 输出：没采用的是什么。
+ * previous 非空（此时 stated 两项为空）= 这条来源清空了它上次写的、当初就没被采用的买家号，任务现有的指定保持不变；
+ * 否则 = 这条来源写的买家号与任务现有的指定不同，没有采用。
+ */
+export function notAdoptedText(d: Record<string, unknown> | null | undefined): string {
+  const detail = d ?? {}
+  const current = designationPairText(detail.current)
+  const previous = detail.previous && typeof detail.previous === 'object' ? designationPairText(detail.previous) : null
+  const stated = designationPairText(detail.stated)
+  if (previous && previous !== NOT_DESIGNATED_TEXT && stated === NOT_DESIGNATED_TEXT) {
+    return `来源清空了买家号「${previous}」，任务现有的指定「${current}」不是这条来源写的，保持不变`
+  }
+  return `来源的买家号「${stated}」与任务现有的指定「${current}」不同，未采用`
+}
+
 /**
  * 输入：事件 → 输出：时间线里的一行摘要：状态变化、来源、预览结论、字段变化（含来源指定的买家号「旧 → 新」）、
- * 叫停原因（cancel_code 的中文）、错误码与护栏码中文、原因与备注；剩下的简单值按「字段：值」列出（对象不原样打印 JSON）。
+ * 没采用的来源指定（order.designation_not_adopted：来源写的与任务现有的指定）、
+ * 叫停原因（cancel_code 的中文）、错误码与护栏码中文、原因与备注、标记已处理时清掉的原提醒（order.attention_cleared 的 previous）；
+ * 都没有时剩下的简单值按「字段：值」列出（对象不原样打印 JSON）。
  */
 export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
   const d = e.detail ?? {}
@@ -134,6 +166,7 @@ export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
     return parts.join(' · ')
   }
   push(eventSourceText(d.source))
+  if (e.kind === 'order.designation_not_adopted') push(notAdoptedText(d))
   if (typeof d.verdict === 'string' && d.verdict) push(labelOf(FEISHU_VERDICT_LABEL, d.verdict))
   if (!from && typeof d.status === 'string' && d.status) push(`状态：${labelOf(ORDER_STATUS_LABEL, d.status)}`)
   push(changesText(d.changes))
@@ -148,6 +181,9 @@ export function eventSummary(e: Pick<EventRecord, 'kind' | 'detail'>): string {
     const v = d[k]
     if (Array.isArray(v)) push(v.filter((x) => typeof x === 'string' && x).join('；'))
   }
+  // 标记已处理：previous 是被清掉的原提醒（备注可以为空）
+  const clearedNote = e.kind === 'order.attention_cleared' && typeof d.previous === 'string' && d.previous.trim() ? d.previous.trim() : null
+  if (clearedNote) push(`原提醒：${clearedNote}`)
   if (!parts.length) {
     const rest = Object.entries(d).filter(
       ([k, v]) => !EVENT_HANDLED_KEYS.has(k) && v !== null && v !== undefined && v !== '' && typeof v !== 'object',

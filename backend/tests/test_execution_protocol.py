@@ -270,8 +270,10 @@ def test_start_conflict_maps_each_unique_index(conn, workspace):
     mapped = {name: execution._start_conflict(conn, row, acc, TODAY, slot, name).code for name, slot in [
         ("execution_runs_one_active_per_account", None), ("execution_runs_one_active_per_device", None),
         ("execution_runs_slot_once", "09:30"), ("", None), ("some_future_index", None)]}
+    # 撞了时间点的索引、此刻却既没有持有者也没有 finished 的批次 = 占着它的批次没跑完就结束了：时间点又空了，
+    # 回 ACCOUNT_BUSY（下一分钟再问），不回 SLOT_DONE。SLOT_DONE 只看事实（见下一条用例）。
     assert mapped == {"execution_runs_one_active_per_account": "ACCOUNT_BUSY",
-                      "execution_runs_one_active_per_device": "DEVICE_BUSY", "execution_runs_slot_once": "SLOT_DONE",
+                      "execution_runs_one_active_per_device": "DEVICE_BUSY", "execution_runs_slot_once": "ACCOUNT_BUSY",
                       "": "ACCOUNT_BUSY", "some_future_index": "ACCOUNT_BUSY"}
     indexes = {r["indexname"] for r in conn.execute(
         "SELECT indexname FROM pg_indexes WHERE schemaname = 'procure' AND tablename = 'execution_runs'")}
@@ -302,6 +304,22 @@ def test_start_conflict_on_a_slot_answers_by_whether_its_run_finished_not_by_ind
     assert execution._slot_finished(conn, workspace["id"], acc["id"], TODAY, "10:00") is False
     assert execution._start_conflict(conn, late, acc, TODAY, None, "execution_runs_one_active_per_account").code == \
         "ACCOUNT_BUSY"
+
+
+def test_start_conflict_whose_slot_run_died_meanwhile_is_account_busy_not_slot_done(conn, workspace):
+    """插入撞上了时间点的唯一索引，查持有者时那个批次已经没跑完就结束了（租约过期）：时间点又空出来，答复是不带
+    持有者的 ACCOUNT_BUSY（插件下一分钟再问就能开始），不能因为撞的是 …_slot_once 就回 SLOT_DONE、让插件把它记掉。"""
+    acc = fx.exec_account(conn, workspace["id"], purchase_mode="scheduled", schedule_times=["09:30"], name="环境-DEMO-A")
+    holder = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-1")
+    late = devices.authenticate(conn, fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-2")["token"])
+    run_id = fx.start(conn, holder, trigger="scheduled", slot="09:30")
+    conn.execute("UPDATE procure.execution_runs SET ended_at = %s, end_reason = 'lease_expired' WHERE id = %s",
+                 (NOW, run_id))
+    for name in ("execution_runs_slot_once", "execution_runs_one_active_per_account"):
+        e = execution._start_conflict(conn, late, acc, TODAY, "09:30", name)
+        assert e.code == "ACCOUNT_BUSY" and e.http_status == 409, name
+        assert e.detail == {"holder_device_id": None, "holder_device_name": None, "since": None}
+    assert fx.start(conn, late, trigger="scheduled", slot="09:30") != run_id          # 再问就能开始
 
 
 # ── 定时批次与时间点 ──────────────────────────────────────────────────────────

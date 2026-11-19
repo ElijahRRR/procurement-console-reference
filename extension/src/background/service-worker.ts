@@ -219,9 +219,12 @@ function ensureSecret(): Promise<{ token: string; url: string } | null> {
       if (!(await writeSecret(sec.token, url))) return null;
       sec = { token: sec.token, url };
     }
-    if (sec && sec.url !== null && isValidDeviceToken(sec.token)) return { token: sec.token, url: sec.url };
+    const urlUsable = !!sec && sec.url !== null && validateServerUrl(sec.url).ok;
+    if (sec && urlUsable && isValidDeviceToken(sec.token)) return { token: sec.token, url: sec.url! };
     // 没有令牌（或存下来的不是服务端接受的形状）：生成一个新的。新令牌 = 一个还没登记过的浏览器。
-    const url = sec?.url ?? stored;
+    // 令牌所属的地址根本连不上（早先的设置页收过带查询串、片段、用户名密码或 https 的地址）：这个令牌从没登记上过，
+    // 换一个新令牌、归到现在设置里的地址（那个地址不能用时设置读出来就是缺省地址）。
+    const url = sec && urlUsable ? sec.url! : stored;
     const token = generateDeviceToken();
     if (!(await writeSecret(token, url))) return null;
     if (rec) await lremove(KEYS.device);
@@ -897,13 +900,19 @@ async function onLeaseRelease(tabId: number): Promise<void> {
 
 // ── 执行批次跟踪（补发批次心跳、接管引擎已经没了的批次）────────────────────
 
-async function clearActiveRun(): Promise<void> {
-  await sremove(KEYS.activeRun);
-  try {
-    await chrome.alarms.clear(ALARM_RUN_BEAT);
-  } catch {
-    // 忽略
-  }
+/** 输入：要清掉的批次 id → 输出：清掉了没有。
+ *
+ *  只在本地记着的**正是这个批次**时才清（连同批次闹钟）；「读 → 比 → 删」整段在 runGate 里，与开始批次时写记录
+ *  串行。关于某个批次的答复可能回来得很慢（结束请求、兜底心跳在网络重试里），这期间这个浏览器可能已经开始了
+ *  下一个批次：晚到的答复不能把新批次的记录删掉（删了就没有兜底心跳、回执不归属批次、页面离开也不结束它）。 */
+async function clearActiveRun(runId: number): Promise<boolean> {
+  return runGate.run(async () => {
+    const cur = await sget<ActiveRun>(KEYS.activeRun);
+    if (!cur || cur.run_id !== runId) return false;
+    await sremove(KEYS.activeRun);
+    await chrome.alarms.clear(ALARM_RUN_BEAT).catch(() => undefined);
+    return true;
+  });
 }
 
 async function markRunViewInactive(tabId: number | null): Promise<void> {
@@ -911,14 +920,30 @@ async function markRunViewInactive(tabId: number | null): Promise<void> {
   if (rv?.active && (tabId === null || rv.tab_id === tabId)) await lset(KEYS.runView, { ...rv, active: false, updated_at: Date.now() });
 }
 
-/** 引擎走后台的每一次协议请求都更新 touched_at（10 秒内只写一次）；续租成功时记下 last_beat_ok_at。 */
-async function touchRun(tabId: number | undefined, beatOk: boolean): Promise<void> {
-  await runGate.run(async () => {
+/** 引擎走后台的每一次协议请求都更新 touched_at（10 秒内只写一次）；续租成功时记下 last_beat_ok_at。
+ *  知道是哪个批次的（批次心跳）时只更新那个批次的记录。只给引擎自己的请求用：后台自己发的心跳走
+ *  noteBackgroundBeatOk，不算引擎在动。输出：更新了（或在 10 秒内更新过）没有。 */
+async function touchRun(tabId: number | undefined, beatOk: boolean, runId: number | null = null): Promise<boolean> {
+  return runGate.run(async () => {
     const ar = await sget<ActiveRun>(KEYS.activeRun);
-    if (!ar || ar.tab_id !== tabId) return;
+    if (!ar || ar.tab_id !== tabId || (runId !== null && ar.run_id !== runId)) return false;
     const now = Date.now();
-    if (!beatOk && now - ar.touched_at < 10_000) return;
+    if (!beatOk && now - ar.touched_at < 10_000) return true;
     await sset(KEYS.activeRun, { ...ar, touched_at: now, ...(beatOk ? { last_beat_ok_at: now } : {}) });
+    return true;
+  });
+}
+
+/** 后台自己发的批次心跳（兜底心跳、接管中的续租）成功了：只记 last_beat_ok_at，**不动 touched_at**。
+ *  touched_at 只跟着引擎自己的请求走（touchRun）：兜底心跳若也刷新它，「引擎多久没动了」就永远到不了
+ *  ENGINE_SILENT_MS，一个还答 ping、却不再发请求的引擎会被后台一直续着租约。
+ *  输入：批次 id → 输出：本地记着的还是不是这个批次（不是就什么都不写）。 */
+async function noteBackgroundBeatOk(runId: number): Promise<boolean> {
+  return runGate.run(async () => {
+    const cur = await sget<ActiveRun>(KEYS.activeRun);
+    if (!cur || cur.run_id !== runId) return false;
+    await sset(KEYS.activeRun, { ...cur, last_beat_ok_at: Date.now() } satisfies ActiveRun);
+    return true;
   });
 }
 
@@ -966,11 +991,23 @@ async function settleLocalRun(): Promise<ActiveRun | null> {
   return (await sget<ActiveRun>(KEYS.activeRun)) ?? null;
 }
 
-/** 接管的批次：先补交它的回执（按退避）；都送到了就结束批次；还有没送到的就续租等着，
- *  租约预算用完、或接管满 CUSTODY_MAX_MS 还送不到（例如结果接口一直 5xx）则放手。 */
+/** 接管的批次往前推的那一步，同一时刻只跑一份（共享单飞）：orphanRun、30 秒的批次闹钟、开始新批次之前的
+ *  settleLocalRun 都会来推，各推各的会对同一个批次发两次结束请求，而回得慢的那一次会落在之后才开始的新批次头上。
+ *  后到的搭同一班、等它的结果；那一班开始时本地记着的还不是这个接管中的批次（它刚被接管），轮到它再推一步。 */
+const orphanFlight = new SharedFlight<number | null>();
+
 async function settleOrphan(): Promise<void> {
+  const handled = await orphanFlight.run(settleOrphanStep);
   const ar = await sget<ActiveRun>(KEYS.activeRun);
-  if (!ar || ar.orphaned_at === null) return;
+  if (ar && ar.orphaned_at !== null && ar.run_id !== handled) await orphanFlight.run(settleOrphanStep);
+}
+
+/** 接管的批次：先补交它的回执（按退避）；都送到了就结束批次；还有没送到的就续租等着，
+ *  租约预算用完、或接管满 CUSTODY_MAX_MS 还送不到（例如结果接口一直 5xx）则放手。
+ *  输出：推的是哪个批次；本地没有接管中的批次为 null。 */
+async function settleOrphanStep(): Promise<number | null> {
+  const ar = await sget<ActiveRun>(KEYS.activeRun);
+  if (!ar || ar.orphaned_at === null) return null;
   await drainReceipts({ runId: ar.run_id });
   const store = await lget<ReceiptStore>(KEYS.receipts);
   const pending = pendingForRun(store, ar.run_id);
@@ -979,7 +1016,7 @@ async function settleOrphan(): Promise<void> {
   const minutes = leaseMinutes(ar.lease_ttl_s);
   if (step === "finish") {
     const r = await authed((c) => c.finishRun(ar.run_id, ar.orphan_reason ?? "engine_gone"), "结束批次");
-    await clearActiveRun();
+    await clearActiveRun(ar.run_id);
     if (r.ok) {
       await log("info", `已通知服务端结束批次 #${ar.run_id}：在途尝试按租约过期处理（未登记提交的回到已分配，已登记提交的进结果待核实）`);
     } else if (r.error.kind === "http" && !(r.error.status !== null && r.error.status >= 500)) {
@@ -987,10 +1024,10 @@ async function settleOrphan(): Promise<void> {
     } else {
       await log("warn", `结束批次 #${ar.run_id} 失败：${r.error.message}；服务端会在租约到期（约 ${minutes} 分钟）后处理在途尝试`);
     }
-    return;
+    return ar.run_id;
   }
   if (step === "release") {
-    await clearActiveRun();
+    await clearActiveRun(ar.run_id);
     if (custodyOverBudget(ar, now)) {
       // 续租一直成功、结果却一直送不到（服务端 5xx）：不能替没有引擎的批次一直占着账号。
       const lastErr = Object.values(store ?? {}).find((r) => r.run_id === ar.run_id && r.last_error)?.last_error ?? null;
@@ -1004,26 +1041,31 @@ async function settleOrphan(): Promise<void> {
         `批次 #${ar.run_id} 还有 ${pending} 条结果回执一直送不到服务端：不再续租，服务端会在租约到期后处理在途尝试；回执保留，连上后补交（记为迟到回执，供人工核实）`,
       );
     }
-    return;
+    return ar.run_id;
   }
   const r = await authed((c) => c.runHeartbeat(ar.run_id), "批次心跳");
   if (r.ok) {
-    await runGate.run(async () => {
-      const cur = await sget<ActiveRun>(KEYS.activeRun);
-      if (cur && cur.run_id === ar.run_id) await sset(KEYS.activeRun, { ...cur, last_beat_ok_at: Date.now() });
-    });
+    await noteBackgroundBeatOk(ar.run_id);
   } else if (r.error.kind === "http" && !(r.error.status !== null && r.error.status >= 500)) {
-    await clearActiveRun();
-    await log("warn", `批次 #${ar.run_id} 的执行权已失效（${r.error.message}）；回执保留，连上后补交`);
+    if (await clearActiveRun(ar.run_id)) await log("warn", `批次 #${ar.run_id} 的执行权已失效（${r.error.message}）；回执保留，连上后补交`);
   }
+  return ar.run_id;
 }
 
 /** 后台的批次闹钟（30 秒一次）。主心跳由引擎自己发；这一路兜底，而且只在执行页面对 ping 有答复、
- *  引擎最近还在动时才发 —— 不替一个卡死或已经没了的引擎续命。接管中的批次走 settleOrphan。 */
+ *  引擎最近还在动（ENGINE_SILENT_MS 内发过协议请求）时才发 —— 不替一个卡死或已经没了的引擎续命。
+ *  「引擎最近还在动」只看引擎自己的请求：兜底心跳成功只记 last_beat_ok_at，不刷新 touched_at。
+ *  接管中的批次走 settleOrphan。
+ *
+ *  兜底心跳的答复可能回来得很慢（网络重试）：这期间同一个标签页可能已经结束了这个批次、又开始了下一个。
+ *  所以答复回来后先确认本地记着的还是这个批次，才按它清记录、请页面停下 —— 关于旧批次的拒绝不能停掉新批次。 */
 async function onRunBeat(): Promise<void> {
   const ar = await sget<ActiveRun>(KEYS.activeRun);
   if (!ar) {
-    await chrome.alarms.clear(ALARM_RUN_BEAT);
+    // 读与清在 runGate 里：两句之间开始的新批次（它的记录与闹钟也在 runGate 里写）不会被清掉闹钟。
+    await runGate.run(async () => {
+      if (!(await sget<ActiveRun>(KEYS.activeRun))) await chrome.alarms.clear(ALARM_RUN_BEAT).catch(() => undefined);
+    });
     return;
   }
   if (ar.orphaned_at !== null) return settleOrphan();
@@ -1035,12 +1077,13 @@ async function onRunBeat(): Promise<void> {
   const r = await authed((c) => c.runHeartbeat(ar.run_id), "批次心跳");
   let stop: string | null = null;
   if (r.ok) {
-    await touchRun(ar.tab_id, true);
-    if (r.data.stop) stop = `服务端要求停止：${stopReasonLabel(r.data.stop_reason)}`;
+    // 本地已经不是这个批次了：服务端对它说的「停止」与新批次无关。
+    if ((await noteBackgroundBeatOk(ar.run_id)) && r.data.stop) stop = `服务端要求停止：${stopReasonLabel(r.data.stop_reason)}`;
   } else if (r.error.kind === "http" && !(r.error.status !== null && r.error.status >= 500)) {
     // 执行权已经没了（LEASE_LOST / 404；重新登记之后仍是 401）：本地也不再认这个批次。引擎下一次请求会自己停下。
+    // 本地记着的已经不是它（引擎自己结束了它、又开始了下一个）：什么都不动。
+    if (!(await clearActiveRun(ar.run_id))) return;
     stop = `执行权已失效：${r.error.message}`;
-    await clearActiveRun();
     await markRunViewInactive(ar.tab_id);
     await log("warn", `批次 #${ar.run_id} ${stop}`);
   }
@@ -1141,7 +1184,7 @@ async function onStartRun(a: unknown[], tabId: number | undefined): Promise<ApiR
   const r = await authed((c) => c.startRun(trigger, customerId, slot), "开始批次");
   if (r.ok) {
     const now = Date.now();
-    await sset(KEYS.activeRun, {
+    const rec: ActiveRun = {
       run_id: r.data.run_id,
       tab_id: tabId,
       trigger,
@@ -1153,8 +1196,12 @@ async function onStartRun(a: unknown[], tabId: number | undefined): Promise<ApiR
       orphan_reason: null,
       customer_id: customerId,
       account_name: r.data.account?.name ?? null,
-    } satisfies ActiveRun);
-    await ensureRunBeatAlarm();
+    };
+    // 记录与批次闹钟在 runGate 里写：与 clearActiveRun 的「读 → 比 → 删」串行，晚到的旧答复删不掉它们。
+    await runGate.run(async () => {
+      await sset(KEYS.activeRun, rec);
+      await ensureRunBeatAlarm();
+    });
   }
   return r;
 }
@@ -1170,7 +1217,7 @@ async function onApi(op: ApiOp, args: unknown[], tabId: number | undefined): Pro
       return onStartRun(a, tabId);
     case "runHeartbeat":
       r = await authed((c) => c.runHeartbeat(num(0)), "批次心跳");
-      await touchRun(tabId, r.ok);
+      await touchRun(tabId, r.ok, num(0));
       return r;
     case "next":
       r = await authed((c) => c.next(num(0)), "领取");
@@ -1199,8 +1246,7 @@ async function onApi(op: ApiOp, args: unknown[], tabId: number | undefined): Pro
     }
     case "finishRun": {
       r = await authed((c) => c.finishRun(num(0), String(a[1] ?? "")), "结束批次");
-      const ar = await sget<ActiveRun>(KEYS.activeRun);
-      if (ar && ar.run_id === num(0)) await clearActiveRun();
+      await clearActiveRun(num(0));
       return r;
     }
     default:
@@ -1225,7 +1271,7 @@ async function onRunView(m: Extract<Msg, { type: "pc.runView" }>, tabId: number 
         `批次 #${ar.run_id} 还有 ${pending} 条结果回执没送到：后台继续续租并补交（最多 ${Math.round(CUSTODY_MAX_MS / 60_000)} 分钟），送达后结束批次`,
       );
     } else {
-      await clearActiveRun(); // 引擎已结束（含中断）：后台也不再补发心跳
+      await clearActiveRun(ar.run_id); // 引擎已结束（含中断）：后台也不再补发心跳
     }
   }
 }
@@ -1248,12 +1294,19 @@ async function onHello(tabId: number | undefined, loadedAt: number | null): Prom
   await checkSchedule("打开亚马逊页面");
 }
 
-/** 亚马逊页面要离开了（刷新、跳转、关闭）。 */
+/** 亚马逊页面要离开了（刷新、跳转、关闭）。
+ *
+ *  它在跑本地记着的批次 → 接管（orphanRun 也放开租约）。这个标签页没有自己的活批次（没有批次、批次是别的标签页的、
+ *  或已在接管）→ 放开它的标签页租约：页面在拿到租约之后、批次建出来之前离开时，没有别的路会放开它，
+ *  别的亚马逊标签页要等租约过期加宽限（最多 15 分钟）才能开始。这个标签页的批次还在、只是页面不知道批次 id
+ *  的那一种不在这里放：30 秒内批次闹钟问不到引擎，就会接管它并放开租约。 */
 async function onBye(tabId: number | undefined, loadedAt: number | null, runId: number | null): Promise<void> {
   if (tabId === undefined) return;
   const ar = await sget<ActiveRun>(KEYS.activeRun);
   if (ar && ar.orphaned_at === null && ar.tab_id === tabId && runId !== null && runId === ar.run_id) {
     await orphanRun(ar, "page_left", `执行页面已离开（刷新、跳转或关闭）：批次 #${ar.run_id} 中断`);
+  } else if (!ar || ar.tab_id !== tabId || ar.orphaned_at !== null) {
+    await onLeaseRelease(tabId); // 只在这个标签页就是持有者时才动
   }
   await onIdentityTabGone(tabId, typeof loadedAt === "number" ? loadedAt + 1 : undefined);
 }
@@ -1277,9 +1330,10 @@ async function amazonTabs(): Promise<chrome.tabs.Tab[]> {
  *
  *  「一个时间点一天只执行一次」的权威在服务端（按账号、北京日期、时间点去重）；本地的当天记录按买家号 ID
  *  分键，只用来少发请求。怎么记「处理过了」（规格 §3）：
- *    · 已开始、服务端说这个时间点今天执行过（SLOT_DONE）、账号已暂停 → 记；
+ *    · 已开始、服务端说这个时间点今天已有正常结束的批次（SLOT_DONE）、账号已暂停 → 记；
  *    · 服务端说参数不对（422：账号改成手动了、时间点删了）→ 先刷新配置，这个时间点记为处理过；
- *    · 这个买家号正在别处执行（ACCOUNT_BUSY）、这个浏览器上一个批次还没结束（DEVICE_BUSY）、没说上话、
+ *    · 这个买家号正在别处执行（ACCOUNT_BUSY，包括同一个时间点的批次还没执行完：它没跑完就结束的话时间点会重新空出来）、
+ *      这个浏览器上一个批次还没结束（DEVICE_BUSY）、没说上话、
  *      登录状态对不上 → **不记**，下一分钟再问；
  *    · 没有登着这个买家号的亚马逊页面 → 只记一次「等待环境」，今天内打开后补执行（跨天不补）。 */
 async function checkSchedule(reason: string): Promise<void> {
@@ -1334,7 +1388,8 @@ async function checkSchedule(reason: string): Promise<void> {
       }
       if (verdict === "done") return done(reply.result === "started" ? "ok" : "info", reply.message);
       if (verdict === "refresh") {
-        await done("warn", `${reply.message}（已刷新配置，今天这个时间点不再触发）`);
+        // 服务端的原话常以括号收尾（「…的执行时间里（18:00）」），这里接分号，不再套一层括号
+        await done("warn", `${reply.message}；已刷新配置，今天这个时间点不再触发`);
         await heartbeat("定时被拒后刷新配置");
         return;
       }

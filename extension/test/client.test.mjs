@@ -103,7 +103,7 @@ test("登记的失败：多个工作区（409 WORKSPACE_REQUIRED）、插件过�
   assert.match(ws.error.message, /工作区 ID/);
   const old = await c(json(409, { code: "PLUGIN_OUTDATED", message: "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）", detail: {} }));
   assert.equal(old.error.code, "PLUGIN_OUTDATED");
-  const rl = await c(new Response(JSON.stringify({ code: "RATE_LIMITED", message: "登记的浏览器太多：请稍后再试", detail: { retry_after_s: 42 } }), { status: 429 }));
+  const rl = await c(new Response(JSON.stringify({ code: "RATE_LIMITED", message: "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES", detail: { retry_after_s: 42 } }), { status: 429 }));
   assert.equal(retryAfterSeconds(rl.error), 42);
 });
 
@@ -393,14 +393,14 @@ test("领取：retry_after_s 只要是不小于 0 的数（整数、小数、数
 });
 
 test("Retry-After：detail.retry_after_s 优先，其次响应头；登记被限速时读得出秒数", async () => {
-  const s = scripted(new Response(JSON.stringify({ code: "RATE_LIMITED", message: "登记的浏览器太多：请稍后再试", detail: {} }), { status: 429, headers: { "retry-after": "17" } }));
+  const s = scripted(new Response(JSON.stringify({ code: "RATE_LIMITED", message: "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES", detail: {} }), { status: 429, headers: { "retry-after": "17" } }));
   const r = await client(s.fetch, { token: null }).register(TOKEN);
   assert.equal(r.ok, false);
   assert.equal(r.error.code, "RATE_LIMITED");
   assert.equal(r.error.retry_after_s, 17);
   assert.equal(retryAfterSeconds(r.error), 17);
-  assert.equal(r.error.message, "登记的浏览器太多：请稍后再试");
-  const d = httpError(429, { code: "RATE_LIMITED", message: "登记的浏览器太多：请稍后再试", detail: { retry_after_s: 42 } }, "17");
+  assert.equal(r.error.message, "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES");
+  const d = httpError(429, { code: "RATE_LIMITED", message: "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES", detail: { retry_after_s: 42 } }, "17");
   assert.equal(retryAfterSeconds(d), 42);
   assert.equal(retryAfterSeconds(httpError(429, null)), null, "没给就是没给");
   assert.equal(parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT"), null, "HTTP 日期格式不认");

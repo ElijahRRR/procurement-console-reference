@@ -134,12 +134,38 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
     fx.overview.devices = { total: shown.length, online: shown.filter((d) => d.online).length }
     fx.overview.discovered_buyers = fx.discovered.filter((x) => !x.ignored).length
   }
-  /** 输入：请求体里的买家号 ID、当前账号 id → 输出：错误响应；可以写入时为 null */
-  function customerIdProblem(raw: unknown, selfId: number | null): MockResponse | null {
+  /** 同服务端 services/accounts：买家号 ID 形状不对时的提示 */
+  const CUSTOMER_ID_SHAPE_MESSAGE = '买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）'
+  /**
+   * 输入：新建 / 修改账号的请求体 → 输出：同服务端规范化后的副本：账号名称去首尾空白；买家号 ID 去首尾空白后大写，空串为 null。
+   * 别的类型原样留着，交给形状检查报错。
+   */
+  function normalizeAccountBody(b: Record<string, unknown>): Record<string, unknown> {
+    const out = { ...b }
+    if (typeof out.name === 'string') out.name = out.name.trim()
+    if (typeof out.amazon_customer_id === 'string') out.amazon_customer_id = out.amazon_customer_id.trim().toUpperCase() || null
+    return out
+  }
+  /** 输入：规范化后的买家号 ID → 输出：形状不对时的错误响应；留空或形状合格为 null */
+  function customerIdShapeProblem(raw: unknown): MockResponse | null {
     if (raw === null || raw === undefined || raw === '') return null
-    if (typeof raw !== 'string' || !CUSTOMER_ID_RE.test(raw)) return err(422, 'VALIDATION', '买家号 ID 以 A 开头，后面至少 8 位大写字母或数字', { field: 'amazon_customer_id' })
-    const other = fx.accounts.find((a) => a.amazon_customer_id === raw && a.id !== selfId)
-    return other ? err(409, 'CONFLICT', `买家号 ID ${raw} 已登记在账号「${other.name}」上`) : null
+    return typeof raw !== 'string' || !CUSTOMER_ID_RE.test(raw) ? err(422, 'VALIDATION', CUSTOMER_ID_SHAPE_MESSAGE, { field: 'amazon_customer_id' }) : null
+  }
+  /**
+   * 输入：请求体里的账号名称、买家号 ID、当前账号 id（新建为 null）→ 输出：错误响应；可以写入时为 null。
+   * 同服务端 services/accounts 的检查顺序与形状：ID 形状 → 名称为空 → 名称重复 → ID 已登记在另一个账号上，都是 422 VALIDATION
+   * （detail.field = amazon_customer_id / name），不是 409。只检查请求里带了的字段；请求体先经 normalizeAccountBody。
+   */
+  function accountInputProblem(b: Record<string, unknown>, selfId: number | null): MockResponse | null {
+    const shape = 'amazon_customer_id' in b ? customerIdShapeProblem(b.amazon_customer_id) : null
+    if (shape) return shape
+    if ('name' in b && b.name !== null && b.name !== undefined && typeof b.name !== 'string') return err(422, 'VALIDATION', '账号名称必须是文本', { field: 'name' })
+    if (('name' in b || selfId === null) && !b.name) return err(422, 'VALIDATION', '账号名称不能为空', { field: 'name' })
+    const name = typeof b.name === 'string' ? b.name.trim() : null
+    if (name !== null && fx.accounts.some((a) => a.name === name && a.id !== selfId)) return err(422, 'VALIDATION', `账号名称「${name}」已存在`, { field: 'name' })
+    const raw = b.amazon_customer_id
+    const other = typeof raw === 'string' && raw ? fx.accounts.find((a) => a.amazon_customer_id === raw && a.id !== selfId) : undefined
+    return other ? err(422, 'VALIDATION', `买家号 ID ${String(raw)} 已登记在账号 ${other.name}`, { field: 'amazon_customer_id' }) : null
   }
 
   function handle(method: string, url: URL, body: unknown): MockResponse {
@@ -249,10 +275,10 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
     if (path === '/accounts' && m === 'GET') return ok(page(fx.accounts, q))
     if (path === '/accounts' && m === 'POST') {
       // 登记 = 带 amazon_customer_id 的新建
-      const bad = customerIdProblem(b.amazon_customer_id, null)
+      const nb = normalizeAccountBody(b)
+      const bad = accountInputProblem(nb, null)
       if (bad) return bad
-      if (fx.accounts.some((a) => a.name === b.name)) return err(409, 'CONFLICT', `账号名称「${String(b.name)}」已存在`)
-      const limit = Number(b.daily_limit ?? 20)
+      const limit = Number(nb.daily_limit ?? 20)
       const created: Account = {
         ...fx.accounts[0],
         amazon_customer_id: null,
@@ -261,9 +287,9 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
         paused_at: null,
         pause_cause: null,
         open_result_unknown: 0,
-        ...(b as Partial<Account>),
+        ...(nb as Partial<Account>),
         id: Math.max(98, ...fx.accounts.map((a) => a.id)) + 1,
-        effective_max_delivery_days: Number(b.max_delivery_days ?? fx.settings.default_max_delivery_days),
+        effective_max_delivery_days: Number(nb.max_delivery_days ?? fx.settings.default_max_delivery_days),
         quota_today: { limit, used: 0, planned: 0, available: limit },
         browsers: [],
         active_run: null,
@@ -281,8 +307,9 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       return ok({ items: fx.discovered.filter((x) => all || !x.ignored) })
     }
     if ((r = /^\/accounts\/discovered\/(ignore|unignore)$/.exec(path)) && m === 'POST') {
-      const id = String(b.customer_id ?? '')
-      if (!CUSTOMER_ID_RE.test(id)) return err(422, 'VALIDATION', '买家号 ID 以 A 开头，后面至少 8 位大写字母或数字', { field: 'customer_id' })
+      // 同服务端：去掉全部空白、大写后再检查形状
+      const id = typeof b.customer_id === 'string' ? b.customer_id.replace(/\s+/g, '').toUpperCase() : ''
+      if (!CUSTOMER_ID_RE.test(id)) return err(422, 'VALIDATION', CUSTOMER_ID_SHAPE_MESSAGE, { field: 'customer_id' })
       // 忽略名单与此刻有没有浏览器登录着无关
       const ignoring = r[1] === 'ignore'
       if (ignoring) ignoredIds.add(id)
@@ -294,13 +321,14 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       const a = fx.accounts.find((x) => x.id === Number(r![1]))
       if (!a) return err(404, 'NOT_FOUND', '账号不存在')
       if (m === 'PATCH') {
-        if ('amazon_customer_id' in b && (b.amazon_customer_id ?? null) !== a.amazon_customer_id) {
+        const nb = normalizeAccountBody(b)
+        const bad = accountInputProblem(nb, a.id)
+        if (bad) return bad
+        if ('amazon_customer_id' in nb && (nb.amazon_customer_id ?? null) !== a.amazon_customer_id) {
           // 填到已有账号 / 修改买家号 ID：执行中或有结果待核实时不允许
-          const bad = customerIdProblem(b.amazon_customer_id, a.id)
-          if (bad) return bad
           if (a.active_run || (a.open_result_unknown ?? 0) > 0) return err(409, 'CONFLICT', '账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID')
         }
-        Object.assign(a, b)
+        Object.assign(a, nb)
         // 改买家号 ID 也触发重新分配（契约 §3.2）
         assignDesignated()
         syncBuyers()
@@ -374,13 +402,17 @@ export function createMockApi(opts: MockOptions = {}, now: Date = new Date()) {
       if (!c) return err(404, 'NOT_FOUND', '连接不存在')
       if (r[2] === 'runs') return ok(page(fx.syncRuns[c.id] ?? [], q))
       if (r[2] === 'sync') {
-        // 同服务端 feishu_intake.run_connection：统计 + 问题记录样本 + 随后的分配摘要
+        // 同服务端 feishu_intake.run_connection：统计 + 问题记录样本（连接级问题在最前面，如来源表里找不到买家号列）
+        // + 随后的分配摘要；连接级问题同时留在连接的 last_stats.problems 里
+        const whole = (c.last_stats?.problems ?? []).filter((p) => p.scope === 'connection')
         const res: FeishuSyncResult = {
           read: 12, new: 2, update: 1, unchanged: 8, conflict: 0, historical: 0, skipped: 1, invalid: 0,
           run_id: 501,
-          problems: [{ record_id: 'recDEMO000777', upstream_order_no: 'PO-DEMO-20261199-SKU99', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
+          problems: [...whole, { record_id: 'recDEMO000777', upstream_order_no: 'PO-DEMO-20261199-SKU99', verdict: 'skipped', reason: '采购方不是本系统接的采购方' }],
           allocation: { ...fx.lastAllocation, id: fx.lastAllocation.id + 1, trigger: 'intake', at: now.toISOString() },
         }
+        const stats = { read: res.read, new: res.new, update: res.update, unchanged: res.unchanged, conflict: res.conflict, historical: res.historical, skipped: res.skipped, invalid: res.invalid }
+        Object.assign(c, { last_sync_at: now.toISOString(), last_sync_ok_at: now.toISOString(), last_error: null, last_stats: whole.length ? { ...stats, problems: whole } : stats })
         return ok(res)
       }
       if (r[2] === 'verify-writeback') {

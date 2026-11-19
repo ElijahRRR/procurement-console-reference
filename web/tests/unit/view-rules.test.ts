@@ -125,6 +125,14 @@ describe('事件摘要', () => {
     // 对象不原样打印 JSON
     expect(eventSummary(event('order.something_new', { extra: { a: 1 }, count: 3 }))).toBe('count：3')
   })
+  it('标记已处理（order.attention_cleared）写出清掉的原提醒；备注为空时摘要也不空', () => {
+    const prev = '账号暂停前的提醒：结果待核实 DEMO'
+    expect(eventSummary(event('order.attention_cleared', { note: null, previous: prev }))).toBe(`原提醒：${prev}`)
+    expect(eventSummary(event('order.attention_cleared', { note: '已在后台核对 DEMO', previous: prev }))).toBe(`已在后台核对 DEMO · 原提醒：${prev}`)
+    expect(eventSummary(event('order.attention_cleared', { note: '已在后台核对 DEMO', previous: null }))).toBe('已在后台核对 DEMO')
+    // 别的事件里同名的简单值照样按「字段：值」列出，不因来源指定事件用到这些键而被藏起来
+    expect(eventSummary(event('order.something_new', { previous: 'x1', stated: 'x2', current: 'x3' }))).toBe('previous：x1；stated：x2；current：x3')
+  })
   it('来源、预览结论、状态与字段变化写成中文', () => {
     expect(eventSummary(event('order.created', { source: { kind: 'file', batch_id: 1, row_no: 6 }, verdict: 'new', status: 'pending_review' }))).toBe(
       '文件批次 1 第 6 行 · 新单 · 状态：待确认',

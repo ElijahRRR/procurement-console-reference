@@ -65,7 +65,7 @@ import ImportPanel from '@/components/sources/ImportPanel.vue'
 import OrderDetailDrawer from '@/components/orders/OrderDetailDrawer.vue'
 import FeishuWizard from '@/components/sources/FeishuWizard.vue'
 import type { FeishuConnection } from '@/api/types'
-import { DESIGNATION_MAPPING_HELP } from '@/utils/designation'
+import { DESIGNATION_MAPPING_HELP, FILE_DESIGNATION_MAPPING_HELP } from '@/utils/designation'
 
 function makeRouter() {
   const Blank = defineComponent({ render: () => h('div') })
@@ -152,9 +152,11 @@ describe('文件导入：预览之后改字段对应', () => {
     await flushPromises()
     expect(importsApi.getImport).toHaveBeenCalledWith(42)
     expect(w.text()).toContain('预览 · 共 2 行')
-    // 字段对应的帮助段落：原来的说明还在，后面多一句买家号两列的用法
+    // 字段对应的帮助段落：原来的说明还在，后面多一句买家号两列的用法；文件导入另说明空着重新上传不会清除指定
     const help = w.find('[data-testid="designation-help"]')
-    expect(help.text()).toBe(DESIGNATION_MAPPING_HELP)
+    expect(help.text()).toBe(FILE_DESIGNATION_MAPPING_HELP)
+    expect(help.text()).toContain('买家号对应到另一个账号时不分配')
+    expect(help.text()).toContain('空着重新上传不会清除指定')
     expect(help.element.parentElement!.textContent).toContain('没有对应的列不导入')
     const commitBtn = () => buttons('提交导入')[0]
     expect(commitBtn().disabled).toBe(false)
@@ -393,6 +395,9 @@ describe('飞书向导：多列回退的字段对应', () => {
     // 字段对应一步的帮助段落：原来的说明还在，后面多一句买家号两列的用法
     const help = document.body.querySelector('[data-testid="designation-help"]') as HTMLElement
     expect(help.textContent).toBe(DESIGNATION_MAPPING_HELP)
+    expect(help.textContent).toContain('买家号对应到另一个账号时不分配')
+    // 飞书清空格子会清除指定：飞书向导不加文件导入那一句
+    expect(help.textContent).not.toContain('空着重新上传不会清除指定')
     expect(help.parentElement!.textContent).toContain('左侧是系统字段，右侧选择飞书表里对应的列')
     const selects = w.findAllComponents(ElSelect).filter((s) => s.props('multiple'))
     const values = selects.map((s) => s.props('modelValue'))

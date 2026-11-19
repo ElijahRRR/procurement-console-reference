@@ -126,7 +126,10 @@ test("植入夹具：标题、搜索框 value、商品标题、属性、注释�
   assert.equal(readCustomerId(doc), "A1DEMO00000");
 });
 
-test("植入夹具：内联脚本里没有真值时读不出（已登录、没读到买家号 ID），绝不把植入的值读成买家号 ID", () => {
+// 这条只覆盖「植入在内联脚本之外」（标题、搜索框 value、商品标题）。植入**在内联脚本里**（例如被回显进 JSON 数据块、
+// 而这一页又没有真值）时解析器会把它读成买家号 ID：这是已知的残余风险，写在 extension/README.md「还没有实机核实的
+// 浏览器行为」里，真实采购之前要按页面路径白名单收紧（真实页面没法在这里核实，读取规则暂不改）。
+test("植入夹具：植入只在标题、搜索框、商品标题里（内联脚本里没有 customerId）时读不出（已登录、没读到买家号 ID）", () => {
   const doc = fixture("planted-no-script.html");
   assert.match(doc.documentElement.innerHTML, /customerId: 'A9PLANT00001'/);
   assert.equal(readLoginState(doc, "https://www.amazon.com/s?k=demo"), "ok");

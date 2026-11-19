@@ -16,10 +16,12 @@
 - 每个任务自己开事务（registry.db.pg_conn，在 workflows 里）；飞书读取每个连接一个事务，读飞书失败时失败记录随该事务提交。
 - 每日分配：进程内记下已处理的北京日期（省得每拍查库）；真正的去重在库里（allocation.daily_done 查
   allocation_runs），所以 00:01 之后重启不会重做当天的每日分配；服务停过、当天还没做的工作区启动后补做一次。
+  只有全部工作区都没报错才记下这一天：有工作区失败（例如被数据库判为死锁回滚）或整次抛错 → 隔 DAILY_RETRY_S 秒
+  再试，已经做完的工作区由 daily_done 跳过，失败的那几个补做。
 - 停止：uvicorn 退出（Ctrl+C / SIGTERM）后置停止事件并等待线程结束；线程是守护线程，不会挂住进程退出。
 - 启动检查：serve 在建应用、起调度之前先看库结构（workflows.db_init.schema_problem）：是旧版或还没建表就打印
   「数据库结构是旧版：请先运行 python cli.py db_init」之类的说明并以非零码退出。升级顺序：停服务 → db_init → 启动
-  → 重新加载插件。
+  → 在控制台点一次「重新分配」→ 重新加载插件。
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import threading
 import time as _time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from registry import settings
@@ -41,6 +43,8 @@ log = logging.getLogger("scheduler")
 DAILY_ALLOCATION_AT = time(0, 1)
 #: 循环的节拍（秒）：每拍检查一次哪些任务到期（只是轮询粒度，不是业务参数）
 TICK_S = 1.0
+#: 每日分配有工作区失败（或整次抛错）后隔多久再试（秒；只是重试节奏，不是业务参数）：不至于每拍都重跑、刷日志
+DAILY_RETRY_S = 60.0
 
 
 # ── 单个任务（每个都自己开事务）────────────────────────────────────────────────
@@ -95,9 +99,10 @@ def run_daily_allocation(now: datetime) -> dict[str, Any]:
 
 @dataclass
 class JobState:
-    """调度的进程内状态：每日分配已跑到的北京日期、各任务的连续失败次数。"""
+    """调度的进程内状态：每日分配已跑到的北京日期、每日分配失败后的下次重试时刻、各任务的连续失败次数。"""
 
     last_daily: date | None = None
+    daily_retry_at: datetime | None = None
     failures: dict[str, int] = field(default_factory=dict)
 
 
@@ -119,11 +124,32 @@ def _guarded(name: str, fn: Callable[[], dict[str, Any]], state: JobState) -> di
     return result
 
 
+def _daily_pending(now: datetime, state: JobState) -> bool:
+    """输入：当前时刻、调度状态 → 输出：现在要不要跑每日分配（daily_due，且不在上次失败后的重试间隔里）。"""
+    if not daily_due(now, state.last_daily):
+        return False
+    return state.daily_retry_at is None or now >= state.daily_retry_at
+
+
 def _daily(now: datetime, state: JobState) -> dict[str, Any]:
+    """输入：当前时刻、调度状态 → 输出：每日分配摘要（run_daily_allocation），或 {skipped}。
+
+    全部工作区都没报错才记下 last_daily；有工作区返回 {error}（或整次抛错，由 _guarded 接住）→ 不记，
+    DAILY_RETRY_S 秒后再试（已做完的工作区由 allocation.daily_done 跳过，不会重复）。
+    """
     if not daily_due(now, state.last_daily):
         return {"skipped": "未到北京时间 00:01 或今天已分配", "last_daily": state.last_daily}
+    if not _daily_pending(now, state):
+        return {"skipped": "上次有工作区分配失败，稍后重试", "retry_at": state.daily_retry_at.isoformat()}
+    state.daily_retry_at = now + timedelta(seconds=DAILY_RETRY_S)        # 这一次抛错时也按间隔重试
     out = run_daily_allocation(now)
+    failed = sorted(w for w, v in out.get("workspaces", {}).items() if isinstance(v, dict) and "error" in v)
+    if failed:
+        log.warning("每日分配（北京 %s）有 %d 个工作区失败（%s），%.0f 秒后重试", clock.bj_date(now), len(failed),
+                    "、".join(failed), DAILY_RETRY_S)
+        return out
     state.last_daily = clock.bj_date(now)
+    state.daily_retry_at = None
     return out
 
 
@@ -208,7 +234,7 @@ class Scheduler:
                     _guarded(job.name, lambda j=job: j.fn(clock.now()), self.state)
             if with_daily and not self._stop.is_set():
                 now = clock.now()
-                if daily_due(now, self.state.last_daily):
+                if _daily_pending(now, self.state):
                     _guarded("daily_allocation", lambda n=now: _daily(n, self.state), self.state)
             self._stop.wait(self.tick_s)
 

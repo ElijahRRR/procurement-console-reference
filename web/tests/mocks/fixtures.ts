@@ -27,6 +27,7 @@ import type {
   Overview,
   ResolvedLink,
   Settings,
+  SyncProblem,
   SyncRun,
   SystemFields,
   UploadResult,
@@ -566,9 +567,10 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       status: 'assigned', unit: '25.60', qty: 1, cap: '33.00', date: 1, account: 3, kind: 'source', sources: ['file'],
       note: '按来源的买家号「环境 - DEMO - 01」（对应账号 环境-DEMO-01）', designated: { name: '环境 - DEMO - 01', account: 3 },
     }),
-    // 来源指定了 环境-DEMO-01，人工改派到了 环境-DEMO-02：留在改派账号期间不跟随来源
+    // 来源指定了 环境-DEMO-01，人工改派到了 环境-DEMO-02：留在改派账号期间不跟随来源。
+    // 后来上传的文件里同一订单写了另一个买家号：文件不是主来源，没有采用（时间线上有一条 order.designation_not_adopted）
     row({
-      status: 'assigned', unit: '27.30', qty: 1, cap: '35.00', date: 0, account: 4, kind: 'manual',
+      status: 'assigned', unit: '27.30', qty: 1, cap: '35.00', date: 0, account: 4, kind: 'manual', sources: ['feishu', 'file'],
       note: '人工改派', designated: { id: 'A1DEMO00001', name: '环境-DEMO-01', account: 3 },
     }),
     // 指定的买家号 ID 还没有登记（浏览器登录着它，见待登记的买家号）
@@ -766,6 +768,15 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
         },
         source: feishu ? { kind: 'feishu', connection_id: 1, record_id: `recDEMO${String(r.id).padStart(6, '0')}` } : { kind: 'file', batch_id: 41, row_no: 3 + (r.id % 17) },
       }))
+      if (feishu && r.source_kinds.includes('file')) {
+        // 文件来源写了另一个买家号，任务已有飞书写的指定、文件不是主来源：没有采用（services/orders._designation_change）
+        list.push(ev(90_000 + r.id, 60 * 5 - 3, 'order.designation_not_adopted', 'source', null, {
+          source: { kind: 'file', batch_id: 41, row_no: 3 + (r.id % 17) },
+          stated: { customer_id: null, name: '环境-DEMO-02' },
+          previous: null,
+          current: { customer_id: des.customer_id, name: des.name },
+        }))
+      }
     }
     if (r.assigned_account) {
       const manual = r.assignment_kind === 'manual'
@@ -960,6 +971,35 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
 
   // ── 飞书 ────────────────────────────────────────────────────────────────────
 
+  /**
+   * 连接级问题（services/feishu_intake.buyer_columns_problem）：来源表里的「买家号id」列被改了名。
+   * 读取结果与读取记录的 problems 最前面各有一条，连接的 last_stats.problems 里也带着它（连接卡片据此提醒）。
+   */
+  const missingBuyerColumn: SyncProblem = {
+    record_id: null,
+    upstream_order_no: '买家号列',
+    verdict: 'skipped',
+    reason: '来源表里找不到买家号列「买家号id」，这一列的指定保持上次读到的内容，新记录暂不接收',
+    scope: 'connection',
+  }
+  /** 买家号列读不到时，没有可信 AMZ 订单号的新记录不接收（services/feishu_intake.new_record_hold_reason） */
+  const heldNewRecord = (no: number): SyncProblem => ({
+    record_id: `recDEMO004${String(no).padStart(3, '0')}`,
+    upstream_order_no: `PO-DEMO-20261118-SKU${no}`,
+    verdict: 'skipped',
+    reason: '来源表里找不到买家号列「买家号id」，读不出这一行有没有指定买家号，暂不接收；恢复这一列或改字段对应后会自动接收',
+  })
+  /** 订单中心最近一次读取的问题样本：6 条跳过、1 条待核实（读取记录对话框先列 5 条，其余可展开） */
+  const recentSamples: SyncProblem[] = [
+    ...[11, 12, 13, 14, 15, 16].map((n): SyncProblem => ({
+      record_id: `recDEMO001${n}`,
+      upstream_order_no: n === 16 ? null : `PO-DEMO-20261118-SKU${n}`,
+      verdict: 'skipped',
+      reason: n === 16 ? '缺少平台订单号' : '采购方不是本系统接的采购方',
+    })),
+    { record_id: 'recDEMO00117', upstream_order_no: 'PO-DEMO-20261118-SKU17', verdict: 'conflict', reason: '飞书记录的数量与任务不同，采购已开始，等待核实' },
+  ]
+
   const connections: FeishuConnection[] = [
     {
       id: 1,
@@ -989,7 +1029,7 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       last_sync_at: ago(4),
       last_sync_ok_at: ago(4),
       last_error: null,
-      last_stats: { read: 128, new: 6, update: 3, unchanged: 112, conflict: 1, historical: 4, skipped: 2, invalid: 0 },
+      last_stats: { read: 128, new: 6, update: 3, unchanged: 108, conflict: 1, historical: 4, skipped: 6, invalid: 0 },
       created_at: ago(60 * 24 * 7),
       updated_at: ago(60 * 24),
     },
@@ -1017,6 +1057,31 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       created_at: ago(60 * 24 * 3),
       updated_at: ago(25),
     },
+    {
+      // 来源表里的「买家号id」列被改了名：读取照常成功（状态点「读取正常」），卡片上提醒（last_stats.problems）
+      id: 4,
+      name: '补充订单表（DEMO）',
+      link: 'https://demo-tenant.feishu.cn/base/bascnDEMO0000000000000004?table=tblDEMOsource04',
+      app_token: 'bascnDEMO0000000000000004',
+      source_table_id: 'tblDEMOsource04',
+      source_view_id: null,
+      result_table_id: 'tblDEMOsource04',
+      field_map: { upstream_order_no: '平台订单号', asin: 'ASIN', quantity: '数量', unit_price: '采购单价', external_buyer_account: '买家号', external_buyer_customer_id: '买家号id' },
+      admission: { approved_values: ['通过'] },
+      writeback_map: {},
+      writeback_enabled: false,
+      writeback_verified_at: null,
+      writeback_state: 'disabled',
+      writeback_test_record: null,
+      poll_minutes: 15,
+      enabled: true,
+      last_sync_at: ago(7),
+      last_sync_ok_at: ago(7),
+      last_error: null,
+      last_stats: { read: 36, new: 0, update: 1, unchanged: 33, conflict: 0, historical: 0, skipped: 2, invalid: 0, problems: [missingBuyerColumn] },
+      created_at: ago(60 * 24 * 2),
+      updated_at: ago(60 * 24),
+    },
   ]
 
   const syncRuns: Record<number, SyncRun[]> = {
@@ -1027,11 +1092,27 @@ export function buildFixtures(now: Date = new Date()): Fixtures {
       started_at: ago(4 + m),
       finished_at: ago(4 + m - 0.2),
       ok: true,
-      stats: { read: 128, new: i === 0 ? 6 : 0, update: i === 0 ? 3 : 1, unchanged: 118, conflict: i === 0 ? 1 : 0 },
+      // 最近一次有问题样本（6 条跳过、1 条待核实）；之前几次没有
+      stats: i === 0
+        ? { read: 128, new: 6, update: 3, unchanged: 108, conflict: 1, historical: 4, skipped: 6, invalid: 0, problems: recentSamples }
+        : { read: 128, new: 0, update: 1, unchanged: 127, conflict: 0 },
       error: null,
     })),
     2: [
       { id: 210, connection_id: 2, trigger: 'schedule', started_at: ago(25), finished_at: ago(24.9), ok: false, stats: null, error: '飞书接口返回 91403：应用没有该数据表的读取权限' },
+    ],
+    4: [
+      {
+        id: 420, connection_id: 4, trigger: 'schedule', started_at: ago(7), finished_at: ago(6.9), ok: true,
+        stats: { read: 36, new: 0, update: 1, unchanged: 33, conflict: 0, historical: 0, skipped: 2, invalid: 0, problems: [missingBuyerColumn, heldNewRecord(81), heldNewRecord(82)] },
+        error: null,
+      },
+      {
+        // 列被改名之前的读取：没有问题
+        id: 410, connection_id: 4, trigger: 'schedule', started_at: ago(22), finished_at: ago(21.9), ok: true,
+        stats: { read: 34, new: 2, update: 0, unchanged: 32, conflict: 0, historical: 0, skipped: 0, invalid: 0 },
+        error: null,
+      },
     ],
   }
 

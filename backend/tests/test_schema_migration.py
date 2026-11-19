@@ -15,7 +15,8 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from registry import db, paths
-from services import accounts, clock, devices, execution
+from services import accounts, allocation, clock, devices, execution, orders, simulation
+from tests import factories as f
 from tests import factories_exec as fx
 from tests.conftest import run_schema
 from workflows import db_init
@@ -292,6 +293,8 @@ def test_db_init_upgrades_an_old_database_in_place(old_db, capsys):
     assert db_init.schema_problem(dsn) == "数据库结构是旧版：请先运行 python cli.py db_init"
     out = db_init.run(dsn=dsn)
     assert out["ok"] is True and out["database_created"] is False
+    err = capsys.readouterr().err
+    assert "已按 schema.sql 建表或升级到当前结构" in err and "已有的表不受影响" not in err   # 升级会改表、删表
     assert db_init.run(dsn=dsn)["ok"] is True                                       # 重复执行
     assert db_init.schema_problem(dsn) is None
     capsys.readouterr()
@@ -454,11 +457,11 @@ def _seed_v1_orders(conn, ids) -> dict:
     seq = iter(range(1, 1000))
 
     def link(order_id, kind, *, buyer=None, cid=None, amz=None, seen_min=0, workspace=ws, feishu_conn=conn_a,
-             batch_id=None):
+             batch_id=None, issues=()):
         n = next(seq)
         normalized = {"upstream_order_no": f"PO-DEMO-{order_id}", "external_buyer_account": buyer,
                       "external_buyer_customer_id": cid, "external_amz_order_no": amz, "review": "approved",
-                      "upstream_cancelled": False, "issues": []}
+                      "upstream_cancelled": False, "issues": list(issues)}
         seen = NOW - timedelta(minutes=seen_min)
         conn.execute(
             "INSERT INTO procure.order_sources (workspace_id, purchase_order_id, kind, feishu_connection_id, "
@@ -471,6 +474,14 @@ def _seed_v1_orders(conn, ids) -> dict:
     def order(key, kind="feishu", workspace=ws, **cols):
         out[key] = _insert_order(conn, workspace, f"PO-DEMO-M-{key}", primary_source_kind=kind, **cols)
         return out[key]
+
+    def attempt(order_id, *, status="succeeded", simulated=True, kind="auto", no=None):
+        n = conn.execute("SELECT count(*) AS n FROM procure.purchase_attempts WHERE purchase_order_id = %s",
+                         (order_id,)).fetchone()["n"]
+        conn.execute(
+            "INSERT INTO procure.purchase_attempts (workspace_id, purchase_order_id, attempt_no, kind, account_id, "
+            "simulated, status, bj_date, finished_at, amazon_order_no) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (ws, order_id, n + 1, kind, ids["a_has"], simulated, status, NOW.date(), NOW, no))
 
     # ① 飞书为主：ID（小写、带空白）+ 名称 → 清洗后回填
     link(order("feishu_both"), "feishu", buyer=" 环境-DEMO-甲 ", cid=" a1demo00021 ")
@@ -495,15 +506,41 @@ def _seed_v1_orders(conn, ids) -> dict:
     o = order("other_kind_only")
     link(o, "feishu")
     link(o, "file", buyer="环境-DEMO-戊", batch_id=batches[2])
-    # ⑦ 已采购 / 已关闭 / 已取消的不回填；采购中、异常、待确认的照样回填
+    # ⑦ 与实时接收同一条规则：只跳过有真实采购成功的任务（和已关闭的）。已采购（没有真实成功的尝试）、已取消的
+    #    照样回填——清除模拟结果、撤销取消后它们会回到分配；采购中、异常、待确认的也回填
     for st in ("purchased", "closed", "cancelled"):
         link(order(f"done_{st}", status=st), "feishu", cid="A1DEMO00024")
     for st in ("executing", "exception", "pending_review", "repurchase_pending"):
         link(order(f"open_{st}", status=st), "feishu", cid="A1DEMO00025")
-    # ⑧ 已经自动分给别的账号：回填指定，但不动分配（回填不触发分配）
+    o = order("sim_purchased", status="purchased")                     # 模拟采购成功：回填
+    attempt(o, no="SIM-20261118-1")
+    link(o, "feishu", buyer="环境-DEMO-乙")
+    o = order("real_purchased", status="purchased")                    # 真实采购成功：不回填（买家号可能是写回写的）
+    attempt(o, simulated=False, no="111-0000000-0000031")
+    link(o, "feishu", buyer="环境-DEMO-乙")
+    o = order("external_purchased", status="purchased")                # 来源带来的外部单号不算本系统的成功：回填
+    attempt(o, simulated=False, kind="external", no="111-0000000-0000032")
+    link(o, "feishu", buyer="环境-DEMO-乙")
+    # ⑧ 行上的 AMZ 订单号就是这笔任务登记过的单号（导出的采购结果再上传，含模拟单号）：那条关联不算表态
+    o = order("export_roundtrip", kind="file", status="purchased")
+    attempt(o, no="SIM-20261118-2")
+    link(o, "file", buyer="环境-DEMO-回填", amz="SIM-20261118-2", batch_id=batches[2])
+    o = order("export_after_source", kind="file")                       # 更早一条写了买家号 → 取它
+    attempt(o, status="aborted", no="SIM-20261118-3")                   # 模拟结果已清除，单号留在尝试上
+    link(o, "file", buyer="环境-DEMO-乙", seen_min=60, batch_id=batches[0])
+    link(o, "file", buyer="环境-DEMO-回填", amz=" SIM-20261118-3 ", seen_min=5, batch_id=batches[1])
+    # ⑨ 旧版把表格错误值存成 null + 一句问题：还原成读不出的指定；带可信单号的行照样不表态
+    link(order("legacy_error_name", kind="file"), "file", batch_id=batches[2],
+         issues=["买家号是表格错误值 #REF!，按没读到处理"])
+    link(order("legacy_error_id"), "feishu", buyer="环境-DEMO-甲",
+         issues=["买家号ID是表格错误值 #VALUE!，按没读到处理"])
+    link(order("legacy_error_credible"), "feishu", amz="111-0000000-0000033",
+         issues=["买家号是表格错误值 #N/A，按没读到处理"])
+    link(order("legacy_other_issue"), "feishu", issues=["收货人电话是表格错误值 #N/A，按没读到处理"])
+    # ⑩ 已经自动分给别的账号：回填指定，但不动分配（回填不触发分配）
     link(order("assigned_elsewhere", status="assigned", assigned_account_id=ids["a_has"], assignment_kind="auto"),
          "feishu", buyer="环境-DEMO-回填")
-    # ⑨ 另一个工作区
+    # ⑪ 另一个工作区
     link(order("other_ws", workspace=ws2), "feishu", cid="A1DEMO00026", workspace=ws2, feishu_conn=conn_b)
     return out
 
@@ -513,25 +550,35 @@ def _designations(conn) -> dict:
         "SELECT id, designated_customer_id, designated_buyer_name FROM procure.purchase_orders").fetchall()}
 
 
+BACKFILLED = {
+    "feishu_both": ("A1DEMO00021", "环境-DEMO-甲"),
+    "file_blank_newer": (None, "环境-DEMO-乙"),
+    "file_latest": (None, "环境-DEMO-新写法"),
+    "file_same_time": (None, "环境-DEMO-后"),
+    "malformed_no": (None, "环境-DEMO-丁"),
+    "done_purchased": ("A1DEMO00024", None), "done_cancelled": ("A1DEMO00024", None),
+    "open_executing": ("A1DEMO00025", None), "open_exception": ("A1DEMO00025", None),
+    "open_pending_review": ("A1DEMO00025", None), "open_repurchase_pending": ("A1DEMO00025", None),
+    "sim_purchased": (None, "环境-DEMO-乙"), "external_purchased": (None, "环境-DEMO-乙"),
+    "export_after_source": (None, "环境-DEMO-乙"),
+    "legacy_error_name": (None, "#REF!"), "legacy_error_id": ("#VALUE!", "环境-DEMO-甲"),
+    "assigned_elsewhere": (None, "环境-DEMO-回填"),
+    "other_ws": ("A1DEMO00026", None),
+}
+
+
 def test_db_init_backfills_designations_once(old_db, capsys):
-    """验收 修订二 第 7 条：旧库升级后，来源里早已填好买家号的未采购任务带上指定；重复升级不改数据。"""
+    """验收 修订二 第 7 条：旧库升级后，来源里早已填好买家号、没有真实采购成功的任务带上指定（规则与实时接收一致）；
+    重复升级不改数据。"""
     dsn, ids = old_db
     with db.pg_conn(dsn) as conn:
         o = _seed_v1_orders(conn, ids)
     out = db_init.run(dsn=dsn)
-    expected = {
-        "feishu_both": ("A1DEMO00021", "环境-DEMO-甲"),
-        "file_blank_newer": (None, "环境-DEMO-乙"),
-        "file_latest": (None, "环境-DEMO-新写法"),
-        "file_same_time": (None, "环境-DEMO-后"),
-        "malformed_no": (None, "环境-DEMO-丁"),
-        "open_executing": ("A1DEMO00025", None), "open_exception": ("A1DEMO00025", None),
-        "open_pending_review": ("A1DEMO00025", None), "open_repurchase_pending": ("A1DEMO00025", None),
-        "assigned_elsewhere": (None, "环境-DEMO-回填"),
-        "other_ws": ("A1DEMO00026", None),
-    }
+    expected = BACKFILLED
     assert out["ok"] is True and out["designations_backfilled"] == len(expected)
-    assert "启动服务后请点一次「重新分配」" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"已为 {len(expected)} 笔没有真实采购成功的任务补上来源里早已填好的买家号（来源指定）；" \
+           "启动服务后请点一次「重新分配」" in err
     with db.pg_conn(dsn) as conn:
         got = _designations(conn)
         assert {k: got[o[k]] for k in o} == {k: expected.get(k, (None, None)) for k in o}
@@ -589,6 +636,149 @@ def test_db_init_on_a_fresh_or_current_database_backfills_nothing(scratch_db, ca
         assert db_init.backfill_designations(conn) == 0
         assert _designations(conn)[oid] == ("A1DEMO00030", None)
     capsys.readouterr()
+
+
+def test_db_init_rolls_back_script_and_backfill_together(old_db, monkeypatch, capsys):
+    """回填只在加列的那一次做，所以建表脚本与回填必须同一个事务：回填出错 → 结构仍是旧版、什么都没写；
+    下次 db_init 从头再来，照样回填。"""
+    dsn, ids = old_db
+    with db.pg_conn(dsn) as conn:
+        _seed_v1_orders(conn, ids)
+    real = db_init.backfill_designations
+
+    def broken(conn):
+        real(conn)                                       # 回填已经写了行，然后出错
+        raise RuntimeError("DEMO 回填中途出错")
+
+    monkeypatch.setattr(db_init, "backfill_designations", broken)
+    with pytest.raises(RuntimeError):
+        db_init.run(dsn=dsn)
+    assert db_init.schema_problem(dsn) == db_init.SCHEMA_OUTDATED_MESSAGE
+    with db.pg_conn(dsn) as conn:
+        assert conn.execute("SELECT to_regclass('procure.device_pairings') AS t").fetchone()["t"] is not None
+        cols = {(c[0], c[1]) for c in _columns(conn)}
+        assert ("purchase_orders", "designated_customer_id") not in cols
+        assert conn.execute("SELECT count(*) AS n FROM procure.events WHERE kind = 'order.designation_changed'"
+                            ).fetchone()["n"] == 0
+    monkeypatch.undo()
+    assert db_init.run(dsn=dsn)["designations_backfilled"] == len(BACKFILLED)
+    capsys.readouterr()
+
+
+# ── 升级之后回到分配的任务（清除模拟结果、撤销取消）：带着来源指定，不落到别的账号 ──────────────────────
+
+LEGACY_ORDER_COLS = ("asin", "quantity", "unit_price", "price_cap", "order_time", "ship_days",
+                     "suggested_purchase_date", "recipient_name", "address1", "city", "state", "postal_code", "phone")
+
+
+def _legacy_world(conn) -> dict:
+    """旧结构里：账号 甲 / 乙（都登记了买家号 ID），一台绑定 甲 的设备，一个飞书连接，一个已提交的文件批次。"""
+    def one(sql, params=()):
+        return conn.execute(sql, params).fetchone()["id"]
+
+    ws = one("INSERT INTO procure.workspaces (name) VALUES ('DEMO 工作区') RETURNING id")
+    conn.execute("INSERT INTO procure.workspace_settings (workspace_id) VALUES (%s)", (ws,))
+    acc = {key: one("INSERT INTO procure.buyer_accounts (workspace_id, name, amazon_customer_id) "
+                    "VALUES (%s, %s, %s) RETURNING id", (ws, name, cid))
+           for key, name, cid in (("jia", "环境-DEMO-甲", "A1DEMO00001"), ("yi", "环境-DEMO-乙", "A1DEMO00002"))}
+    dev = one("INSERT INTO procure.devices (workspace_id, name, token_hash, bound_account_id) "
+              "VALUES (%s, 'Mac-DEMO-甲', 'demo-hash-legacy', %s) RETURNING id", (ws, acc["jia"]))
+    con = one("INSERT INTO procure.feishu_connections (workspace_id, name, link, app_token, source_table_id, "
+              "result_table_id) VALUES (%s, 'DEMO', 'https://demo.example.invalid/base/x', 'bascnDEMO000077', "
+              "'tblDEMO0000001', 'tblDEMO0000001') RETURNING id", (ws,))
+    batch = one("INSERT INTO procure.import_batches (workspace_id, filename, file_sha256, file_bytes, status) "
+                "VALUES (%s, 'demo-legacy.xlsx', 'demo-sha-legacy', ''::bytea, 'committed') RETURNING id", (ws,))
+    return {"ws": ws, "dev": dev, "con": con, "batch": batch, **acc}
+
+
+def _legacy_order(conn, w: dict, key: str, *, status: str, kind: str = "feishu", account: int | None = None,
+                  normalized_over: dict | None = None, **rec_kw) -> int:
+    """旧版接收留下的任务 + 来源关联（normalized 即规范化记录的 JSON 形状）。"""
+    rec = f.make_record(upstream_order_no=f"PO-DEMO-UP-{key}", suggested_purchase_date=clock.bj_today(), **rec_kw)
+    cols = ["workspace_id", "upstream_order_no", *LEGACY_ORDER_COLS, "suggested_date_basis", "country",
+            "review_status", "review_source", "review_value", "status", "primary_source_kind", "assigned_account_id",
+            "assignment_kind", "assigned_at"]
+    vals = [w["ws"], rec.upstream_order_no, *[getattr(rec, c) for c in LEGACY_ORDER_COLS], "source", "US",
+            "approved", kind, "通过", status, kind, account, "auto" if account else None, NOW if account else None]
+    oid = conn.execute(f"INSERT INTO procure.purchase_orders ({', '.join(cols)}) "
+                       f"VALUES ({', '.join(['%s'] * len(cols))}) RETURNING id", vals).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO procure.order_sources (workspace_id, purchase_order_id, kind, feishu_connection_id, "
+        "feishu_record_id, import_batch_id, import_row_no, snapshot, normalized, fingerprint) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, %s, 'demo-fp')",
+        (w["ws"], oid, kind, w["con"] if kind == "feishu" else None, f"recDEMOUP-{key}" if kind == "feishu" else None,
+         w["batch"] if kind == "file" else None, oid + 1 if kind == "file" else None,
+         Jsonb({**rec.to_json(), **(normalized_over or {})})))
+    return oid
+
+
+def _legacy_simulated_purchase(conn, w: dict, order_id: int) -> None:
+    """旧版 甲 的设备把这笔任务模拟采购成功（批次已结束）。"""
+    run = conn.execute(
+        "INSERT INTO procure.execution_runs (workspace_id, account_id, device_id, trigger, simulated, started_at, "
+        "heartbeat_at, lease_expires_at, ended_at, end_reason) VALUES (%s, %s, %s, 'manual', true, %s, %s, %s, %s, "
+        "'finished') RETURNING id",
+        (w["ws"], w["jia"], w["dev"], NOW, NOW, NOW + timedelta(seconds=180), NOW)).fetchone()["id"]
+    att = conn.execute(
+        "INSERT INTO procure.purchase_attempts (workspace_id, purchase_order_id, attempt_no, kind, account_id, "
+        "device_id, run_id, simulated, status, bj_date, claimed_at, submitted_at, finished_at, amazon_order_no) "
+        "VALUES (%s, %s, 1, 'auto', %s, %s, %s, true, 'succeeded', %s, %s, %s, %s, 'SIM-20261118-1') RETURNING id",
+        (w["ws"], order_id, w["jia"], w["dev"], run, clock.bj_today(), NOW, NOW, NOW)).fetchone()["id"]
+    conn.execute("UPDATE procure.purchase_orders SET purchased_attempt_id = %s, current_attempt_id = %s WHERE id = %s",
+                 (att, att, order_id))
+
+
+def _state(conn, order_id: int) -> dict:
+    return dict(conn.execute(
+        "SELECT status, assigned_account_id, assignment_kind, designated_customer_id, designated_buyer_name, "
+        "status_reason FROM procure.purchase_orders WHERE id = %s", (order_id,)).fetchone())
+
+
+def test_upgrade_keeps_the_designation_of_tasks_that_come_back(scratch_db, _clock, capsys):
+    """旧库：来源写了买家号 乙，旧版却自动分给 甲 并模拟采购成功；另一笔来源写了 乙 的买家号 ID、在旧控制台取消了。
+    升级 → 清除模拟结果 / 撤销取消 → 重新分配：两笔都带着指定分给 乙（kind source），绝不以自动分配落在 甲。"""
+    run_schema(scratch_db, SCHEMA_V1)
+    with db.pg_conn(scratch_db) as conn:
+        w = _legacy_world(conn)
+        sim = _legacy_order(conn, w, "SIM", status="purchased", account=w["jia"], external_buyer_account="环境-DEMO-乙")
+        _legacy_simulated_purchase(conn, w, sim)
+        can = _legacy_order(conn, w, "CAN", status="cancelled", external_buyer_customer_id="A1DEMO00002")
+    assert db_init.run(dsn=scratch_db)["designations_backfilled"] == 2
+    capsys.readouterr()
+    with db.pg_conn(scratch_db) as conn:
+        assert simulation.reset(conn, w["ws"], None)["orders_restored"] == [sim]
+        orders.uncancel(conn, w["ws"], can, "DEMO 撤销取消", actor_user_id=None)
+        allocation.allocate(conn, w["ws"], trigger="manual")
+        a, b = _state(conn, sim), _state(conn, can)
+    assert (a["designated_customer_id"], a["designated_buyer_name"]) == (None, "环境-DEMO-乙")
+    assert (b["designated_customer_id"], b["designated_buyer_name"]) == ("A1DEMO00002", None)
+    for got in (a, b):
+        assert (got["status"], got["assigned_account_id"], got["assignment_kind"]) == ("assigned", w["yi"], "source")
+
+
+def test_upgrade_turns_legacy_error_values_into_unreadable_designations(scratch_db, _clock, capsys):
+    """旧版把买家号两列的表格错误值存成 null + 一句问题。升级后与当前版本一样：一个读不出的指定，任务留在待分配并
+    写明原因，不会被当成「没写」而自动分给 甲（文件来源不会再读一遍，升级时不补就永远补不上）。"""
+    run_schema(scratch_db, SCHEMA_V1)
+    with db.pg_conn(scratch_db) as conn:
+        w = _legacy_world(conn)
+        ferr = _legacy_order(conn, w, "FERR", status="assigned", account=w["jia"], kind="file",
+                             normalized_over={"external_buyer_account": None,
+                                              "issues": ["买家号是表格错误值 #REF!，按没读到处理"]})
+        ierr = _legacy_order(conn, w, "IERR", status="queued",
+                             normalized_over={"external_buyer_customer_id": None,
+                                              "issues": ["买家号ID是表格错误值 #VALUE!，按没读到处理"]})
+    assert db_init.run(dsn=scratch_db)["designations_backfilled"] == 2
+    capsys.readouterr()
+    with db.pg_conn(scratch_db) as conn:
+        allocation.allocate(conn, w["ws"], trigger="manual")
+        a, b = _state(conn, ferr), _state(conn, ierr)
+    assert (a["designated_customer_id"], a["designated_buyer_name"]) == (None, "#REF!")
+    assert (b["designated_customer_id"], b["designated_buyer_name"]) == ("#VALUE!", None)
+    assert (a["status"], a["assigned_account_id"]) == ("queued", None)
+    assert (b["status"], b["assigned_account_id"]) == ("queued", None)
+    assert a["status_reason"] == "来源的买家号是表格错误值 #REF!，读不出指定的买家号；在来源里改正后会重新分配"
+    assert b["status_reason"] == "来源的买家号 ID 是表格错误值 #VALUE!，读不出指定的买家号；在来源里改正后会重新分配"
 
 
 def test_schema_problem_uses_configured_database_by_default(clean_db):

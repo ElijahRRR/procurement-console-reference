@@ -10,6 +10,11 @@
 - 影响分配的配置变化（金额区间、每日额度、优先级、采购开关、站点，以及**名称与买家号 ID**：来源指定靠它们对应
   账号）以及新建（不论采购开关开没开）、恢复执行、归档后，立即按今天重新分配
   （allocation.allocate(trigger='account_change')）。暂停执行不重新分配：暂停的账号不参与自动分配，已分配给它的任务保留。
+  忽略 / 恢复一个买家号 ID 时，如果有待分配的任务指定了它，也重新分配一次（只会刷新这些任务的未分配原因：原因里写着
+  这个 ID 是否已被忽略）。
+- 加锁顺序（契约 §3.2）：账号行（FOR NO KEY UPDATE，不挡外键检查的 KEY SHARE）→ 工作区分配锁
+  （allocation.lock_workspace）→ 任务行。改了影响分配的字段时先取分配锁再改账号行；改名还要先锁齐任务行再改
+  账号行（名称在唯一约束里，改名的 UPDATE 拿的行锁会挡外键检查）；归档在锁它的任务行之前先取分配锁。
 - 在线 = 3 分钟内有联系。
 """
 
@@ -198,13 +203,19 @@ def _check_customer_id_unique(conn, ws: int, customer_id: str, account_id: int |
 
 
 def get_row(conn, workspace_id: int, account_id: int, for_update: bool = False) -> dict[str, Any]:
-    """输入：工作区、账号 id、是否加行锁 → 输出：buyer_accounts 行（含已归档）；不存在或跨工作区 → NOT_FOUND。"""
+    """输入：工作区、账号 id、是否加行锁 → 输出：buyer_accounts 行（含已归档）；不存在或跨工作区 → NOT_FOUND。
+
+    for_update=True 加的是 FOR NO KEY UPDATE：同一账号的修改 / 暂停 / 恢复 / 归档照样互相串行，但不挡别的事务插入
+    引用这个账号的行（采购尝试、分配写回）时外键检查要的 FOR KEY SHARE，否则「拿着账号行等分配锁」与「拿着分配锁
+    （或任务行）等外键检查」会互相等待成死锁。账号行从不删除，主键也不变。
+    """
     try:
         aid = int(account_id)
     except (TypeError, ValueError):
         raise not_found("买家账号") from None
     row = conn.execute(
-        "SELECT * FROM procure.buyer_accounts WHERE id = %s AND workspace_id = %s" + (" FOR UPDATE" if for_update else ""),
+        "SELECT * FROM procure.buyer_accounts WHERE id = %s AND workspace_id = %s"
+        + (" FOR NO KEY UPDATE" if for_update else ""),
         (aid, workspace_id),
     ).fetchone()
     if row is None:
@@ -355,6 +366,16 @@ def _reallocate(conn, ws: int, actor_kind: str, actor_id: int | None) -> dict[st
     return allocation.allocate(conn, ws, trigger="account_change", actor_kind=actor_kind, actor_id=actor_id)
 
 
+def _lock_allocation(conn, ws: int, *, tasks: bool = False) -> None:
+    """输入：连接、工作区、是否同时锁上分配可能动到的任务行 → 输出：无。取工作区分配锁（加锁顺序：账号行 → 本锁 →
+    任务行；同一事务里可重入）；tasks=True 时再按 id 顺序锁齐任务行（allocation.lock_open_tasks，改名用）。"""
+    from services import allocation
+
+    allocation.lock_workspace(conn, ws)
+    if tasks:
+        allocation.lock_open_tasks(conn, ws)
+
+
 def _busy_counts(conn, workspace_id: int, account_id: int) -> bool:
     """输入：工作区、账号 → 输出：账号是否有未结束的执行批次，或在途 / 结果待核实的采购尝试。"""
     busy = conn.execute(
@@ -402,6 +423,10 @@ def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], acto
     修改或清空买家号 ID：账号有未结束批次、在途或结果待核实的尝试时 → CONFLICT（执行中的身份检查以它为基准，
     待核实的结果也要对着原来的买家号去核实）；允许时 'account.updated' 事件的 changes 里记下旧值。
     写入某个 ID 时同时清掉它的忽略记录。
+
+    要重新分配时，先取工作区分配锁再改账号行；改名还要先锁齐分配可能动到的任务行：改名的 UPDATE 拿的是与外键
+    KEY SHARE 冲突的行锁（名称在唯一约束里），拿着它再去等分配锁或任务行，正在把任务分给这个账号的分配、拿着任务行
+    正要插入尝试的领取、人工改派就会和它互相等待。
     """
     row = get_row(conn, workspace_id, account_id, for_update=True)
     if row["archived_at"] is not None:
@@ -413,6 +438,9 @@ def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], acto
         return get(conn, workspace_id, account_id)
     if "amazon_customer_id" in changes and _busy_counts(conn, workspace_id, account_id):
         raise conflict("账号正在执行或有结果待核实的采购，处理完后才能修改买家号 ID")
+    reallocate = bool(ALLOCATION_FIELDS & set(changes))
+    if reallocate:
+        _lock_allocation(conn, workspace_id, tasks="name" in changes)
     sets = ", ".join(f"{k} = %s" for k in changes)
     _unique_write(
         conn,
@@ -424,7 +452,7 @@ def update(conn, workspace_id: int, account_id: int, patch: dict[str, Any], acto
     ak, aid = _actor(actor_user_id)
     events.record(conn, workspace_id, "account", account_id, "account.updated", actor_kind=ak, actor_id=aid,
                   detail={"changes": changes})
-    if ALLOCATION_FIELDS & set(changes):
+    if reallocate:
         _reallocate(conn, workspace_id, ak, aid)
     return get(conn, workspace_id, account_id)
 
@@ -479,6 +507,7 @@ def archive(conn, workspace_id: int, account_id: int, actor_user_id: int | None)
     """输入：工作区、账号、操作人 → 输出：账号（已归档）。
 
     有未结束的执行批次、在途或待核实的尝试时拒绝；已分配的开始前任务解除分配后重新分配。
+    加锁顺序：账号行 → 工作区分配锁 → 它的任务行（先取分配锁再锁任务行，不与同时进行的分配互相等待）。
     """
     row = get_row(conn, workspace_id, account_id, for_update=True)
     if row["archived_at"] is not None:
@@ -487,6 +516,7 @@ def archive(conn, workspace_id: int, account_id: int, actor_user_id: int | None)
         raise conflict("账号正在执行或有待核实的采购，不能归档")
     from services import orders
 
+    _lock_allocation(conn, workspace_id)
     ak, aid = _actor(actor_user_id)
     for o in conn.execute(
         "SELECT * FROM procure.purchase_orders WHERE workspace_id = %s AND assigned_account_id = %s "
@@ -650,12 +680,23 @@ def discovered_count(conn, workspace_id: int) -> int:
     ).fetchone()["n"])
 
 
+def _queued_designating(conn, workspace_id: int, customer_id: str) -> bool:
+    """输入：工作区、买家号 ID → 输出：有没有待分配（queued）的任务由来源指定了这个 ID。"""
+    return conn.execute(
+        "SELECT 1 FROM procure.purchase_orders WHERE workspace_id = %s AND designated_customer_id = %s "
+        "AND status = 'queued' LIMIT 1",
+        (workspace_id, customer_id),
+    ).fetchone() is not None
+
+
 def ignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: int | None) -> dict[str, Any]:
     """输入：工作区、买家号 ID、操作人 → 输出：{customer_id, ignored: true}。幂等。
 
     忽略后这个 ID 不再出现在待登记列表里，登录着它的浏览器显示「已忽略」、分不到任务。ID 形状不对 → VALIDATION；
     已登记在未归档账号上的 ID 不能忽略（VALIDATION：要停用它应关掉账号的采购开关或归档账号）。
-    新忽略时写 'account.buyer_id_ignored' 事件。
+    新忽略时写 'account.buyer_id_ignored' 事件；这时如果有待分配的任务由来源指定了这个 ID，立即重新分配一次
+    （trigger='account_change'），这些任务的未分配原因随即注明「已被忽略」——重新分配只改写原因，不产生订单事件。
+    重复忽略、没有任务指定的 ID 不触发分配。
     """
     cid = _customer_id_arg(customer_id)
     owner = find_by_customer_id(conn, workspace_id, cid)
@@ -670,12 +711,17 @@ def ignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: in
         ak, aid = _actor(actor_user_id)
         events.record(conn, workspace_id, "account", None, "account.buyer_id_ignored", actor_kind=ak, actor_id=aid,
                       detail={"customer_id": cid})
+        if _queued_designating(conn, workspace_id, cid):
+            _reallocate(conn, workspace_id, ak, aid)
     return {"customer_id": cid, "ignored": True}
 
 
 def unignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: int | None) -> dict[str, Any]:
     """输入：工作区、买家号 ID、操作人 → 输出：{customer_id, ignored: false}。幂等（没忽略过也成功）。
-    确实删掉了忽略记录时写 'account.buyer_id_unignored' 事件。"""
+
+    确实删掉了忽略记录时写 'account.buyer_id_unignored' 事件；这时如果有待分配的任务由来源指定了这个 ID，立即重新
+    分配一次（同 ignore_buyer_id：原因里不再写「已被忽略」）。没忽略过、没有任务指定的 ID 不触发分配。
+    """
     cid = _customer_id_arg(customer_id)
     row = conn.execute(
         "DELETE FROM procure.ignored_buyer_ids WHERE workspace_id = %s AND customer_id = %s RETURNING customer_id",
@@ -685,4 +731,6 @@ def unignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: 
         ak, aid = _actor(actor_user_id)
         events.record(conn, workspace_id, "account", None, "account.buyer_id_unignored", actor_kind=ak, actor_id=aid,
                       detail={"customer_id": cid})
+        if _queued_designating(conn, workspace_id, cid):
+            _reallocate(conn, workspace_id, ak, aid)
     return {"customer_id": cid, "ignored": False}

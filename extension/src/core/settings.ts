@@ -41,21 +41,29 @@ export function normalizeServerUrl(s: string): string {
 
 /** 输入：服务端地址 → 输出：能不能用，不能用时给出原因。
  *
- *  只允许本机地址（http://127.0.0.1 或 http://localhost，端口任意）：
- *  插件的主机权限只申请了这两个（不申请 <all_urls>），别的地址请求会被浏览器拦下；
- *  服务端的插件接口也只接受本机对端。 */
+ *  只允许本机的 http 地址（http://127.0.0.1 或 http://localhost，端口任意），只有协议、主机和端口：
+ *  插件的主机权限只申请了这两个的 http（不申请 <all_urls>，也没有 https），别的地址请求会被浏览器拦下；
+ *  服务端的插件接口也只接受本机对端。带用户名密码（fetch 拒绝这种地址）、查询串或片段（请求会拼成
+ *  「/?x=1/plugin/v1/…」）的地址永远连不上，保存它会白白换掉令牌，所以一律不收。
+ *  查询串与片段看文本里有没有 `?`、`#`：只写一个 `?` 或 `#` 时 URL 解析出的 search、hash 是空的。
+ *  反斜杠同样看文本：URL 解析把 `\` 当成 `/`（「…:8790\」解析出的路径是「/」），而请求是「地址 + /plugin/v1/…」
+ *  拼出来的，会变成「//plugin/v1/…」，服务端答「接口不存在」。 */
 export function validateServerUrl(s: string): { ok: true } | { ok: false; reason: string } {
+  const text = normalizeServerUrl(s);
   let u: URL;
   try {
-    u = new URL(normalizeServerUrl(s));
+    u = new URL(text);
   } catch {
     return { ok: false, reason: "地址格式不正确，例如 http://127.0.0.1:8790" };
   }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return { ok: false, reason: "只支持 http 或 https 地址" };
+  if (u.protocol !== "http:") return { ok: false, reason: "只支持 http 地址，例如 http://127.0.0.1:8790" };
+  if (u.username !== "" || u.password !== "") return { ok: false, reason: "地址里不要带用户名或密码" };
   if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") {
     return { ok: false, reason: "当前版本只支持本机服务端（127.0.0.1 或 localhost）" };
   }
-  if (u.pathname !== "/" && u.pathname !== "") return { ok: false, reason: "只填协议、主机和端口，不要带路径" };
+  if ((u.pathname !== "/" && u.pathname !== "") || text.includes("?") || text.includes("#") || text.includes("\\")) {
+    return { ok: false, reason: "只填协议、主机和端口，不要带路径" };
+  }
   return { ok: true };
 }
 

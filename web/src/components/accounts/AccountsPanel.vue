@@ -15,7 +15,7 @@ import AccountDialog, { type AccountPreset } from './AccountDialog.vue'
 import DiscoveredBuyers from './DiscoveredBuyers.vue'
 import { formatAmountRange, formatDateTime, formatNumber, formatRelative } from '@/utils/format'
 import { PAUSE_CAUSE_LABEL, PURCHASE_MODE_LABEL, labelOf } from '@/utils/labels'
-import { resumeConfirmText, resumeNeedsCaution } from '@/utils/accounts'
+import { normalizeCustomerId, resumeConfirmText, resumeNeedsCaution, suggestedFillTarget } from '@/utils/accounts'
 import { browserOnlineText } from '@/utils/browsers'
 import { confirmAction, notifyFailure, notifySuccess, promptText, toast } from '@/utils/feedback'
 
@@ -30,6 +30,8 @@ const busy = ref<string | null>(null)
 const dialogOpen = ref(false)
 const editing = ref<Account | null>(null)
 const preset = ref<AccountPreset | null>(null)
+/** 正在登记的待登记项（对话框里选「填到同名账号」时交给待登记区走填到已有账号）；不是从待登记项打开的为 null */
+const registering = ref<DiscoveredBuyer | null>(null)
 const discovered = ref<InstanceType<typeof DiscoveredBuyers>>()
 
 async function load() {
@@ -62,24 +64,60 @@ const summary = computed(() => {
 function openCreate() {
   editing.value = null
   preset.value = null
+  registering.value = null
   dialogOpen.value = true
 }
 function openEdit(a: Account) {
   editing.value = a
   preset.value = null
+  registering.value = null
   dialogOpen.value = true
 }
 /**
  * 输入：要登记的买家号 ID、来源里的名称、这个买家号从哪里来（来源指定了几笔任务、有没有浏览器登录着）
  * → 输出：无（打开账号对话框，ID 与名称已填；提交走新建接口）
  */
-function openRegister(customerId: string, nameHint: string | null = null, source: Pick<AccountPreset, 'sourceOrders' | 'hasBrowser'> = {}) {
+function openRegister(customerId: string, nameHint: string | null = null, source: Pick<AccountPreset, 'sourceOrders' | 'hasBrowser' | 'fillTarget'> = {}) {
   editing.value = null
   preset.value = { customerId, name: nameHint, ...source }
+  registering.value = null
   dialogOpen.value = true
 }
-const registerDiscovered = (item: DiscoveredBuyer) =>
-  openRegister(item.customer_id, item.name_hint, { sourceOrders: item.source_orders ?? 0, hasBrowser: !!item.browsers?.length })
+/**
+ * 输入：待登记的买家号 → 输出：无（打开登记对话框：ID 与来源里的名称已填，写明来源指定了几笔任务；
+ * 已有同名、还没登记 ID 的账号时对话框提示可以直接填到它上面）
+ */
+function registerDiscovered(item: DiscoveredBuyer) {
+  const same = suggestedFillTarget(accounts.value, item)
+  openRegister(item.customer_id, item.name_hint, {
+    sourceOrders: item.source_orders ?? 0,
+    hasBrowser: !!item.browsers?.length,
+    fillTarget: same ? { id: same.id, name: same.name } : null,
+  })
+  registering.value = item
+}
+
+/**
+ * 输入：别处（「浏览器」页签）要登记的买家号 ID → 输出：无。先在待登记的买家号里找到它，按与待登记列表的「登记」
+ * 相同的方式打开对话框（来源里的名称、来源指定了几笔任务、同名账号提示）；找不到或读取失败时只带 ID 打开。
+ */
+async function registerBuyer(customerId: string) {
+  const id = normalizeCustomerId(customerId)
+  let item: DiscoveredBuyer | undefined
+  try {
+    item = (await accountsApi.listDiscovered(true)).find((x) => normalizeCustomerId(x.customer_id) === id)
+  } catch {
+    item = undefined
+  }
+  if (item) return registerDiscovered({ ...item, browsers: item.browsers ?? [] })
+  openRegister(id ?? customerId)
+}
+
+/** 登记对话框里选了「填到同名账号」：交给待登记区（重新读目标账号、确认后 PATCH） */
+async function onDialogFill(accountId: number) {
+  const item = registering.value
+  if (item) await discovered.value?.fill(item, accountId)
+}
 
 /** 输入：无 → 输出：无（重新读账号与待登记的买家号） */
 async function reloadAll() {
@@ -95,7 +133,7 @@ function onDiscoveredChanged() {
   emit('changed')
   void load()
 }
-defineExpose({ reload: reloadAll, openRegister })
+defineExpose({ reload: reloadAll, openRegister, registerBuyer })
 
 function replace(updated: Account | null | undefined) {
   if (!updated || typeof updated !== 'object' || !('id' in updated)) return void load()
@@ -321,6 +359,6 @@ function quotaStatus(a: Account): '' | 'warning' {
       </el-table>
     </el-card>
 
-    <AccountDialog v-model="dialogOpen" :account="editing" :preset="preset" :default-max-days="defaultMaxDays" @saved="onSaved" />
+    <AccountDialog v-model="dialogOpen" :account="editing" :preset="preset" :default-max-days="defaultMaxDays" @saved="onSaved" @fill="onDialogFill" />
   </div>
 </template>

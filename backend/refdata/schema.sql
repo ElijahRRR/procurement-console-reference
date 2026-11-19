@@ -3,7 +3,7 @@
 --
 -- 新库：CREATE TABLE 直接是当前形状。旧库：CREATE TABLE IF NOT EXISTS 不动已有的表，靠文件后面各段
 -- 「追加（幂等）」的 ALTER / DO 块升级；整份脚本可以在新库、旧库上反复执行。
--- 升级顺序：停服务 → python cli.py db_init → 启动 → 重新加载插件。
+-- 升级顺序：停服务 → python cli.py db_init → 启动 → 在控制台点一次「重新分配」→ 重新加载插件。
 
 CREATE SCHEMA IF NOT EXISTS procure;
 

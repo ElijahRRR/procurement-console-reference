@@ -5,7 +5,7 @@
  * 并入待登记列表（source_orders），登记后任务立刻分给它；忽略名单里的 ID 全部列出。
  */
 import { describe, expect, it } from 'vitest'
-import type { Account, AllocationSummary, Device, DiscoveredBuyer, OrderDetail, OrderRow, Overview, Page } from '@/api/types'
+import type { Account, AllocationSummary, Device, DiscoveredBuyer, FeishuConnection, FeishuSyncResult, OrderDetail, OrderRow, Overview, Page, SyncRun } from '@/api/types'
 import { ASSIGNMENT_KINDS, LOGIN_STATES } from '@/api/types'
 import { createMockApi } from '../mocks/handlers'
 
@@ -52,9 +52,56 @@ describe('模拟后端：待登记的买家号', () => {
     expect(dev.login.state).toBe('ready')
     expect(dev.account).toEqual({ id: created.body.id, name: '环境-DEMO-05' })
     expect(call<Overview>('GET', '/overview').body.discovered_buyers).toBe(2)
-    // 同一个 ID 不能登记到两个账号
-    expect(call('POST', '/accounts', { name: '环境-DEMO-06', amazon_customer_id: 'A2TEST00005' }).status).toBe(409)
+    // 同一个 ID 不能登记到两个账号：同服务端是 422 VALIDATION，detail.field 指向买家号 ID（不是 409）
+    expect(call('POST', '/accounts', { name: '环境-DEMO-06', amazon_customer_id: 'A2TEST00005' })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '买家号 ID A2TEST00005 已登记在账号 环境-DEMO-05', detail: { field: 'amazon_customer_id' } },
+    })
     expect(call('POST', '/accounts', { name: '环境-DEMO-06', amazon_customer_id: 'not-an-id' }).status).toBe(422)
+  })
+
+  it('账号名称重复、买家号 ID 已登记在别的账号上：新建与修改都是 422 VALIDATION（detail.field），与服务端一致', () => {
+    const { call } = api()
+    expect(call('POST', '/accounts', { name: '环境-DEMO-01', amazon_customer_id: null })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '账号名称「环境-DEMO-01」已存在', detail: { field: 'name' } },
+    })
+    // 修改：改成别的账号的名称、填入别的账号已登记的 ID
+    expect(call('PATCH', '/accounts/8', { name: '环境-DEMO-01' })).toMatchObject({ status: 422, body: { code: 'VALIDATION', detail: { field: 'name' } } })
+    expect(call('PATCH', '/accounts/8', { amazon_customer_id: 'A1DEMO00001' })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '买家号 ID A1DEMO00001 已登记在账号 环境-DEMO-01', detail: { field: 'amazon_customer_id' } },
+    })
+    // 保存自己的名称与 ID 不算重复
+    const own = call<Account>('GET', '/accounts/3').body
+    expect(call('PATCH', '/accounts/3', { name: own.name, priority: 6 }).status).toBe(200)
+  })
+
+  it('买家号 ID 与名称同服务端规范化：去首尾空白、ID 转大写后再检查与保存；形状不对、名称为空的提示与服务端一致', () => {
+    const { call } = api()
+    // 小写、带空白的 ID 按大写登记；查重也按大写比
+    const created = call<Account>('POST', '/accounts', { name: ' 环境-DEMO-05 ', amazon_customer_id: ' a2test00005 ' })
+    expect(created.status).toBe(200)
+    expect(created.body).toMatchObject({ name: '环境-DEMO-05', amazon_customer_id: 'A2TEST00005' })
+    expect(call('PATCH', '/accounts/8', { amazon_customer_id: 'a2test00005' })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '买家号 ID A2TEST00005 已登记在账号 环境-DEMO-05', detail: { field: 'amazon_customer_id' } },
+    })
+    expect(call<Account>('PATCH', '/accounts/8', { amazon_customer_id: 'a2test00004' }).body.amazon_customer_id).toBe('A2TEST00004')
+    // 空白的 ID 等于不填
+    expect(call<Account>('POST', '/accounts', { name: '环境-DEMO-06', amazon_customer_id: '   ' }).body.amazon_customer_id).toBeNull()
+    expect(call('POST', '/accounts', { name: '环境-DEMO-07', amazon_customer_id: 'not-an-id' })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）', detail: { field: 'amazon_customer_id' } },
+    })
+    expect(call('POST', '/accounts/discovered/ignore', { customer_id: 'B-DEMO' })).toMatchObject({
+      status: 422,
+      body: { code: 'VALIDATION', message: '买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）', detail: { field: 'customer_id' } },
+    })
+    // 名称为空（新建没带名称、修改成空白）
+    for (const res of [call('POST', '/accounts', { amazon_customer_id: null }), call('PATCH', '/accounts/8', { name: '  ' })]) {
+      expect(res).toMatchObject({ status: 422, body: { code: 'VALIDATION', message: '账号名称不能为空', detail: { field: 'name' } } })
+    }
   })
 
   it('填到已有账号 = PATCH 现有账号；账号正在执行时不能改买家号 ID（409）', () => {
@@ -228,6 +275,65 @@ describe('模拟后端：来源指定买家号', () => {
     expect(keys).toContain('external_buyer_account')
     expect(keys).toContain('external_buyer_customer_id')
     expect(fx.upload.suggested_mapping).toMatchObject({ 买家号: 'external_buyer_account', 买家号ID: 'external_buyer_customer_id' })
+  })
+})
+
+describe('模拟后端：飞书读取的问题', () => {
+  const missing = '来源表里找不到买家号列「买家号id」，这一列的指定保持上次读到的内容，新记录暂不接收'
+
+  it('来源表里找不到买家号列：连接照常成功（last_error 为空），last_stats.problems 带这条连接级问题；没有问题的连接不带这个键', () => {
+    const { call } = api()
+    const rows = call<Page<FeishuConnection>>('GET', '/feishu/connections').body.rows
+    const broken = rows.find((c) => c.last_stats?.problems?.length)!
+    expect(broken.last_error).toBeNull()
+    expect(broken.last_sync_ok_at).toBeTruthy()
+    expect(broken.last_stats!.problems).toEqual([{ record_id: null, upstream_order_no: '买家号列', verdict: 'skipped', reason: missing, scope: 'connection' }])
+    for (const c of rows.filter((x) => x.id !== broken.id)) expect(c.last_stats ?? {}).not.toHaveProperty('problems')
+    // 读取记录：连接级问题在 problems 最前面，之后是记录级样本（新记录暂不接收）
+    const run = call<Page<SyncRun>>('GET', `/feishu/connections/${broken.id}/runs`).body.rows[0]
+    expect(run.stats!.problems![0]).toMatchObject({ scope: 'connection', reason: missing })
+    expect(run.stats!.problems!.slice(1).every((p) => p.scope !== 'connection' && p.verdict === 'skipped' && !!p.reason?.includes('暂不接收'))).toBe(true)
+  })
+
+  it('立即同步：连接级问题排在 problems 最前面；连接的 last_stats 随之更新（仍带 problems）', () => {
+    const { call } = api()
+    const broken = call<Page<FeishuConnection>>('GET', '/feishu/connections').body.rows.find((c) => c.last_stats?.problems?.length)!
+    const res = call<FeishuSyncResult>('POST', `/feishu/connections/${broken.id}/sync`, {}).body
+    expect(res.problems[0]).toMatchObject({ scope: 'connection', reason: missing })
+    expect(res.problems.slice(1).every((p) => p.scope !== 'connection')).toBe(true)
+    const after = call<FeishuConnection>('GET', `/feishu/connections/${broken.id}`).body
+    expect(after.last_stats).toMatchObject({ read: res.read, skipped: res.skipped, problems: [res.problems[0]] })
+    // 没有连接级问题的连接：同步结果里没有它，last_stats 也不带 problems
+    const fine = call<FeishuSyncResult>('POST', '/feishu/connections/1/sync', {}).body
+    expect(fine.problems.some((p) => p.scope === 'connection')).toBe(false)
+    expect(call<FeishuConnection>('GET', '/feishu/connections/1').body.last_stats).not.toHaveProperty('problems')
+  })
+
+  it('读取记录的问题样本与统计对得上：记录级样本条数 = 跳过 + 无效 + 待核实', () => {
+    const { fixtures: fx } = api()
+    for (const runs of Object.values(fx.syncRuns)) {
+      for (const r of runs) {
+        const problems = r.stats?.problems
+        if (!problems) continue
+        const records = problems.filter((p) => p.scope !== 'connection').length
+        const n = (k: string) => (typeof r.stats![k] === 'number' ? (r.stats![k] as number) : 0)
+        expect(records).toBe(n('skipped') + n('invalid') + n('conflict'))
+      }
+    }
+  })
+
+  it('时间线：来源指定没有采用时有 order.designation_not_adopted（{source, stated, previous, current}）', () => {
+    const { fixtures: fx } = api()
+    const events = Object.values(fx.details).flatMap((d) => d.events.map((e) => ({ d, e }))).filter(({ e }) => e.kind === 'order.designation_not_adopted')
+    expect(events.length).toBeGreaterThan(0)
+    for (const { d, e } of events) {
+      expect(Object.keys(e.detail).sort()).toEqual(['current', 'previous', 'source', 'stated'])
+      // current 是任务现有的指定；这条来源确实关联在任务上
+      expect(e.detail.current).toEqual({ customer_id: d.designated_buyer!.customer_id, name: d.designated_buyer!.name })
+      const src = e.detail.source as { kind: string }
+      expect(d.source_kinds).toContain(src.kind)
+      expect(src.kind).not.toBe(d.primary_source_kind)
+    }
   })
 })
 

@@ -342,6 +342,59 @@ def test_ignore_and_unignore_buyer_id(conn, workspace):
                       "detail": {"customer_id": "A2TEST0000X"}}
 
 
+IGNORED_TAIL = "（这个买家号 ID 已被忽略，恢复后才能登记）"
+
+
+def test_ignore_and_restore_refresh_the_reason_of_tasks_designating_the_id(conn, workspace):
+    """忽略 / 恢复一个被来源指定的买家号 ID：待分配原因立即跟着变（重新分配只改原因，不写订单事件）；
+    重复忽略、没有任务指定的 ID 不触发分配。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    f.make_account(conn, ws, name="环境-DEMO-B")
+    o = f.ingest_ready_order(conn, ws, external_buyer_customer_id="A1DEMO0777")
+    allocation.allocate(conn, ws, trigger="manual")
+    plain = "来源指定的买家号 ID A1DEMO0777 还没有登记为账号；在「账号与浏览器」登记后会自动分配"
+
+    def reason() -> str:
+        return orders.get_row(conn, ws, o["id"])["status_reason"]
+
+    def order_events() -> int:
+        return f.count(conn, "events", "entity = 'order' AND entity_id = %s", (o["id"],))
+
+    def runs() -> int:
+        return f.count(conn, "allocation_runs", "workspace_id = %s", (ws,))
+
+    assert reason() == plain
+    n_events, n_runs = order_events(), runs()
+    accounts.ignore_buyer_id(conn, ws, "a1demo0777", uid)
+    assert reason() == plain + IGNORED_TAIL
+    assert runs() == n_runs + 1
+    assert conn.execute("SELECT trigger FROM procure.allocation_runs ORDER BY id DESC LIMIT 1").fetchone()[
+        "trigger"] == "account_change"
+    accounts.ignore_buyer_id(conn, ws, "A1DEMO0777", uid)                          # 重复忽略：不再分配
+    accounts.ignore_buyer_id(conn, ws, "A1DEMO0888", uid)                          # 没有任务指定：不分配
+    assert runs() == n_runs + 1
+    accounts.unignore_buyer_id(conn, ws, "A1DEMO0777", uid)
+    assert reason() == plain
+    assert runs() == n_runs + 2
+    accounts.unignore_buyer_id(conn, ws, "A1DEMO0777", uid)                        # 没忽略着：不分配
+    accounts.unignore_buyer_id(conn, ws, "A1DEMO0888", uid)                        # 没有任务指定：不分配
+    assert runs() == n_runs + 2
+    assert order_events() == n_events                                              # 只改了原因
+    got = orders.get_row(conn, ws, o["id"])
+    assert (got["status"], got["assigned_account_id"]) == ("queued", None)
+
+
+def test_ignore_does_not_reallocate_for_tasks_that_are_not_waiting(conn, workspace):
+    """指定这个 ID 的任务不在待分配（例如已取消）：忽略 / 恢复不触发分配。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    o = f.ingest_ready_order(conn, ws, external_buyer_customer_id="A1DEMO0777")
+    f.set_status(conn, o["id"], "cancelled")
+    n_runs = f.count(conn, "allocation_runs")
+    accounts.ignore_buyer_id(conn, ws, "A1DEMO0777", uid)
+    accounts.unignore_buyer_id(conn, ws, "A1DEMO0777", uid)
+    assert f.count(conn, "allocation_runs") == n_runs
+
+
 @pytest.mark.parametrize("bad", [None, "", "not-an-id", "B2TEST0000X", "A123", 12345678901, "A" + "9" * 70])
 def test_ignore_validates_customer_id_shape(conn, workspace, bad):
     for fn in (accounts.ignore_buyer_id, accounts.unignore_buyer_id):

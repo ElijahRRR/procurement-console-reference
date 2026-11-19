@@ -534,6 +534,24 @@ def test_unstorable_characters_from_the_plugin_are_dropped_not_500(owner, api, b
 
 
 @pytest.mark.parametrize("bad", UNSTORABLE)
+def test_outdated_version_with_unstorable_characters_is_refused_not_stored(owner, api, bad):
+    """过旧的版本号后面跟着坏字符：闸门按会存下来的版本（去掉坏字符后）判定 → 409 PLUGIN_OUTDATED，detail 写得进
+    JSON；以前原文解析不了就放行，浏览器以「0.1.0」登记进来。"""
+    c = local_client(api, headers=JSON, raise_server_exceptions=False)
+    token = device_token()
+    body = err(c.post("/plugin/v1/register", content=_raw({"device_token": token, "ext_version": f"0.1.0{bad}"})),
+               409, "PLUGIN_OUTDATED")
+    assert body["detail"] == {"ext_version": "0.1.0", "min_ext_version": "0.2.0"}
+    reg = ok(c.post("/plugin/v1/register", content=_raw({"device_token": token, "ext_version": "0.2.0"})))
+    assert reg["created"] is True                                         # 刚才那次什么也没登记
+    h = bearer(token)
+    for path, extra in [("/plugin/v1/heartbeat", {}), ("/plugin/v1/identity", identity(None))]:
+        body = err(c.post(path, content=_raw({**extra, "ext_version": f"{bad}0.1.0"}), headers=h), 409, "PLUGIN_OUTDATED")
+        assert body["detail"]["ext_version"] == "0.1.0", path
+    assert ok(owner.get(f"/api/v1/devices/{reg['device_id']}"))["ext_version"] == "0.2.0"
+
+
+@pytest.mark.parametrize("bad", UNSTORABLE)
 def test_unstorable_characters_in_the_execution_protocol_are_not_500(owner, api, bad):
     """执行中的每一步（开始批次、进度、护栏、等待验证、结果、结束批次）：请求里带 NUL 或不成对的代理项，要么按
     参数错误 / 护栏拦截回答，要么去掉坏字符照常处理——没有一步是 500，回执收得下来。"""

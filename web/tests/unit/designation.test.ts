@@ -42,6 +42,8 @@ import OrdersView from '@/views/OrdersView.vue'
 import {
   ACCOUNT_NAME_HELP,
   DESIGNATION_MAPPING_HELP,
+  FILE_DESIGNATION_MAPPING_HELP,
+  FILE_DESIGNATION_NOTE,
   REALLOCATE_CONFIRM_TEXT,
   UNASSIGNED_EMPTY_TEXT,
   UNASSIGN_CONFIRM_TEXT,
@@ -55,7 +57,7 @@ import {
   unassignConfirmText,
 } from '@/utils/designation'
 import { ASSIGNMENT_KIND_LABEL, eventKindLabel, fieldLabel, labelOf } from '@/utils/labels'
-import { NOT_DESIGNATED_TEXT, changesText, eventSourceText, eventSummary } from '@/utils/orderDetail'
+import { NOT_DESIGNATED_TEXT, changesText, eventSourceText, eventSummary, notAdoptedText } from '@/utils/orderDetail'
 import { allocationBreakdown } from '@/utils/overview'
 import { allocationBrief } from '@/utils/results'
 
@@ -237,19 +239,30 @@ describe('人工改派到别的账号时的后缀', () => {
 })
 
 describe('文案', () => {
-  it('解除分配确认：有指定时说明下次分配会再分给它；没有指定时是原来的一句', () => {
-    expect(unassignConfirmText(bySource())).toBe('确定要解除这笔任务的账号分配吗？来源指定了买家号「环境-DEMO-A」，下次分配时会再分给它；要换账号请用「改派账号」。')
+  it('解除分配确认：有指定时说明下次分配仍按来源指定（接得了分给它，接不了停在待分配）、引用「名称（ID）」；没有指定时是原来的一句', () => {
+    expect(unassignConfirmText(bySource())).toBe(
+      '确定要解除这笔任务的账号分配吗？来源指定了买家号「环境-DEMO-A（A1DEMO0000）」，下次分配仍按来源指定：接得了就分给它，接不了就停在待分配并写明原因；要换账号请用「改派账号」。',
+    )
     expect(unassignConfirmText(orderRow(1, { designated_buyer: des('A1DEMO0000', null, ACC_A) }))).toBe(
-      '确定要解除这笔任务的账号分配吗？来源指定了买家号「A1DEMO0000」，下次分配时会再分给它；要换账号请用「改派账号」。',
+      '确定要解除这笔任务的账号分配吗？来源指定了买家号「A1DEMO0000」，下次分配仍按来源指定：接得了就分给它，接不了就停在待分配并写明原因；要换账号请用「改派账号」。',
     )
     expect(unassignConfirmText(orderRow(1))).toBe('确定要解除这笔任务的账号分配吗？任务会回到待分配。')
     expect(unassignConfirmText(orderRow(1))).toBe(UNASSIGN_CONFIRM_TEXT)
     expect(unassignConfirmText(null)).toBe(UNASSIGN_CONFIRM_TEXT)
   })
 
+  it('unassignConfirmText：指定解析不到账号时不承诺会再分给它', () => {
+    // 来源指定的买家号 ID 还没登记（或已忽略、已归档、两列不是同一个账号），人工改派到了别的账号：解除后任务会停在待分配
+    const s = unassignConfirmText(orderRow(1, { assignment_kind: 'manual', assigned_account: ACC_B, designated_buyer: des('A2TEST00005', '新环境-X', null) }))
+    expect(s).not.toContain('下次分配时会再分给它；')
+    expect(s).toContain('待分配')
+    // 两列都填时 ID 才是对应账号的依据：文案里引用「名称（ID）」，不只引用名称
+    expect(s).toContain('「新环境-X（A2TEST00005）」')
+  })
+
   it('改派对话框：有指定时在原说明前加一段；没有指定时不加', () => {
     expect(assignDesignationNote(overridden())).toBe(
-      '来源给这笔任务指定了买家号「环境-DEMO-A」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。',
+      '来源给这笔任务指定了买家号「环境-DEMO-A（A1DEMO0000）」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。',
     )
     expect(assignDesignationNote(orderRow(1, { designated_buyer: des('A2TEST0007', null, null) }))).toContain('指定了买家号「A2TEST0007」')
     expect(assignDesignationNote(orderRow(1))).toBe('')
@@ -260,14 +273,22 @@ describe('文案', () => {
     expect(REALLOCATE_CONFIRM_TEXT).toBe('确定要重新分配吗？来源指定了买家号的任务按指定分配，其余自动分配的任务按当前账号配置重算，人工改派的任务保持不动。')
     expect(UNASSIGNED_EMPTY_TEXT).toBe('分不出去的任务会写明原因：金额不在任何启用账号的区间内、匹配账号当天额度已满，或来源指定的买家号暂时接不了。')
     expect(DESIGNATION_MAPPING_HELP).toBe(
-      '「买家号」「买家号 ID」填了，这笔订单就指定给对应的账号（买家号按账号名称对应，买家号 ID 按账号登记的 ID 对应，都填以 ID 为准）；留空由系统自动分配。已有 AMZ 订单号的行，这两列只当作历史采购记录。',
+      '「买家号」「买家号 ID」填了，这笔订单就指定给对应的账号（买家号按账号名称对应，买家号 ID 按账号登记的 ID 对应；都填时以 ID 为准，买家号对应到另一个账号时不分配，停在待分配）；留空由系统自动分配。已有 AMZ 订单号的行，这两列只当作历史采购记录。',
     )
+    // 文件导入向导多一句：空着重新上传不会清除指定（飞书清空格子会清除，飞书向导不加）
+    expect(FILE_DESIGNATION_NOTE).toBe('已导入过的订单，这两列空着重新上传不会清除指定。')
+    expect(FILE_DESIGNATION_MAPPING_HELP).toBe(DESIGNATION_MAPPING_HELP + FILE_DESIGNATION_NOTE)
     expect(ACCOUNT_NAME_HELP).toBe('来源按「买家号」指定时靠名称对应账号，改名后这些任务会回到待分配。')
+  })
+
+  it('买家号两列的说明写明两列指向不同账号时不分配（ID 不会「胜出」）', () => {
+    expect(DESIGNATION_MAPPING_HELP).toContain('买家号对应到另一个账号时不分配')
+    expect(DESIGNATION_MAPPING_HELP).not.toContain('都填以 ID 为准）')
   })
 
   it('统一叫「来源指定」，不出现「按表指定」；确认文案都是「确定要……吗？」；不用感叹号', () => {
     const all = [
-      REALLOCATE_CONFIRM_TEXT, UNASSIGNED_EMPTY_TEXT, DESIGNATION_MAPPING_HELP, ACCOUNT_NAME_HELP, UNASSIGN_CONFIRM_TEXT,
+      REALLOCATE_CONFIRM_TEXT, UNASSIGNED_EMPTY_TEXT, DESIGNATION_MAPPING_HELP, FILE_DESIGNATION_MAPPING_HELP, ACCOUNT_NAME_HELP, UNASSIGN_CONFIRM_TEXT,
       unassignConfirmText(bySource()), assignDesignationNote(bySource()), allocationBreakdown({ considered: 1, assigned: 1, coverage: 0, fill: 0, designated: 1, unassigned: 0 }),
       ASSIGNMENT_KIND_LABEL.source,
     ]
@@ -332,6 +353,40 @@ describe('时间线：来源指定的买家号变了', () => {
     )
     // 别的字符串不当作来源
     expect(eventSourceText('something')).toBe('')
+  })
+
+  it('来源指定未采用（order.designation_not_adopted）：中文名，摘要写明来源写的与任务现有的指定，「名称（ID）」', () => {
+    expect(eventKindLabel('order.designation_not_adopted')).toBe('来源指定未采用')
+    // 来源写的与任务现有的指定不同、这条来源不是主来源种类：没有采用（previous 为 null）
+    const notAdopted = { stated: { customer_id: null, name: '环境-DEMO-B' }, previous: null, current: { customer_id: 'A1DEMO0000', name: '环境-DEMO-A' } }
+    expect(eventSummary(event(1, 'order.designation_not_adopted', { source: { kind: 'file', batch_id: 3, row_no: 6 }, ...notAdopted }))).toBe(
+      '文件批次 3 第 6 行 · 来源的买家号「环境-DEMO-B」与任务现有的指定「环境-DEMO-A（A1DEMO0000）」不同，未采用',
+    )
+    // 这条来源清空了它上次写的、当初就没被采用的买家号：任务现有的指定保持不变（stated 两项为空，previous 是它上次写的）
+    const cleared = { stated: { customer_id: null, name: null }, previous: { customer_id: 'A2TEST0007', name: null }, current: { customer_id: 'A1DEMO0000', name: '环境-DEMO-A' } }
+    expect(eventSummary(event(1, 'order.designation_not_adopted', { source: { kind: 'feishu', connection_id: 1, record_id: 'recDEMO1' }, ...cleared }))).toBe(
+      '飞书记录 recDEMO1 · 来源清空了买家号「A2TEST0007」，任务现有的指定「环境-DEMO-A（A1DEMO0000）」不是这条来源写的，保持不变',
+    )
+    // 缺项的旧记录也不出现英文键、JSON 或 undefined
+    for (const t of [notAdoptedText(null), notAdoptedText({ stated: 'x' })]) {
+      expect(t).toBe('来源的买家号「未指定」与任务现有的指定「未指定」不同，未采用')
+    }
+  })
+
+  it('时间线里显示「来源指定未采用」，不出现事件的英文 kind', async () => {
+    ordersApi.getOrder.mockResolvedValue(detail(overridden(7), {
+      events: [
+        event(2, 'order.designation_not_adopted', {
+          source: { kind: 'file', batch_id: 41, row_no: 9 },
+          stated: { customer_id: null, name: '环境-DEMO-B' }, previous: null, current: { customer_id: 'A1DEMO0000', name: '环境-DEMO-A' },
+        }),
+      ],
+    }))
+    await mountWith(OrderDetailDrawer, { orderId: 7, modelValue: true })
+    expect(bodyText()).toContain('来源指定未采用')
+    expect(bodyText()).toContain('文件批次 41 第 9 行 · 来源的买家号「环境-DEMO-B」与任务现有的指定「环境-DEMO-A（A1DEMO0000）」不同，未采用')
+    expect(bodyText()).not.toContain('order.designation_not_adopted')
+    expect(bodyText()).not.toContain('[object Object]')
   })
 
   it('来源更新事件里的指定变化与别的字段写在一起；别的字段的空值仍是「—」；不出现英文键与 JSON', () => {
@@ -450,13 +505,15 @@ describe('任务详情：「分配」区的来源指定', () => {
 })
 
 describe('任务详情：解除分配与改派的文案', () => {
-  it('解除分配：来源指定了买家号时，确认框说明下次分配会再分给它', async () => {
+  it('解除分配：来源指定了买家号时，确认框说明下次分配仍按来源指定', async () => {
     ordersApi.getOrder.mockResolvedValue(detail(bySource(7)))
     ordersApi.unassignOrder.mockResolvedValue(detail(orderRow(7, { status: 'queued', assigned_account: null, assignment_kind: null, assignment_note: null, status_reason: '人工解除分配', designated_buyer: des('A1DEMO0000', '环境-DEMO-A', ACC_A) })))
     await mountWith(OrderDetailDrawer, { orderId: 7, modelValue: true })
     buttons('解除分配')[0].click()
     await settle()
-    expect(confirmMessage()).toBe('确定要解除这笔任务的账号分配吗？来源指定了买家号「环境-DEMO-A」，下次分配时会再分给它；要换账号请用「改派账号」。')
+    expect(confirmMessage()).toBe(
+      '确定要解除这笔任务的账号分配吗？来源指定了买家号「环境-DEMO-A（A1DEMO0000）」，下次分配仍按来源指定：接得了就分给它，接不了就停在待分配并写明原因；要换账号请用「改派账号」。',
+    )
     expect(ordersApi.unassignOrder).toHaveBeenCalledWith(7)
     // 解除之后指定还在
     expect((document.body.querySelector('[data-testid="designated-buyer"]') as HTMLElement).textContent).toBe('环境-DEMO-A（A1DEMO0000）')
@@ -468,7 +525,7 @@ describe('任务详情：解除分配与改派的文案', () => {
     await mountWith(OrderDetailDrawer, { orderId: 7, modelValue: true })
     buttons('解除分配')[0].click()
     await settle()
-    expect(confirmMessage()).toContain('来源指定了买家号「环境-DEMO-A」')
+    expect(confirmMessage()).toContain('来源指定了买家号「环境-DEMO-A（A1DEMO0000）」')
     expect(ordersApi.unassignOrder).not.toHaveBeenCalled()
   })
 
@@ -487,7 +544,7 @@ describe('任务详情：解除分配与改派的文案', () => {
     buttons('改派账号')[0].click()
     await settle()
     const note = document.body.querySelector('[data-testid="assign-designation-note"]') as HTMLElement
-    expect(note.textContent).toBe('来源给这笔任务指定了买家号「环境-DEMO-C」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。')
+    expect(note.textContent).toBe('来源给这笔任务指定了买家号「环境-DEMO-C（A2TEST0007）」。改派后以改派为准；任务留在新账号期间不再跟随来源的指定，回到待分配后仍按来源指定分配。')
     const original = note.nextElementSibling as HTMLElement
     expect(original.textContent).toContain('人工改派后任务固定在该账号，不参与自动重算。')
   })

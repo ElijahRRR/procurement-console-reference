@@ -1,6 +1,7 @@
 /**
  * 「账号与浏览器」页的接线（执行入口改造后）：
- * - 账号页签顶部的「待登记的买家号」：登记（账号对话框预填 ID 与名称，走新建接口）、填到已有账号（PATCH）、忽略 / 恢复、自动刷新；
+ * - 账号页签顶部的「待登记的买家号」：登记（账号对话框预填 ID 与名称，走新建接口）、填到已有账号（先重新读目标账号，
+ *   它此刻已有 ID 就不发 PATCH）、忽略 / 恢复、自动刷新；
  *   来源指定的买家号也列在这里（写明指定了几笔任务，没有浏览器登录时写明），已忽略分组列出忽略名单里的全部 ID；
  * - 账号表的「买家号 ID」「所在浏览器」两列；账号对话框没有原来的指定执行环境一项；
  * - 浏览器页签：只读列表、各登录状态的文字、改名、移除、显示已移除、空状态；
@@ -132,6 +133,8 @@ beforeEach(() => {
   clipboard.copyText.mockResolvedValue(true)
   settingsApi.getSettings.mockResolvedValue({ default_max_delivery_days: 10, simulation_only: true, logistics_sync_time: '08:30', real_purchase_available: false })
   accountsApi.listAccounts.mockResolvedValue({ total: 2, rows: [account(), noIdAccount()] })
+  // 「填到已有账号」前重新读目标账号：缺省读到的就是列表里那一个（还没登记 ID）
+  accountsApi.getAccount.mockImplementation(async (id: number) => (id === 8 ? noIdAccount() : account({ id })))
   accountsApi.listDiscovered.mockResolvedValue([])
   devicesApi.listDevices.mockResolvedValue({ total: 0, rows: [] })
 })
@@ -199,7 +202,8 @@ describe('账号页签：待登记的买家号', () => {
 
   it('登记失败：提示「登记买家号失败：原因」，对话框不关', async () => {
     accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005', { name_hint: '环境-DEMO-01' })])
-    const e = new ApiError('CONFLICT', '账号名称「环境-DEMO-01」已存在', 409)
+    // 与服务端一致：重名是 422 VALIDATION，detail.field 指向名称
+    const e = new ApiError('VALIDATION', '账号名称「环境-DEMO-01」已存在', 422, { field: 'name' })
     accountsApi.createAccount.mockRejectedValue(e)
     await mountWith(AccountsPanel)
     buttons('登记')[0].click()
@@ -219,6 +223,9 @@ describe('账号页签：待登记的买家号', () => {
     expect(dropdown.props('disabled')).toBe(false)
     dropdown.vm.$emit('command', 8)
     await settle()
+    // 确认前、发请求前各重新读一次目标账号（候选来自可能过时的账号列表）
+    expect(accountsApi.getAccount).toHaveBeenCalledWith(8)
+    expect(accountsApi.getAccount).toHaveBeenCalledTimes(2)
     expect(feedback.confirmAction).toHaveBeenCalledWith(expect.objectContaining({ message: '确定要把买家号 ID A2TEST00004 登记到「环境-DEMO-04」吗？' }))
     expect(accountsApi.updateAccount).toHaveBeenCalledWith(8, { amazon_customer_id: 'A2TEST00004' })
     expect(accountsApi.createAccount).not.toHaveBeenCalled()
@@ -241,6 +248,59 @@ describe('账号页签：待登记的买家号', () => {
     accountsApi.updateAccount.mockRejectedValue(e)
     w.findComponent(ElDropdown).vm.$emit('command', 8)
     await settle()
+    expect(feedback.notifyFailure).toHaveBeenCalledWith('登记买家号', e)
+  })
+
+  it('填到已有账号：目标账号此刻已登记了别的 ID 时不发 PATCH', async () => {
+    // 另一个页面或成员刚给账号 8 登记了 A2TEST00009；本页的账号列表还是旧的，仍把它列为候选
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005')])
+    accountsApi.getAccount.mockResolvedValue(account({ id: 8, name: '环境-DEMO-04', amazon_customer_id: 'A2TEST00009' }))
+    const w = await mountWith(AccountsPanel)
+    accountsApi.listAccounts.mockClear()
+    w.findComponent(ElDropdown).vm.$emit('command', 8)
+    await settle()
+    expect(accountsApi.getAccount).toHaveBeenCalledWith(8)
+    expect(accountsApi.updateAccount).not.toHaveBeenCalled()
+    expect(feedback.confirmAction).not.toHaveBeenCalled()
+    expect(feedback.notifyFailure).toHaveBeenCalledWith('登记买家号', expect.anything())
+    expect(feedback.notifyFailure.mock.calls[0][1]).toBe('账号「环境-DEMO-04」已经登记了买家号 ID A2TEST00009，不能再填入别的 ID；要换 ID 请编辑这个账号')
+    // 让账号列表重读，候选与「未登记」标记跟上
+    expect(accountsApi.listAccounts).toHaveBeenCalled()
+  })
+
+  it('填到已有账号：确认框停留期间目标账号被登记了 ID，发请求前的复查拦住 PATCH', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005')])
+    accountsApi.getAccount
+      .mockResolvedValueOnce(noIdAccount())
+      .mockResolvedValueOnce(account({ id: 8, name: '环境-DEMO-04', amazon_customer_id: 'A2TEST00009' }))
+    const w = await mountWith(AccountsPanel)
+    w.findComponent(ElDropdown).vm.$emit('command', 8)
+    await settle()
+    expect(feedback.confirmAction).toHaveBeenCalledTimes(1)
+    expect(accountsApi.getAccount).toHaveBeenCalledTimes(2)
+    expect(accountsApi.updateAccount).not.toHaveBeenCalled()
+    expect(feedback.notifyFailure).toHaveBeenCalledWith('登记买家号', expect.stringContaining('已经登记了买家号 ID A2TEST00009'))
+  })
+
+  it('填到已有账号：目标账号已经登记的就是这个 ID（别处刚填好）时不发请求，只提示一句', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005')])
+    accountsApi.getAccount.mockResolvedValue(account({ id: 8, name: '环境-DEMO-04', amazon_customer_id: 'A2TEST00005' }))
+    const w = await mountWith(AccountsPanel)
+    w.findComponent(ElDropdown).vm.$emit('command', 8)
+    await settle()
+    expect(accountsApi.updateAccount).not.toHaveBeenCalled()
+    expect(feedback.notifyFailure).not.toHaveBeenCalled()
+    expect(feedback.toast).toHaveBeenCalledWith('买家号 ID A2TEST00005 已经登记在「环境-DEMO-04」上', 'info')
+  })
+
+  it('填到已有账号：重新读目标账号失败时不发请求，提示「登记买家号失败：原因」', async () => {
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005')])
+    const e = new ApiError('NOT_FOUND', '账号不存在', 404)
+    accountsApi.getAccount.mockRejectedValue(e)
+    const w = await mountWith(AccountsPanel)
+    w.findComponent(ElDropdown).vm.$emit('command', 8)
+    await settle()
+    expect(accountsApi.updateAccount).not.toHaveBeenCalled()
     expect(feedback.notifyFailure).toHaveBeenCalledWith('登记买家号', e)
   })
 
@@ -514,6 +574,21 @@ describe('账号表与账号对话框', () => {
     expect(accountsApi.updateAccount.mock.calls[1][1]).toMatchObject({ amazon_customer_id: 'A1DEMO00009' })
   })
 
+  it('账号对话框：每段说明在自己输入框所在的表单项里（窄屏单列时也紧跟自己的输入框）', async () => {
+    await mountWith(AccountsPanel)
+    buttons('新建账号')[0].click()
+    await settle()
+    const dialog = openDialog()!
+    const nameHelp = dialog.querySelector('[data-testid="account-name-help"]') as HTMLElement
+    expect(nameHelp.closest('.el-form-item')?.querySelector('label')?.textContent).toContain('账号名称')
+    const idHelp = dialog.querySelector('[data-testid="customer-id-help"]') as HTMLElement
+    expect(idHelp.closest('.el-form-item')?.querySelector('label')?.textContent).toContain('买家号 ID')
+    expect(idHelp.textContent).toContain('亚马逊 customerId')
+    // 说明紧跟在自己的输入框后面
+    expect(nameHelp.previousElementSibling?.classList.contains('el-input')).toBe(true)
+    expect(idHelp.previousElementSibling?.classList.contains('el-input')).toBe(true)
+  })
+
   it('买家号 ID 的表单校验：留空可以，形状不对给出说明（校验规则本身；el-form 的规则在这个测试环境里不执行）', () => {
     expect(customerIdProblem('')).toBe('')
     expect(customerIdProblem('   ')).toBe('')
@@ -696,6 +771,65 @@ describe('账号与浏览器页', () => {
     buttons('登记', pane)[0].click()
     await settle()
     expect(w.find('.el-tabs__item.is-active').text()).toBe('账号')
+    const dialog = openDialog()!
+    expect(dialog.textContent).toContain('登记买家号 · A2TEST00005')
+    expect((dialog.querySelector('input[aria-label="买家号 ID"]') as HTMLInputElement).value).toBe('A2TEST00005')
+  })
+
+  it('浏览器页签里点「登记」与待登记列表的「登记」一样：名称用来源里的名称预填，写明来源指定的任务数', async () => {
+    devicesApi.listDevices.mockResolvedValue({
+      total: 1,
+      rows: [device({ id: 10, name: '浏览器 10', login: { state: 'unregistered', customer_id: 'A2TEST00005', at: new Date().toISOString(), stale: false }, account: null })],
+    })
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005', { name_hint: '新环境-X', source_orders: 1 })])
+    const w = await mountWith(AccountsView, {}, '/accounts?tab=browsers')
+    await settle()
+    const pane = document.body.querySelector('#pane-browsers .el-table__body') as HTMLElement
+    buttons('登记', pane)[0].click()
+    await settle()
+    expect(w.find('.el-tabs__item.is-active').text()).toBe('账号')
+    const dialog = openDialog()!
+    expect(dialog.textContent).toContain('登记买家号 · A2TEST00005')
+    expect([...dialog.querySelectorAll('input')].map((i) => i.value)).toContain('新环境-X')
+    expect(dialog.textContent).toContain('来源指定给它的 1 笔任务会按指定重新分配')
+    expect(dialog.textContent).toContain('由插件从浏览器登录的亚马逊页面读出')
+    // 没有同名、还没登记 ID 的账号：不出现同名提示
+    expect(dialog.querySelector('[data-testid="register-same-name"]')).toBeNull()
+  })
+
+  it('登记时已有同名、还没登记 ID 的账号：对话框提示可以直接填到它上面，「填到」走填到已有账号（不新建）', async () => {
+    devicesApi.listDevices.mockResolvedValue({
+      total: 1,
+      rows: [device({ id: 10, name: '浏览器 10', login: { state: 'unregistered', customer_id: 'A2TEST00005', at: new Date().toISOString(), stale: false }, account: null })],
+    })
+    accountsApi.listAccounts.mockResolvedValue({ total: 2, rows: [account(), account({ id: 8, name: '新环境-X', amazon_customer_id: null, browsers: [] })] })
+    accountsApi.getAccount.mockResolvedValue(account({ id: 8, name: '新环境-X', amazon_customer_id: null, browsers: [] }))
+    accountsApi.listDiscovered.mockResolvedValue([buyer('A2TEST00005', { name_hint: '新环境-X', source_orders: 1 })])
+    accountsApi.updateAccount.mockResolvedValue(account({ id: 8, name: '新环境-X', amazon_customer_id: 'A2TEST00005' }))
+    await mountWith(AccountsView, {}, '/accounts?tab=browsers')
+    await settle()
+    buttons('登记', document.body.querySelector('#pane-browsers .el-table__body') as HTMLElement)[0].click()
+    await settle()
+    const dialog = openDialog()!
+    const hint = dialog.querySelector('[data-testid="register-same-name"]') as HTMLElement
+    expect(hint.textContent).toContain('来源里这个买家号叫「新环境-X」，已有同名账号还没登记买家号 ID，可以直接填到它上面。')
+    buttons('填到「新环境-X」', dialog)[0].click()
+    await settle()
+    expect(feedback.confirmAction).toHaveBeenCalledWith(expect.objectContaining({ message: '确定要把买家号 ID A2TEST00005 登记到「新环境-X」吗？' }))
+    expect(accountsApi.updateAccount).toHaveBeenCalledWith(8, { amazon_customer_id: 'A2TEST00005' })
+    expect(accountsApi.createAccount).not.toHaveBeenCalled()
+  })
+
+  it('浏览器页签里点「登记」时读不到待登记列表：照样打开只填了 ID 的对话框', async () => {
+    devicesApi.listDevices.mockResolvedValue({
+      total: 1,
+      rows: [device({ id: 10, name: '浏览器 10', login: { state: 'unregistered', customer_id: 'A2TEST00005', at: new Date().toISOString(), stale: false }, account: null })],
+    })
+    await mountWith(AccountsView, {}, '/accounts?tab=browsers')
+    await settle()
+    accountsApi.listDiscovered.mockRejectedValue(new ApiError('INTERNAL', '服务端出错', 500))
+    buttons('登记', document.body.querySelector('#pane-browsers .el-table__body') as HTMLElement)[0].click()
+    await settle()
     const dialog = openDialog()!
     expect(dialog.textContent).toContain('登记买家号 · A2TEST00005')
     expect((dialog.querySelector('input[aria-label="买家号 ID"]') as HTMLInputElement).value).toBe('A2TEST00005')

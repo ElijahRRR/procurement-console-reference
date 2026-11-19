@@ -4,6 +4,8 @@
  * 加上来源指定给未采购任务、还没有账号登记的（这种没有浏览器登录着，写明「来源指定了 N 笔任务」）。
  * 有条目才显示；页面可见时每 10 秒自动刷新。每行三个动作：
  * 「登记」（交给上层打开账号对话框，ID 与名称已填）、「填到已有账号」（选一个还没登记 ID 的账号，确认后 PATCH）、「忽略」。
+ * 「填到已有账号」的候选来自上层的账号列表，它可能已经过时（另一个页面或成员刚给这个账号登记了 ID）：确认前与发请求前
+ * 各重新读一次目标账号，它已经有买家号 ID 时不发请求（绝不替换别人登记的 ID），提示原因并让上层重读账号列表。
  * 底部「已忽略 N 个」可展开：列出忽略名单里的全部 ID（不要求此刻有浏览器登录着），每行「恢复」。
  */
 import { computed, onMounted, ref } from 'vue'
@@ -18,6 +20,7 @@ import {
   fillConfirmText,
   fillTargets,
   registeredEffectText,
+  sameNameHint,
   sourceOrdersText,
   splitDiscovered,
   suggestedFillTarget,
@@ -67,7 +70,7 @@ async function load(auto = false) {
 }
 onMounted(() => load())
 useVisiblePolling(() => load(true), { enabled: () => props.active })
-defineExpose({ reload: () => load() })
+defineExpose({ reload: () => load(), fill })
 
 const targetsOf = (item: DiscoveredBuyer) => fillTargets(props.accounts, item)
 const suggestedOf = (item: DiscoveredBuyer) => suggestedFillTarget(props.accounts, item)
@@ -77,13 +80,40 @@ async function copy(id: string) {
   else notifyFailure('复制买家号 ID', '浏览器不允许访问剪贴板，请手动选中后复制')
 }
 
+/**
+ * 输入：要填的目标账号、要填的买家号 ID → 输出：重新读到的账号此刻还没有买家号 ID 时为 true。
+ * 已经有别的 ID（或读不到这个账号）时提示「登记买家号失败：原因」；已经就是这个 ID 时只提示一句；
+ * 这两种情况都让上层重读账号列表、本区重读待登记列表，返回 false。
+ */
+async function stillWithoutId(target: Account, customerId: string): Promise<boolean> {
+  try {
+    const fresh = await accountsApi.getAccount(target.id)
+    const id = (fresh?.amazon_customer_id ?? '').trim()
+    if (!id) return true
+    const name = fresh?.name || target.name
+    if (id === customerId) toast(`买家号 ID ${id} 已经登记在「${name}」上`, 'info')
+    else notifyFailure('登记买家号', `账号「${name}」已经登记了买家号 ID ${id}，不能再填入别的 ID；要换 ID 请编辑这个账号`)
+  } catch (e) {
+    notifyFailure('登记买家号', e)
+  }
+  emit('changed')
+  void load()
+  return false
+}
+
 async function fill(item: DiscoveredBuyer, accountId: unknown) {
   const target = props.accounts.find((a) => a.id === Number(accountId))
   if (!target) return
+  busy.value = `fill-${item.customer_id}`
+  const open = await stillWithoutId(target, item.customer_id)
+  busy.value = null
+  if (!open) return
   const ok = await confirmAction({ message: fillConfirmText(item.customer_id, target.name), confirmText: '登记' })
   if (!ok) return
   busy.value = `fill-${item.customer_id}`
   try {
+    // 确认框可能停留了很久：发请求前再确认一次目标账号仍没有 ID
+    if (!(await stillWithoutId(target, item.customer_id))) return
     await accountsApi.updateAccount(target.id, { amazon_customer_id: item.customer_id })
     notifySuccess(`已把买家号 ID 登记到「${target.name}」`, registeredEffectText(item))
     emit('changed')
@@ -152,9 +182,7 @@ async function restore(item: DiscoveredBuyer) {
               </el-tooltip>
             </div>
             <p v-if="sourceOrdersText(item)" class="mt-1 text-xs font-medium text-gray-700 dark:text-gray-300" data-testid="source-orders">{{ sourceOrdersText(item) }}</p>
-            <p v-if="suggestedOf(item)" class="mt-1 text-xs text-amber-700 dark:text-amber-400">
-              来源里这个买家号叫「{{ item.name_hint }}」，已有同名账号还没登记买家号 ID，可以直接填到它上面。
-            </p>
+            <p v-if="suggestedOf(item)" class="mt-1 text-xs text-amber-700 dark:text-amber-400">{{ sameNameHint(item.name_hint ?? '') }}</p>
             <p v-else-if="item.name_hint" class="mt-1 text-xs text-gray-500 dark:text-dark-400">来源里这个买家号叫「{{ item.name_hint }}」。</p>
           </div>
           <div class="min-w-0 basis-48">

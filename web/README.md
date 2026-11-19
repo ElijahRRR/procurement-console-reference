@@ -41,6 +41,9 @@ tests/visual/screenshots.ts     截图脚本（Node 直接运行 .ts）
 - 分配方式三种：自动分配、人工改派、来源指定（来源 = 飞书表格或上传的表格；界面上只叫「来源指定」）。任务行与详情的 `designated_buyer` 是来源指定的买家号，没有指定为 null；只在有指定时才出现的内容（详情「分配」区的「来源指定的买家号」一行、解除分配确认与改派对话框里多出的话）都由 `utils/designation` 按它给出。分不出去的原因是服务端写的 `status_reason`，前端原样显示。
 - 分配摘要的 `stats.designated` 与待登记项的 `source_orders` 旧记录、旧服务端可能没有，显示时按 0；时间线里来源指定的买家号变化按 `detail.changes` 的扁平键显示「旧 → 新」，空写「未指定」（`utils/orderDetail.changesText`）。
 - 浏览器「当前登录」一栏的文字由 `utils/browsers.browserLoginView` 按登录状态给出，与插件面板的状态用词一致。
+- 「填到已有账号」的候选来自账号列表，可能已经过时：确认前与发请求前各重新读一次目标账号，它已经有买家号 ID 就不发请求（不替换别处登记的 ID）。「浏览器」页签里的「登记」先在待登记列表里找这个 ID，与待登记列表的「登记」打开同样的对话框（来源里的名称、来源指定了几笔任务；已有同名、没登记 ID 的账号时提示并可直接「填到」它）。
+- 飞书读取的问题（`problems`）在立即同步的提示、读取记录对话框、连接卡片三处用同一套文字（`utils/results.problemLines`）：说整个连接的问题（`scope = 'connection'`，如来源表里找不到买家号列）只写原因；定时读取遇到它时读取仍算成功（状态点「读取正常」），连接卡片按 `last_stats.problems` 显示提醒。读取记录对话框是列表（手机宽度下也完整可见），每次读取的问题样本先列 5 条、可展开。
+- 时间线里 `order.designation_not_adopted`（来源指定未采用）按 `detail.stated / previous / current` 写明来源写的与任务现有的指定（`utils/orderDetail.notAdoptedText`）。
 - 列表筛选全部交给服务端（视图 + `needs_attention` 等条件），total 按全部条件计数，前端不再二次过滤。
 - 下载（模板、导出、问题行）先 fetch 看状态：失败提示「动作失败：原因」，401 跳登录。
 - 顶栏显示页面名（路由 meta），页面标题（PageHeader）放本页自己的内容，不重复顶栏。

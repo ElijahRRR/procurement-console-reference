@@ -564,7 +564,7 @@ test("执行中换了买家号（进度 cancel_code IDENTITY_MISMATCH）：这�
   assert.equal(srv.state.account.execution_paused, false, "换登另一个买家号是正常操作，不暂停账号");
   assert.ok(logs.some((l) => l.text.includes(BUYER_CHANGED_TEXT)), "日志里是规格 §5 的那一句");
   assert.ok(views.some((v) => v.message === `${BUYER_CHANGED_TEXT}。`), "面板上也是");
-  assert.ok(logs.some((l) => /没有可执行的任务了：.*不是这个批次的买家号/.test(l.text)), "之后领取不下发，批次正常结束");
+  assert.ok(logs.some((l) => /没有可执行的任务了：浏览器登录的买家号变了（现在是 A9OTHER00000，这个批次的账号 环境-DEMO 登记的是 A1DEMO00000），停止领取/.test(l.text)), "之后领取不下发（服务端的原话），批次正常结束");
   assert.equal(s.status, "finished");
 });
 

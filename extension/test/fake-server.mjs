@@ -6,24 +6,40 @@
  *   · 插件入口闸（gate：{code, message} → 403，在认证之前，例如非本机对端、网页来源）；
  *   · 设备登记 `POST /register {device_token, ext_version?, workspace_id?}`（不要令牌头）：令牌形状不对 → 422；
  *     同一个令牌再登记 → 返回那一行、created=false（幂等）；没有工作区 → 409 CONFLICT；多个工作区且没带
- *     存在的 workspace_id → 409 WORKSPACE_REQUIRED；设备数到上限 → 429 RATE_LIMITED（registerRateLimit：
- *     detail.retry_after_s 与 Retry-After 头）；名称「浏览器 <id>」；
- *   · 版本闸：登记或心跳带来的 ext_version 低于 0.2.0 → 409 PLUGIN_OUTDATED；
+ *     存在的 workspace_id → 409 WORKSPACE_REQUIRED；工作区里还在用的浏览器到上限（maxDevices；移除了的不算）→
+ *     429 RATE_LIMITED「登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES」
+ *     （真实服务端 devices.MAX_DEVICES_MESSAGE；registerRateLimit 另可注入 detail.retry_after_s 与 Retry-After 头，
+ *     测插件的退避）；名称「浏览器 <id>」；
+ *   · 版本闸：登记、心跳、身份上报带来的 ext_version 低于 0.2.0 → 409 PLUGIN_OUTDATED（什么也不记）；
  *   · 其余接口带 Bearer 令牌，未知令牌 → 401 UNAUTHORIZED（forgetDevices() 模拟服务端换了库）；
- *   · 身份上报（心跳捎带或单独 `POST /identity`，返回同一形状）：清洗（customer_id 大写、形状不对当没读到，
- *     绝不报错）；设备登录状态 unknown / conflict / signed_out / no_id / signed_in；signed_in 时按买家号 ID
- *     解析成 ready（未归档账号登记了它）/ ignored / unregistered；stale = 超过 identity_fresh_s（默认 600 秒）；
- *   · 心跳形状 {device, login, account, device_run, server_time, bj_date, simulation_only}；account 只在 ready 时有，
- *     含 executable_today、future_assigned、active_run；
- *   · 开始批次 `POST /runs {customer_id, trigger, slot?, simulated}`，依次：缺 customer_id → 422；设备已有未结束
+ *   · 身份上报（心跳捎带或单独 `POST /identity`，返回同一形状，都清掉「已移除」）：清洗（customer_id 大写、
+ *     形状不对当没读到，绝不报错）；设备登录状态 unknown / conflict / signed_out / no_id / signed_in；signed_in 时
+ *     按买家号 ID 解析成 ready（未归档账号登记了它）/ ignored / unregistered；stale = 超过 identity_fresh_s
+ *     （默认 600 秒），**从没上报过的不算过期**（真实服务端 devices.identity_stale）；
+ *   · 心跳形状 {device, login, account, device_run, server_time, bj_date, simulation_only}；login.customer_id 只在
+ *     登录状态是 signed_in 时有（真实服务端 login_customer_id：有分歧、没登录、没读到 ID 时为 null）；account 只在
+ *     ready 时有，含 quota_today {limit, used, planned, available = max(0, limit − used − planned)}、executable_today、
+ *     future_assigned、active_run；
+ *   · 开始批次 `POST /runs {customer_id, trigger, slot?, simulated}`，依次（真实服务端 execution.start_run）：
+ *     trigger 不是 manual / scheduled → 422（缺省 manual）；simulated 不是布尔 → 422「simulated 必须是 true 或 false」
+ *     （在 DEVICE_BUSY 之前）；缺 customer_id → 422「插件版本过旧，请更新插件」；形状不对 → 422；设备已有未结束
  *     批次 → 409 DEVICE_BUSY（detail {run_id, account_name, since, lease_expires_at}）；登录状态不是 signed_in、
  *     ID 与请求不同、过期 → 403 IDENTITY_MISMATCH（detail {login_state, identity_at, stale}）；没有登记这个 ID
- *     的账号 → 403 ACCOUNT_NOT_REGISTERED；暂停 → 403 ACCOUNT_PAUSED；非模拟 → 403 REAL_PURCHASE_DISABLED；
- *     定时：缺 slot、账号不是定时模式、slot 不在执行时间里、北京时间还没到点 → 422，同一（账号、北京日期、slot）
- *     已有未结束或以 finished 结束的定时批次 → 409 SLOT_DONE；账号已有未结束批次 → 409 ACCOUNT_BUSY；
- *     返回 {run_id, lease_ttl_s, lease_expires_at, account: {id, name}}，租约按 lease_ttl_s 过期，只有批次心跳续租；
+ *     的账号 → 403 ACCOUNT_NOT_REGISTERED；暂停 → 403 ACCOUNT_PAUSED（detail {pause_reason, paused_at}）；
+ *     非模拟 → 403 REAL_PURCHASE_DISABLED；定时：没带 slot、slot 写法不对（两句不同的原话）、账号不是定时模式
+ *     （detail.purchase_mode）、slot 不在执行时间里（原话带上执行时间，detail.schedule_times）、北京时间还没到点
+ *     → 422（真实服务端 _norm_slot / _check_slot）；同一（账号、北京日期、slot）
+ *     已有**以 finished 结束**的定时批次 → 409 SLOT_DONE；账号已有未结束批次（包括同一个时间点**还在执行**的
+ *     定时批次）→ 409 ACCOUNT_BUSY（带持有者，插件下一分钟再问）；那个批次没跑完就结束（租约过期、buyer 项拦截、
+ *     清除模拟结果）时时间点重新空出来，再问就能开始；
+ *     返回 {run_id, lease_ttl_s, lease_expires_at, account: {id, name}}，租约按 lease_ttl_s 过期（到期那一刻起就算
+ *     过期），只有批次心跳续租；
  *   · 执行中的身份检查（领取、进度、提交登记）：这台设备最新的登录状态是 signed_in、买家号 ID 等于批次账号
  *     **当前**登记的 ID、且不过期；批次心跳 stop_reason 取 account_paused / account_archived / identity_mismatch；
+ *   · 领取不到时的原因照真实服务端 next_attempt 的次序：暂停、归档、买家号不符、身份过期、当天额度已用完
+ *     （「账号 N 今天（日期）的额度已用完：已占用 U / 上限 L」；占用 = 当天这个账号没有失败或中止的尝试，
+ *     account.used_today 可预置），账号在别的批次还有在途尝试（「账号还有一笔进行中的采购尝试（#N），等它结束后
+ *     再领取」）；
  *   · 领取（同一批次已有在途尝试 → 409 ATTEMPT_IN_FLIGHT）。领取时复核来源指定：任务上来源指定的买家号已经不是
  *     这个账号（task.off_target，真实服务端 designation.off_target）→ 解除分配回待分配、跳过这一笔，领不到任务时
  *     原因里带「N 笔来源指定的买家号已不是本账号、已解除分配」。插件不看分配方式，只把原因写进日志；
@@ -48,13 +64,15 @@
  *     200 duplicate，别的 → 409 CONFLICT；设备心跳的 device_run、account.active_run 为 null；重新开始批次马上可以，
  *     新批次会再领到这一笔。被它结束的定时批次不占时间点（只有 finished 才占）；
  *   · 提交登记：不在 guard_passed → 409（detail.attempt_status，已登记的是 submitting）、任务已取消 → 409、
+ *     任务已不在执行这一笔（控制台改了它）→ 409「任务状态已变化，不能提交」（detail.order_status）、
  *     账号归档 → 409、暂停 → 409 ACCOUNT_PAUSED、买家号不符或过期 → 409 IDENTITY_MISMATCH（detail.login_state /
  *     stale）、来源暂停或有变化 → 409 SOURCE_CHANGED（detail.fields）、按最新配置对存下的结算事实复核护栏不过 →
  *     409 GUARD_BLOCKED（detail {block_code, reasons}，什么都没改；buyer 项除外，见上一条）；
  *   · 结果处理表（账号级错误暂停账号、PAGE_LOAD_FAILED 首次重试、登记后非成功 → unknown、
  *     中止类（含 ABORTED_BY_SERVER、IDENTITY_MISMATCH）回已分配、**不暂停账号**，再按领取后的来源变化重新定状态
  *     （task.drift.to），未知错误码按任务级失败）；已结束的尝试再报同一份 → 200 duplicate；
- *     已是 unknown 而这次不同 → 409 detail.late_receipt_recorded；其他不同 → 409；
+ *     已是 unknown 而这次不同、或已由控制台核实（resolve(attemptId, "ordered" | "not_ordered")）而这次不同 →
+ *     409 detail.late_receipt_recorded（回执记下，不改结论）；其他不同 → 409；
  *     未登记提交、批次已失效 → LEASE_LOST；**结果上报、结束批次不做身份检查**；
  *   · 结束批次 {reason, detail?} → {run_id, ended_at, end_reason, stats}：end_reason 是封闭取值（finished /
  *     lease_expired / simulation_reset / identity_mismatch），插件结束的恒为 finished，插件给的短码记为
@@ -64,6 +82,9 @@
  *     detail {run_id, end_reason}；租约过期 →「执行权已超时（租约过期），请重新开始批次」，
  *     detail {run_id, lease_expires_at}；
  *   · 批次统计 stats：claimed / succeeded / failed / blocked / unknown / aborted（真实服务端 _bump）。
+ *
+ * 测试用的几个直接操作：setLogin（这台设备刚上报了这一份身份）、forgetDevices（服务端换了库）、sweep（租约清扫）、
+ * resolve（控制台核实一笔结果待核实的尝试）。
  *
  * 为了让引擎、客户端测试不用先走一遍登记：缺省预先登记一个浏览器（令牌 DEMO_TOKEN，登着账号的买家号、
  * 刚上报过身份）。后台测试传 preRegistered: false，让真正的后台自己生成令牌、自己登记。
@@ -83,6 +104,8 @@ const err = (status, code, message, detail = null, headers = {}) => json(status,
 
 /** 预先登记的那个浏览器的令牌（形状合格的假值）。 */
 export const DEMO_TOKEN = "demo-token-000000000000000000000000001";
+/** 工作区里还在用的浏览器到上限时，新登记得到的 429 说明（真实服务端 devices.MAX_DEVICES_MESSAGE）。 */
+export const MAX_DEVICES_MESSAGE = "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES";
 /** 演示账号登记的买家号 ID、另一个买家号 ID（都是假值）。 */
 export const DEMO_CID = "A1DEMO00000";
 export const OTHER_CID = "A9OTHER00000";
@@ -90,6 +113,10 @@ export const OTHER_CID = "A9OTHER00000";
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
 const CUSTOMER_ID_RE = /^A[0-9A-Z]{8,}$/;
 const MIN_EXT_VERSION = [0, 2, 0];
+
+/** 版本闸的 409（真实服务端 devices.check_ext_version）。 */
+const outdatedErr = (v) =>
+  err(409, "PLUGIN_OUTDATED", "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）", { ext_version: String(v).trim(), min_ext_version: "0.2.0" });
 
 /** 输入：版本文本 → 输出：能解析且低于 0.2.0。缺失或解析不了不拦。 */
 function outdated(v) {
@@ -180,6 +207,8 @@ const CHECK_ORDER = [
   ["buyer", "IDENTITY_MISMATCH"], ["item", "ITEM_MISMATCH"], ["zip", "ZIP_MISMATCH"], ["subtotal", "SUBTOTAL_OUT_OF_RANGE"],
   ["price_cap", "PRICE_OVER_CAP"], ["delivery", "DELIVERY_TOO_LONG"], ["data", "DATA_UNRELIABLE"], ["card", "CARD_MISMATCH"],
 ];
+/** 上报结局的中文（真实服务端 execution._OUTCOME_ZH）。 */
+const OUTCOME_ZH = { succeeded: "成功", failed: "失败", unknown: "结果不明" };
 const STATUS_ZH = { claimed: "已领取", checking: "结算中", guard_passed: "护栏已放行", submitting: "已登记提交", verifying: "等待验证", succeeded: "成功", failed: "失败", unknown: "结果待核实", aborted: "已中止" };
 
 /** 输入：初始数据与选项 → 输出：{ fetch, state, calls, count(path 片段), now, setNow }。 */
@@ -267,7 +296,8 @@ export function createFakeServer(opts = {}) {
   const runOf = (id) => state.runs.get(Number(id));
   const attemptOf = (id) => state.attempts.get(Number(id));
   const taskOf = (a) => state.tasks.find((t) => t.id === a.task_id);
-  const runActive = (run) => run && !run.ended && clock <= run.lease_until;
+  // 真实服务端 _require_active：lease_expires_at <= now 即过期（到期那一刻起不再有效）
+  const runActive = (run) => run && !run.ended && clock < run.lease_until;
   const iso = (ms) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
   /** 批次失效的答复（真实服务端 _require_active）：已结束的带结束原因，租约过期的带过期时刻。 */
   const leaseLost = (run) =>
@@ -303,23 +333,29 @@ export function createFakeServer(opts = {}) {
     if (acc) return { state: "ready", account: acc };
     return { state: state.ignored.has(dev.identity.customer_id) ? "ignored" : "unregistered", account: null };
   }
-  const identityStale = (dev) => dev.identityAt === null || clock - dev.identityAt > identityFreshS * 1000;
+  /** 真实服务端 devices.identity_stale：从没上报过（identity_at 为空）不算过期，那是登录状态 unknown 的事。 */
+  const identityStale = (dev) => dev.identityAt !== null && clock - dev.identityAt > identityFreshS * 1000;
   const STALE_TEXT = `插件超过 ${Math.max(1, Math.floor(identityFreshS / 60))} 分钟没有上报登录状态`;
+  /** 登录状态不是 signed_in 时的说明（真实服务端 execution._LOGIN_PROBLEM_ZH，开始批次与执行中共用）。 */
   const LOGIN_PROBLEM = {
-    unknown: "插件还没有读到这个浏览器的登录状态，请打开或刷新亚马逊页面后重试",
+    unknown: "插件还没有上报这个浏览器的登录状态，请打开或刷新亚马逊页面后重试",
     conflict: "这个浏览器的亚马逊标签页显示的买家号不一致，请刷新或关闭较早打开的标签页",
     signed_out: "浏览器没有登录亚马逊",
-    no_id: "这个浏览器已登录亚马逊，但没有读到买家号 ID，请打开订单页后重试",
+    no_id: "插件没有读到浏览器登录的买家号 ID，请打开亚马逊订单页后重试",
   };
   /** 执行中的身份检查（真实服务端 _identity_problem）：这台设备登着的不是批次账号**当前**登记的买家号时的原话。 */
   function identityProblem(dev, acc) {
     const st = loginState(dev);
     if (st !== "signed_in") return LOGIN_PROBLEM[st];
+    if (!acc.amazon_customer_id) return `账号 ${acc.name} 现在没有登记买家号 ID`;
     if (dev.identity.customer_id !== acc.amazon_customer_id) {
-      return `浏览器登录的买家号（${dev.identity.customer_id}）不是这个批次的买家号（账号 ${acc.name}：${acc.amazon_customer_id ?? "未登记"}）`;
+      return `浏览器登录的买家号变了（现在是 ${dev.identity.customer_id}，这个批次的账号 ${acc.name} 登记的是 ${acc.amazon_customer_id}）`;
     }
     return null;
   }
+  /** 当天已占用的额度（真实服务端 quota.used：这个账号今天没有失败、中止的尝试；account.used_today 是预置的基数）。 */
+  const usedToday = (acc) =>
+    (acc.used_today ?? 0) + [...state.attempts.values()].filter((a) => a.account_id === acc.id && a.bj_date === bjDate(clock) && a.status !== "failed" && a.status !== "aborted").length;
   function storeIdentity(dev, raw, via) {
     dev.identity = cleanIdentity(raw);
     dev.identityAt = clock;
@@ -336,12 +372,12 @@ export function createFakeServer(opts = {}) {
     const foreign = acc && acc.id === state.account.id ? state.foreignRun : null;
     return {
       device: { id: dev.id, name: dev.name },
-      login: { state: st, customer_id: dev.identity?.customer_id ?? null, at: iso(dev.identityAt), stale: dev.identityAt !== null && identityStale(dev) },
+      login: { state: st, customer_id: loginCustomerId(dev), at: iso(dev.identityAt), stale: identityStale(dev) },
       account: acc ? {
         id: acc.id, name: acc.name, amazon_customer_id: acc.amazon_customer_id, purchase_enabled: acc.purchase_enabled !== false,
         execution_paused: acc.execution_paused, pause_reason: acc.pause_reason, purchase_mode: acc.purchase_mode,
         schedule_times: acc.schedule_times, effective_max_delivery_days: acc.max_delivery_days,
-        quota_today: { limit: acc.daily_limit, used: 0, planned: tasks.length, available: acc.daily_limit },
+        quota_today: { limit: acc.daily_limit, used: usedToday(acc), planned: tasks.length, available: Math.max(0, acc.daily_limit - usedToday(acc) - tasks.length) },
         executable_today: tasks.filter((t) => !t.future && !t.hold).length,
         future_assigned: tasks.filter((t) => t.future).length,
         active_run: holder
@@ -474,6 +510,14 @@ export function createFakeServer(opts = {}) {
     run.stats[key] = (run.stats[key] ?? 0) + 1;
   }
 
+  /** 暂停账号（真实服务端 accounts.pause）：更新原因，已暂停时保留最初的暂停时刻（恢复会清掉它；测试里直接把
+   *  execution_paused 改回 false 的，按没暂停过算）。 */
+  function pauseAccount(acc, reason) {
+    acc.paused_at = acc.execution_paused && acc.paused_at != null ? acc.paused_at : clock;
+    acc.execution_paused = true;
+    acc.pause_reason = reason;
+  }
+
   /** 尝试被迫结束（结束批次、清扫）：已登记 → unknown + 暂停；否则 aborted、任务回已分配。 */
   function settleInflight(a, cause) {
     const t = taskOf(a);
@@ -481,8 +525,7 @@ export function createFakeServer(opts = {}) {
       finishAttempt(a, "unknown", { error_detail: cause });
       t.status = "result_unknown";
       const acc = accountOf(runOf(a.run_id));
-      acc.execution_paused = true;
-      acc.pause_reason = "结果待核实";
+      pauseAccount(acc, "结果待核实");
       bump(runOf(a.run_id), "unknown");
     } else {
       finishAttempt(a, "aborted", { error_detail: cause });
@@ -532,10 +575,12 @@ export function createFakeServer(opts = {}) {
   /** 设备登记（不要令牌头）。 */
   function register(body) {
     const rl = opts.registerRateLimit;
-    if (rl) return err(429, "RATE_LIMITED", "登记的浏览器太多：请稍后再试", rl.retry_after_s === undefined ? {} : { retry_after_s: rl.retry_after_s }, rl.header === undefined && rl.retry_after_s === undefined ? {} : { "retry-after": String(rl.header ?? rl.retry_after_s) });
+    if (rl) return err(429, "RATE_LIMITED", MAX_DEVICES_MESSAGE, rl.retry_after_s === undefined ? {} : { retry_after_s: rl.retry_after_s }, rl.header === undefined && rl.retry_after_s === undefined ? {} : { "retry-after": String(rl.header ?? rl.retry_after_s) });
     const token = body.device_token;
-    if (typeof token !== "string" || !TOKEN_RE.test(token)) return err(422, "VALIDATION", "设备令牌格式不对");
-    if (outdated(body.ext_version)) return err(409, "PLUGIN_OUTDATED", "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）");
+    if (typeof token !== "string" || !TOKEN_RE.test(token)) {
+      return err(422, "VALIDATION", "浏览器令牌格式不对（应为 32–128 位字母、数字、下划线或连字符）", { field: "device_token" });
+    }
+    if (outdated(body.ext_version)) return outdatedErr(body.ext_version);
     state.registrations.push({ at: clock, token, workspace_id: body.workspace_id ?? null, ext_version: body.ext_version ?? null });
     let dev = state.tokens.get(token);
     let created = false;
@@ -547,8 +592,9 @@ export function createFakeServer(opts = {}) {
       if (state.workspaces.length === 1) ws = state.workspaces[0];
       else ws = state.workspaces.find((w) => w.id === body.workspace_id) ?? null;
       if (!ws) return err(409, "WORKSPACE_REQUIRED", "系统里有多个工作区：请在插件设置的「工作区 ID」里填写（控制台「设置」页可以查到）");
-      if (opts.maxDevices !== undefined && state.devices.filter((d) => d.workspace_id === ws.id).length >= opts.maxDevices) {
-        return err(429, "RATE_LIMITED", "登记的浏览器太多：请稍后再试");
+      // 只数还在用的浏览器（真实服务端还排除过了保留期没联系的；这里没有时间维度，只排除移除了的）
+      if (opts.maxDevices !== undefined && state.devices.filter((d) => d.workspace_id === ws.id && !d.hidden).length >= opts.maxDevices) {
+        return err(429, "RATE_LIMITED", MAX_DEVICES_MESSAGE);
       }
       dev = addDevice(token, ws);
       created = true;
@@ -557,12 +603,20 @@ export function createFakeServer(opts = {}) {
     return json(200, { device_id: dev.id, device_name: dev.name, workspace_id: dev.workspace_id, workspace_name: dev.workspace_name, created });
   }
 
-  /** 开始批次（规格 §2.5 的顺序）。 */
+  /** ACCOUNT_BUSY 的原话（真实服务端 execution._busy）。 */
+  const busyText = (acc, deviceName, sinceMs) =>
+    `账号 ${acc.name} 正由浏览器「${deviceName}」执行（北京时间 ${new Date(sinceMs + 8 * 3600_000).toISOString().slice(5, 16).replace("T", " ")} 起），同一账号同时只能有一个执行者`;
+
+  /** 开始批次（真实服务端 execution.start_run 的顺序）。 */
   function startRun(dev, body) {
-    if (body.customer_id === undefined || body.customer_id === null) return err(422, "VALIDATION", "插件版本过旧，请更新插件");
-    const cid = typeof body.customer_id === "string" ? body.customer_id.trim().toUpperCase() : "";
-    if (!CUSTOMER_ID_RE.test(cid)) return err(422, "VALIDATION", "买家号 ID 格式不对");
-    if (body.trigger !== "manual" && body.trigger !== "scheduled") return err(422, "VALIDATION", "触发方式不对");
+    const trigger = body.trigger === undefined ? "manual" : body.trigger;
+    if (trigger !== "manual" && trigger !== "scheduled") return err(422, "VALIDATION", "触发方式只能是 manual 或 scheduled", { field: "trigger" });
+    if (typeof body.simulated !== "boolean") return err(422, "VALIDATION", "simulated 必须是 true 或 false", { field: "simulated" });
+    if (body.customer_id === undefined || body.customer_id === null || (typeof body.customer_id === "string" && !body.customer_id.trim())) {
+      return err(422, "VALIDATION", "插件版本过旧，请更新插件", { field: "customer_id" });
+    }
+    const cid = typeof body.customer_id === "string" ? body.customer_id.replace(/\s+/g, "").toUpperCase() : "";
+    if (cid.length > 64 || !CUSTOMER_ID_RE.test(cid)) return err(422, "VALIDATION", "买家号 ID 格式不对（应以 A 开头，至少 9 位字母或数字）", { field: "customer_id" });
     const mine = runOfDevice(dev);
     if (mine) {
       return err(409, "DEVICE_BUSY", "这个浏览器上一个批次还没有结束", {
@@ -570,39 +624,56 @@ export function createFakeServer(opts = {}) {
       });
     }
     const st = loginState(dev);
-    const stale = identityStale(dev);
+    const stale = identityStale(dev); // 从没上报过的不算过期（detail.stale = false），由 login_state = unknown 说明
     const detail = { login_state: st, identity_at: iso(dev.identityAt), stale };
     if (st !== "signed_in") return err(403, "IDENTITY_MISMATCH", LOGIN_PROBLEM[st], detail);
     if (dev.identity.customer_id !== cid) return err(403, "IDENTITY_MISMATCH", "页面上的买家号与插件最近上报的不一致，请刷新亚马逊页面后重试", detail);
     if (stale) return err(403, "IDENTITY_MISMATCH", `${STALE_TEXT}，请打开或刷新亚马逊页面后重试`, detail);
     const acc = registered(cid);
-    if (!acc) return err(403, "ACCOUNT_NOT_REGISTERED", "这个买家号还没有登记：请在控制台「账号」页登记后再开始");
-    if (acc.execution_paused) return err(403, "ACCOUNT_PAUSED", `账号已暂停执行${acc.pause_reason ? `：${acc.pause_reason}` : ""}`);
-    if (body.simulated !== true) return err(403, "REAL_PURCHASE_DISABLED", "本阶段只允许模拟执行");
+    if (!acc) return err(403, "ACCOUNT_NOT_REGISTERED", "这个买家号还没有登记：请在控制台「账号」页登记后再开始", { customer_id: cid });
+    if (acc.execution_paused) {
+      // 真实服务端暂停时总会记下 paused_at（COALESCE(paused_at, now)）；测试直接改标志、没写时刻时按「刚刚暂停」
+      return err(403, "ACCOUNT_PAUSED", `账号 ${acc.name} 已暂停执行：${acc.pause_reason ?? "人工暂停"}`, {
+        pause_reason: acc.pause_reason ?? null, paused_at: iso(acc.paused_at ?? clock),
+      });
+    }
+    if (body.simulated !== true) return err(403, "REAL_PURCHASE_DISABLED", "本阶段只允许模拟执行，服务端拒绝真实采购批次");
     let slot = null;
-    if (body.trigger === "scheduled") {
+    if (trigger === "scheduled") {
+      // 真实服务端 execution._norm_slot：没带（或空白）与写法不对是两句话
+      if (body.slot === undefined || body.slot === null || (typeof body.slot === "string" && !body.slot.trim())) {
+        return err(422, "VALIDATION", "定时执行需要带上时间点（slot，北京时间 HH:MM）", { field: "slot" });
+      }
       const m = typeof body.slot === "string" ? /^\s*(\d{1,2}):(\d{2})\s*$/.exec(body.slot) : null;
-      if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) return err(422, "VALIDATION", "定时执行需要带上时间点（slot，北京时间 HH:MM）", { field: "slot" });
+      if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) return err(422, "VALIDATION", "时间点格式不对（应为北京时间 HH:MM）", { field: "slot" });
       slot = `${m[1].padStart(2, "0")}:${m[2]}`;
-      if (acc.purchase_mode !== "scheduled") return err(422, "VALIDATION", `账号 ${acc.name} 不是定时执行模式，不能按时间点开始`, { field: "slot" });
-      if (!acc.schedule_times.includes(slot)) return err(422, "VALIDATION", `时间点 ${slot} 不在账号 ${acc.name} 的执行时间里`, { field: "slot" });
+      // 真实服务端 execution._check_slot：detail 带账号的执行方式 / 执行时间
+      if (acc.purchase_mode !== "scheduled") {
+        return err(422, "VALIDATION", `账号 ${acc.name} 不是定时执行模式，不能按时间点开始`, { field: "slot", purchase_mode: acc.purchase_mode });
+      }
+      const times = [...(acc.schedule_times ?? [])];
+      if (!times.includes(slot)) {
+        return err(422, "VALIDATION", `时间点 ${slot} 不在账号 ${acc.name} 的执行时间里（${times.join("、") || "未设置"}）`, { field: "slot", schedule_times: times });
+      }
       if (bjHm(clock) < slot) return err(422, "VALIDATION", `北京时间还没有到 ${slot}，不能开始这个时间点的批次`, { field: "slot" });
-      const taken = [...state.runs.values()].some((r) => r.account_id === acc.id && r.trigger === "scheduled" && r.bj_date === bjDate(clock) && r.scheduled_slot === slot && (!r.ended || r.end_reason === "finished"));
-      if (taken) return err(409, "SLOT_DONE", "这个时间点今天已经执行过");
+      // 只有以 finished 结束的才算「已经执行过」（真实服务端 _slot_finished）。同一个时间点的批次还在执行时
+      // 走下面的占用检查回 ACCOUNT_BUSY：它可能没跑完就结束，那时时间点重新空出来。
+      const done = [...state.runs.values()].some((r) => r.account_id === acc.id && r.trigger === "scheduled" && r.bj_date === bjDate(clock) && r.scheduled_slot === slot && r.ended && r.end_reason === "finished");
+      if (done) return err(409, "SLOT_DONE", "这个时间点今天已经执行过");
     }
     if (state.foreignRun && acc.id === state.account.id) {
-      return err(409, "ACCOUNT_BUSY", `账号 ${acc.name} 正由浏览器「${state.foreignRun.device_name}」执行`, {
+      return err(409, "ACCOUNT_BUSY", busyText(acc, state.foreignRun.device_name, Date.parse(state.foreignRun.since)), {
         holder_device_id: state.foreignRun.device_id, holder_device_name: state.foreignRun.device_name, since: state.foreignRun.since,
       });
     }
     const holder = runOfAccount(acc);
     if (holder) {
-      return err(409, "ACCOUNT_BUSY", `账号 ${acc.name} 正由浏览器「${deviceOf(holder).name}」执行`, {
+      return err(409, "ACCOUNT_BUSY", busyText(acc, deviceOf(holder).name, holder.started_at), {
         holder_device_id: holder.device_id, holder_device_name: deviceOf(holder).name, since: iso(holder.started_at),
       });
     }
     const run = {
-      id: state.nextRunId++, trigger: body.trigger, account_id: acc.id, device_id: dev.id, customer_id: cid, scheduled_slot: slot, bj_date: bjDate(clock),
+      id: state.nextRunId++, trigger, account_id: acc.id, device_id: dev.id, customer_id: cid, scheduled_slot: slot, bj_date: bjDate(clock),
       started_at: clock, lease_until: clock + leaseTtlS * 1000, ended: false, ended_at: null, stop: false, stop_reason: null, end_reason: null,
       plugin_reason: null, finish_detail: null, beats: 0, stats: {},
     };
@@ -613,12 +684,15 @@ export function createFakeServer(opts = {}) {
   function route(path, body, dev) {
     let m;
     if (path === "/plugin/v1/heartbeat") {
-      if (outdated(body.ext_version)) return err(409, "PLUGIN_OUTDATED", "插件版本过旧：请重新构建并加载新版插件（需要 0.2.0 及以上）");
+      if (outdated(body.ext_version)) return outdatedErr(body.ext_version);
       dev.hidden = false;
       if (body.identity) storeIdentity(dev, body.identity, "heartbeat");
       return json(200, statusOut(dev));
     }
     if (path === "/plugin/v1/identity") {
+      // 真实服务端 report_identity = 带身份的心跳：同样先过版本闸（什么也不记）、清掉「已移除」
+      if (outdated(body.ext_version)) return outdatedErr(body.ext_version);
+      dev.hidden = false;
       storeIdentity(dev, body, "identity");
       return json(200, statusOut(dev));
     }
@@ -644,6 +718,12 @@ export function createFakeServer(opts = {}) {
       if (sr === "account_archived") return json(200, { attempt: null, reason: "账号已归档，停止领取" });
       if (sr !== null) return json(200, { attempt: null, reason: `${identityProblem(dev, acc)}，停止领取` });
       if (identityStale(dev)) return json(200, { attempt: null, reason: `${STALE_TEXT}，停止领取（请打开或刷新亚马逊页面后重新开始）` });
+      const used = usedToday(acc);
+      if (used >= acc.daily_limit) {
+        return json(200, { attempt: null, reason: `账号 ${acc.name} 今天（${bjDate(clock)}）的额度已用完：已占用 ${used} / 上限 ${acc.daily_limit}` });
+      }
+      const elsewhere = [...state.attempts.values()].find((a) => a.account_id === acc.id && IN_FLIGHT.has(a.status));
+      if (elsewhere) return json(200, { attempt: null, reason: `账号还有一笔进行中的采购尝试（#${elsewhere.id}），等它结束后再领取` });
       if (hooks.beforeClaim) { const r = hooks.beforeClaim(state); if (r) return json(200, r); }
       // 领取时复核来源指定（真实服务端 designation.off_target）：来源指定的买家号已经不是这个账号 → 解除分配回待分配、跳过
       let redesignated = 0;
@@ -664,7 +744,8 @@ export function createFakeServer(opts = {}) {
         return json(200, { attempt: null, reason: `今天没有可执行的任务${extras.length ? `（${extras.join("，")}）` : ""}` });
       }
       t.status = "executing";
-      const a = { id: state.nextAttemptId++, task_id: t.id, run_id: run.id, attempt_no: [...state.attempts.values()].filter((x) => x.task_id === t.id).length + 1, status: "claimed", submitted_at: null, guard: null, guard_input: null, guards: 0, submits: 0, results: [] };
+      const a = { id: state.nextAttemptId++, task_id: t.id, run_id: run.id, account_id: acc.id, bj_date: bjDate(clock), attempt_no: [...state.attempts.values()].filter((x) => x.task_id === t.id).length + 1, status: "claimed", submitted_at: null, resolution: null, guard: null, guard_input: null, guards: 0, submits: 0, results: [] };
+      t.current_attempt_id = a.id;
       state.attempts.set(a.id, a);
       bump(run, "claimed");
       if (hooks.afterClaim) hooks.afterClaim(t, a, state);
@@ -711,7 +792,7 @@ export function createFakeServer(opts = {}) {
           if (acc.archived) return stop("ACCOUNT_ARCHIVED", "账号已归档");
           if (acc.execution_paused) return stop("ACCOUNT_PAUSED", `账号已暂停执行：${acc.pause_reason ?? "人工暂停"}`);
           if (identityProblem(dev, acc)) return stop("IDENTITY_MISMATCH", identityProblem(dev, acc));
-          if (identityStale(dev)) return stop("IDENTITY_STALE", `${STALE_TEXT}，登录状态已过期`);
+          if (identityStale(dev)) return stop("IDENTITY_STALE", STALE_TEXT); // 真实服务端 _progress_stop 的原话
           if (t.hold) return stop("SOURCE_HOLD", `${t.hold.text}，未提交前中止`);
           if (t.drift) return stop("SOURCE_CHANGED", `${t.drift.text}，未提交前中止`);
         }
@@ -750,6 +831,8 @@ export function createFakeServer(opts = {}) {
           return err(409, "CONFLICT", msg, { attempt_status: a.status });
         }
         if (t.cancelled) return err(409, "CONFLICT", "上游已取消，不能提交", { order_status: t.status });
+        // 真实服务端 _owns：任务还在执行**这一笔**（控制台改派、退回之类会让它不再是）
+        if (t.status !== "executing" || t.current_attempt_id !== a.id) return err(409, "CONFLICT", "任务状态已变化，不能提交", { order_status: t.status });
         if (acc.archived) return err(409, "CONFLICT", "账号已归档，不能提交");
         if (acc.execution_paused) return err(409, "ACCOUNT_PAUSED", `账号已暂停执行（${acc.pause_reason ?? "人工暂停"}），不能提交`);
         if (identityProblem(dev, acc)) return err(409, "IDENTITY_MISMATCH", `${identityProblem(dev, acc)}，不能提交`, { login_state: loginState(dev), stale: false, identity_at: iso(dev.identityAt) });
@@ -796,10 +879,21 @@ export function createFakeServer(opts = {}) {
       if (FINAL.has(a.status)) {
         const same = a.status === target && (target === "succeeded" ? a.amazon_order_no === body.amazon_order_no : (a.error_code ?? null) === (body.error_code ?? null));
         if (same) return json(200, { attempt_status: a.status, order_status: t.status, duplicate: true });
+        const what = OUTCOME_ZH[body.outcome] ?? body.outcome;
         if (a.status === "unknown") {
           state.lateReceipts.push({ attempt_id: a.id, body });
-          return err(409, "CONFLICT", "该采购尝试已登记为「结果待核实」，迟到的结果已记录，请在控制台核实",
+          return err(409, "CONFLICT", `该采购尝试已登记为「结果待核实」，迟到的结果（${what}）已记录，请在控制台核实`,
             { attempt_status: "unknown", order_status: t.status, late_receipt_recorded: true });
+        }
+        if (a.resolution === "ordered" || a.resolution === "not_ordered") {
+          // 已由控制台核实（真实服务端 _late_receipt_after_resolution）：只记下，不改尝试与核实结论
+          state.lateReceipts.push({ attempt_id: a.id, body, resolution: a.resolution });
+          const contradicts = body.outcome === "succeeded" && !!body.amazon_order_no
+            && (a.resolution === "not_ordered" || body.amazon_order_no !== a.amazon_order_no);
+          const resZh = a.resolution === "ordered" ? "已下单" : "未下单";
+          return err(409, "CONFLICT",
+            `该采购尝试已人工核实为「${resZh}」，迟到的结果（${what}）已记录${contradicts ? "，与核实结论矛盾，请在控制台核实是否重复下单" : "，不改变核实结论"}`,
+            { attempt_status: a.status, order_status: t.status, late_receipt_recorded: true });
         }
         return err(409, "CONFLICT", `该采购尝试的结果已登记为「${STATUS_ZH[a.status]}」，与本次上报不一致`, { attempt_status: a.status, reported: body.outcome });
       }
@@ -811,7 +905,7 @@ export function createFakeServer(opts = {}) {
       }
       if (target === "unknown") {
         finishAttempt(a, "unknown", { error_code: body.error_code ?? null }); t.status = "result_unknown";
-        acc.execution_paused = true; acc.pause_reason = "结果待核实";
+        pauseAccount(acc, "结果待核实");
         bump(run, "unknown");
         return json(200, { attempt_status: "unknown", order_status: t.status });
       }
@@ -824,7 +918,7 @@ export function createFakeServer(opts = {}) {
       const category = categories[body.error_code ?? ""] ?? "task";
       finishAttempt(a, "failed", { error_code: body.error_code });
       if (category === "account") {
-        release(t); acc.execution_paused = true; acc.pause_reason = ACCOUNT_ZH[body.error_code] ?? "账号级错误";
+        release(t); pauseAccount(acc, ACCOUNT_ZH[body.error_code] ?? "账号级错误");
       } else if (category === "retry_once") {
         t.page_load_failures += 1;
         if (t.page_load_failures >= 2) t.status = "exception"; else release(t);
@@ -885,5 +979,32 @@ export function createFakeServer(opts = {}) {
     /** 服务端换了库（或这一行被清理了）：所有令牌都不认识了。之后带令牌的请求回 401，重新登记得到新的一行。 */
     forgetDevices: () => { state.tokens.clear(); state.devices.length = 0; state.device = null; },
     loginState: (dev = state.device) => resolveLogin(dev).state,
+    /** 租约清扫（真实服务端 execution.sweep 的批次部分）：租约已过期、还没结束的批次按 lease_expired 结束，在途尝试
+     *  照结束批次的规则落地（未登记提交的回已分配）。输出：结束了的批次 id。定时批次被这样结束后不占时间点。 */
+    sweep: () => {
+      const ended = [];
+      for (const r of state.runs.values()) {
+        if (!r.ended && clock >= r.lease_until) {
+          endRun(r, "lease_expired");
+          ended.push(r.id);
+        }
+      }
+      return ended;
+    },
+    /** 控制台核实一笔结果待核实的尝试（真实服务端 orders.resolve_unknown）：ordered → 尝试成功（记单号）、任务已采购；
+     *  not_ordered → 尝试失败、任务回已分配。之后插件再送来的不同回执按迟到回执记下（409 late_receipt_recorded）。 */
+    resolve: (attemptId, resolution, amazonOrderNo = null) => {
+      const a = attemptOf(attemptId);
+      const t = taskOf(a);
+      a.resolution = resolution;
+      if (resolution === "ordered") {
+        a.status = "succeeded";
+        a.amazon_order_no = amazonOrderNo;
+        t.status = "purchased";
+      } else {
+        a.status = "failed";
+        t.status = "assigned";
+      }
+    },
   };
 }

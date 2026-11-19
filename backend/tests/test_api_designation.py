@@ -716,6 +716,10 @@ def test_feishu_sync_reports_a_missing_buyer_column_and_keeps_the_designation(ow
     row = find_order(owner, "PO-DEMO-S0001")
     assert (row["assignment_kind"], row["assigned_account"]["id"]) == ("source", b["id"])
     assert row["designated_buyer"]["customer_id"] == ID_B and row["source_kinds"] == ["feishu", "file"]
+    # 提交之后，批次的问题行里也留着这一句（上传预览、批次行、飞书样本预览看得到；飞书读取结果的 problems 不带它）
+    committed = ok(owner.get(f"/api/v1/imports/{up['batch_id']}/rows", params={"verdict": "problems"}))["rows"]
+    assert [r["upstream_order_no"] for r in committed] == ["PO-DEMO-S0001"]
+    assert f"文件来源的买家号「{ID_A}」与任务现有的指定「{ID_B}」不同，{ADVICE}" in committed[0]["issues"]
     # 没采用的那一句不只在预览里：任务时间线上有一条 order.designation_not_adopted
     events = [e for e in ok(owner.get(f"/api/v1/orders/{row['id']}"))["events"]
               if e["kind"] == "order.designation_not_adopted"]

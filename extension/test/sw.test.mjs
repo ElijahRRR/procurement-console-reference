@@ -234,7 +234,7 @@ test("服务端晚启动：登记失败按 5 / 15 / 60 秒退避 —— 退避�
   }
 });
 
-test("登记被限速（429）：按服务端给的 retry_after_s 等（没有则 60 秒），等待期间自动与手动都不发", async () => {
+test("登记被拒（429：工作区里还在用的浏览器到了上限）：面板照服务端的原话写明怎么办；按服务端给的 retry_after_s 等（没有则 60 秒），等待期间自动与手动都不发", async () => {
   const T = Date.parse("2026-11-18T06:00:00Z");
   mock.timers.enable({ apis: ["Date"], now: T });
   try {
@@ -243,7 +243,7 @@ test("登记被限速（429）：按服务端给的 retry_after_s 等（没有�
     let reg = await get(env.local, "pc.registration");
     assert.deepEqual([reg.code, reg.next_at, reg.halted], ["RATE_LIMITED", T + 42_000, false]);
     const st = await state(env);
-    assert.equal(panelStatus(st).text, "连接失败：登记的浏览器太多：请稍后再试。插件稍后会自动重试。");
+    assert.equal(panelStatus(st).text, "连接失败：登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES。插件稍后会自动重试。");
     mock.timers.tick(30_000);
     await env.fireAlarm("pc.heartbeat");
     await env.fromPage({ type: "pc.retry" });
@@ -255,10 +255,17 @@ test("登记被限速（429）：按服务端给的 retry_after_s 等（没有�
     await env.settle(120);
     assert.equal(paths(srv, /\/register$/).length, 2, "到点自动重试");
 
-    // 没给秒数：60 秒
-    const b = await boot({ login: NO_PAGE, server: { registerRateLimit: {} } });
+    // 真实服务端的上限答复不带秒数：60 秒。所有者在控制台移除不用的浏览器（腾出名额）之后，下一次重试就登记上
+    const b = await boot({ login: NO_PAGE, server: { maxDevices: 1, preRegistered: true } });
+    assert.deepEqual(b.srv.state.devices.map((d) => d.id), [5], "另一个浏览器占着唯一的名额");
     reg = await get(b.env.local, "pc.registration");
-    assert.equal(reg.next_at - reg.at, 60_000);
+    assert.deepEqual([reg.code, reg.next_at - reg.at], ["RATE_LIMITED", 60_000]);
+    assert.equal(panelStatus(await state(b.env)).text, "连接失败：登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES。插件稍后会自动重试。");
+    b.srv.state.devices[0].hidden = true;
+    mock.timers.tick(60_000);
+    await b.env.fireAlarm("pc.register");
+    await b.env.settle(120);
+    assert.equal((await state(b.env)).device.registered, true, "移除的浏览器不占名额");
   } finally {
     mock.timers.reset();
   }
@@ -710,6 +717,47 @@ test("换工作区：已经登记在别的工作区时改填工作区 ID → 换
   const tok = storedToken();
   assert.equal((await env.fromPage({ type: "pc.saveSettings", patch: { workspaceId: null } })).ok, true);
   assert.equal(storedToken(), tok);
+});
+
+test("永远连不上的服务端地址（带查询串、片段、反斜杠、用户名密码，或 https）：保存失败，什么都不改 —— 不换令牌、不重新登记", async () => {
+  const { srv, env } = await boot({ login: NO_PAGE });
+  const token = storedToken();
+  const reg0 = paths(srv, /\/register$/).length;
+  const cases = [
+    ["http://127.0.0.1:8790?x=1", "保存失败：只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790#frag", "保存失败：只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790?", "保存失败：只填协议、主机和端口，不要带路径"],
+    ["http://127.0.0.1:8790\\", "保存失败：只填协议、主机和端口，不要带路径"],
+    ["http://user:pw@127.0.0.1:8790", "保存失败：地址里不要带用户名或密码"],
+    ["https://localhost:8790", "保存失败：只支持 http 地址，例如 http://127.0.0.1:8790"],
+  ];
+  for (const [url, message] of cases) {
+    const r = await env.fromPage({ type: "pc.saveSettings", patch: { serverUrl: url } });
+    await env.settle(60);
+    assert.deepEqual([r.ok, r.message], [false, message], url);
+  }
+  assert.equal(storedToken(), token, "令牌没换");
+  assert.equal(storedTokenUrl(), URL_A);
+  assert.equal(paths(srv, /\/register$/).length, reg0, "没有重新登记");
+  const st = await state(env);
+  assert.deepEqual([st.settings.serverUrl, st.device.registered, st.device.device_id], [URL_A, true, 5]);
+});
+
+test("早先存下的令牌属于一个永远连不上的地址（旧的设置页收过带查询串的地址）：换一个新令牌、归到缺省地址并登记上；旧令牌不外发", async () => {
+  const BAD = "http://127.0.0.1:8790?x=1";
+  const srv = createFakeServer({ tasks: TASKS(), preRegistered: false, account: { purchase_mode: "manual" } });
+  const env = installFakeChrome({ fetch: srv.fetch });
+  globalThis.indexedDB._dbs.set("pc-secrets", { version: 1, stores: new Map([["kv", new Map([["device_token", LEGACY], ["device_token_url", BAD]])]]) });
+  await env.local.set({ "pc.settings": { serverUrl: BAD, simulationOutcome: "pass", workspaceId: null } });
+  await env.startWorker();
+  await env.fireInstalled("update");
+  await env.settle(120);
+  assert.notEqual(storedToken(), LEGACY);
+  assert.equal(storedTokenUrl(), URL_A);
+  assert.equal(paths(srv, /\/register$/)[0].body.device_token, storedToken());
+  assert.equal(JSON.stringify(srv.calls).includes(LEGACY), false, "旧令牌没有发出去");
+  const st = await state(env);
+  assert.deepEqual([st.settings.serverUrl, st.device.registered], [URL_A, true]);
 });
 
 // ── 心跳的新形状、快心跳 ─────────────────────────────────────────────────
@@ -1170,6 +1218,157 @@ test("批次闹钟：执行页面对 ping 说没在跑（或收不到）→ 接�
   assert.ok(env.sentToTabs.some((x) => x.msg.type === "pc.stopRun"));
 });
 
+/** 输入：要拦住的路径（正则）→ 输出：{hits, release}。只拦第一个匹配的请求，直到 release() 才放它去服务端
+ *  （模拟一个回得很慢的请求：网络重试、连接卡住）。restore() 恢复原来的 fetch。 */
+function holdFirst(re) {
+  const orig = globalThis.fetch;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const hits = [];
+  globalThis.fetch = async (url, init) => {
+    const p = new URL(url).pathname;
+    if (re.test(p)) {
+      hits.push(p);
+      if (hits.length === 1) await gate;
+    }
+    return orig(url, init);
+  };
+  return { hits, release: () => release(), restore: () => { globalThis.fetch = orig; } };
+}
+
+test("接管批次时第一个结束请求回得慢、期间批次闹钟也来接管、新批次等着开始：同一个批次只发一次结束请求，晚到的答复不清掉新批次的记录", async () => {
+  const { srv, env } = await boot();
+  env.setTabHandler(3, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: reading(CID) } : { running: true, run_id: 9 }));
+  const s1 = await startRun(env, 3);
+  assert.equal(s1.data.run_id, 9);
+  const slow = holdFirst(/^\/plugin\/v1\/runs\/9\/finish$/);
+  try {
+    // 执行页面离开：后台接管批次 #9，结束请求卡在路上
+    await env.fromTab(3, { type: "pc.bye", loaded_at: Date.now() - 60_000, run_id: 9 });
+    await env.settle();
+    assert.equal(slow.hits.length, 1);
+    // 30 秒的批次闹钟也来推这个接管中的批次：搭同一班，不另发结束请求
+    await env.fireAlarm("pc.runBeat");
+    await env.settle();
+    assert.equal(slow.hits.length, 1, "同一个批次同一时刻只有一个接管步骤在跑");
+    assert.equal((await get(env.session, "pc.activeRun")).run_id, 9, "结束请求回来之前记录还在");
+    // 另一个标签页要开始新批次：等接管的那一步做完（本地还占着）
+    env.addTab(4, AMZ, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: reading(CID) } : { running: true, run_id: 10 }));
+    const p2 = startRun(env, 4);
+    await env.settle();
+    assert.equal(srv.state.runs.size, 1, "旧批次的结束请求还没回来：新批次不发");
+    slow.release();
+    const s2 = await p2;
+    await env.settle(200);
+    assert.equal(s2.ok, true, JSON.stringify(s2));
+    assert.equal(s2.data.run_id, 10);
+  } finally {
+    slow.restore();
+  }
+  assert.equal(slow.hits.length, 1, "批次 #9 只发了一次结束请求");
+  assert.equal(srv.state.runs.get(9).ended, true);
+  assert.equal(srv.state.runs.get(10).ended, false);
+  assert.equal((await get(env.session, "pc.activeRun"))?.run_id, 10, "新批次的记录还在");
+  assert.ok(await env.chrome.alarms.get("pc.runBeat"), "新批次的批次闹钟还在");
+});
+
+test("兜底心跳的答复回得慢：期间引擎结束了批次 #9、同一页又开始了 #10 —— 关于 #9 的 409 不让页面停下 #10，也不清它的记录", async () => {
+  const { srv, env } = await boot();
+  let cur = 9;
+  env.setTabHandler(3, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: reading(CID) } : m.type === "pc.ping" ? { running: true, run_id: cur } : { ok: true }));
+  const s1 = await startRun(env, 3);
+  assert.equal(s1.data.run_id, 9);
+  const slow = holdFirst(/^\/plugin\/v1\/runs\/9\/heartbeat$/);
+  try {
+    await env.fireAlarm("pc.runBeat"); // 批次 #9 的兜底心跳卡在路上
+    assert.equal(slow.hits.length, 1);
+    const fin = await env.fromTab(3, { type: "pc.api", op: "finishRun", args: [9, "completed"] });
+    assert.equal(fin.ok, true, JSON.stringify(fin));
+    assert.equal(await get(env.session, "pc.activeRun"), undefined);
+    const s2 = await startRun(env, 3);
+    assert.equal(s2.data.run_id, 10);
+    cur = 10;
+    await env.fromTab(3, { type: "pc.runView", view: view(10), active: true });
+    const stops0 = env.sentToTabs.filter((x) => x.msg.type === "pc.stopRun").length;
+    slow.release(); // 服务端回：批次 #9 已结束（409 LEASE_LOST）
+    await env.settle(200);
+    assert.equal(env.sentToTabs.filter((x) => x.msg.type === "pc.stopRun").length, stops0, "没有请页面停下");
+  } finally {
+    slow.restore();
+  }
+  assert.equal((await get(env.session, "pc.activeRun"))?.run_id, 10);
+  assert.equal((await get(env.local, "pc.runView")).active, true, "界面上仍是执行中");
+  assert.ok(await env.chrome.alarms.get("pc.runBeat"));
+  assert.equal(srv.state.runs.get(10).ended, false);
+  assert.ok(!env.logs().some((t) => /批次 #9 执行权已失效/.test(t)), "不为一个已经结束的旧批次写「执行权已失效」");
+});
+
+test("兜底心跳不替不动的引擎续命：页面还答 ping、引擎却 150 秒没发过请求 → 批次闹钟不再发心跳（兜底心跳自己不算引擎在动）；引擎一发请求就恢复", async () => {
+  const T = Date.parse("2026-11-05T06:00:00Z");
+  mock.timers.enable({ apis: ["Date"], now: T });
+  try {
+    const { srv, env } = await boot();
+    env.setTabHandler(3, (m) => (m.type === "pc.readIdentity" ? { ok: true, identity: reading(CID) } : m.type === "pc.ping" ? { running: true, run_id: 9 } : { ok: true }));
+    const s1 = await startRun(env, 3);
+    assert.equal(s1.data.run_id, 9);
+    const t0 = Date.now(); // 引擎最后一次请求（开始批次）
+    const beatAt = []; // 后台发出兜底心跳时距 t0 的秒数
+    const beatsSoFar = () => paths(srv, /^\/plugin\/v1\/runs\/9\/heartbeat$/).length;
+    for (let k = 1; k <= 10; k++) {
+      mock.timers.tick(40_000);
+      const before = beatsSoFar();
+      await env.fireAlarm("pc.runBeat");
+      await env.settle();
+      if (beatsSoFar() > before) beatAt.push(Math.round((Date.now() - t0) / 1000));
+    }
+    assert.deepEqual(beatAt, [40, 80, 120], "引擎最后一次请求之后 150 秒内照常兜底，过了就不再发");
+    const ar = await get(env.session, "pc.activeRun");
+    assert.equal(ar.run_id, 9, "记录还在：让租约自然到期、由服务端清扫");
+    assert.equal(ar.touched_at, t0, "兜底心跳不刷新「引擎最近一次请求」");
+    assert.equal(ar.last_beat_ok_at, t0 + 120_000, "兜底心跳成功照样记下续租时刻");
+
+    // 引擎又发了请求（自己的批次心跳）：算它在动，下一次批次闹钟照常兜底
+    const own = await env.fromTab(3, { type: "pc.api", op: "runHeartbeat", args: [9] });
+    assert.equal(own.ok, true, JSON.stringify(own));
+    assert.equal((await get(env.session, "pc.activeRun")).touched_at, Date.now());
+    mock.timers.tick(40_000);
+    const before = beatsSoFar();
+    await env.fireAlarm("pc.runBeat");
+    await env.settle();
+    assert.equal(beatsSoFar(), before + 1, "引擎在动：兜底续租恢复");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("拿了标签页租约、批次还没建出来页面就离开（pc.bye 不带批次）：放开租约，别的标签页马上可以开始；本标签页有活批次时不在这里放", async () => {
+  const { env } = await boot();
+  env.addTab(4, AMZ, () => ({ ok: true }));
+  assert.deepEqual(await env.fromTab(3, { type: "pc.lease", busy: true }), { granted: true, held_by: null, reason: "fresh" });
+  // 别的标签页离开：不动 3 号的租约
+  await env.fromTab(4, { type: "pc.bye", loaded_at: Date.now() - 60_000, run_id: null });
+  await env.settle();
+  assert.equal((await get(env.session, "pc.tabLease")).tabId, 3);
+  await env.fromTab(3, { type: "pc.bye", loaded_at: Date.now() - 60_000, run_id: null });
+  await env.settle();
+  assert.equal(await get(env.session, "pc.tabLease"), undefined, "租约放开");
+  assert.deepEqual(await env.fromTab(4, { type: "pc.lease", busy: true }), { granted: true, held_by: null, reason: "fresh" });
+  await env.fromTab(4, { type: "pc.leaseRelease" });
+
+  // 3 号标签页有自己的批次、页面还不知道批次 id 就离开了：租约不在 bye 这里放，批次闹钟问不到引擎时接管并放开
+  env.setTabHandler(3, (m) => (m.type === "pc.ping" ? { running: false, run_id: null } : { ok: true }));
+  await env.fromTab(3, { type: "pc.lease", busy: true });
+  const s = await startRun(env, 3);
+  assert.equal(s.ok, true);
+  await env.fromTab(3, { type: "pc.bye", loaded_at: Date.now() - 60_000, run_id: null });
+  await env.settle();
+  assert.equal((await get(env.session, "pc.tabLease")).tabId, 3);
+  await env.fireAlarm("pc.runBeat");
+  await env.settle();
+  assert.equal(await get(env.session, "pc.tabLease"), undefined);
+  assert.equal(await get(env.session, "pc.activeRun"), undefined);
+});
+
 test("执行中的标签页被关掉：立即通知服务端结束批次", async () => {
   const { srv, env } = await boot();
   env.setTabHandler(3, () => ({ running: true, run_id: 9 }));
@@ -1400,6 +1599,58 @@ test("这个买家号正在别的浏览器里执行（ACCOUNT_BUSY）或本浏�
   assert.deepEqual((await schedBook(b.env))[CID].done, ["14:00"]);
 });
 
+/** 另一个浏览器（自己的令牌）直接对着假服务端说话：登记、报上登着的买家号。返回 call(path, body)。 */
+const OTHER_BROWSER_TOKEN = "other-browser-token-demo-000000000000000001";
+async function otherBrowser(srv, cid = CID) {
+  const call = async (path, body, auth = true) => {
+    const res = await srv.fetch(`${URL_A}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${OTHER_BROWSER_TOKEN}` } : {}) },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  assert.equal((await call("/plugin/v1/register", { device_token: OTHER_BROWSER_TOKEN, ext_version: "0.2.0" }, false)).status, 200);
+  await call("/plugin/v1/identity", { signed_in: true, customer_id: cid, site: "US", page_url: AMZ, conflict: false, ext_version: "0.2.0" });
+  return call;
+}
+/** 本浏览器（后台）发出的开始批次请求（不含另一个浏览器的）。 */
+const ownStarts = (srv) => srv.calls.filter((c) => /\/runs$/.test(c.path) && c.auth !== `Bearer ${OTHER_BROWSER_TOKEN}`);
+
+test("同一个买家号在另一个浏览器里的同一个时间点批次还在执行（ACCOUNT_BUSY）：不记，下一分钟再问；那个批次没跑完就死了（租约过期被清扫）→ 本浏览器下一分钟补上这个时间点", async () => {
+  const { srv, env } = await boot({ manual: false, server: { now: AT_1400 } });
+  env.setTabHandler(3, runnerTab(env, 3, CID));
+  // 另一个浏览器准点为 14:00 开始了定时批次、领了任务，还在执行
+  const other = await otherBrowser(srv);
+  const a = await other("/plugin/v1/runs", { customer_id: CID, trigger: "scheduled", slot: "14:00", simulated: true });
+  assert.equal(a.status, 200, JSON.stringify(a.body));
+  const holder = srv.state.devices.find((d) => d.id !== 5);
+  assert.equal((await other(`/plugin/v1/runs/${a.body.run_id}/next`, {})).body.attempt.order_id, 1);
+
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle(150);
+  assert.equal(ownStarts(srv).length, 1);
+  assert.deepEqual((await schedBook(env))[CID].done, [], "批次还在执行：不是「已经执行过」，不记");
+  assert.ok(env.logs().some((t) => t.includes(`定时 14:00：暂未开始（开始执行失败：这个买家号正在浏览器「${holder.name}」里执行（14:00 开始）。），稍后自动重试`)), env.logs().join(" | "));
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle(150);
+  assert.equal(ownStarts(srv).length, 2, "下一分钟再问，还是 ACCOUNT_BUSY");
+  assert.deepEqual((await schedBook(env))[CID].done, []);
+
+  // 那个浏览器崩了：租约过期，清扫结束批次（不是 finished），这个时间点重新空出来，任务回到已分配
+  srv.advance(181_000);
+  assert.deepEqual(srv.sweep(), [a.body.run_id]);
+  assert.equal(srv.state.tasks[0].status, "assigned");
+  await env.fireAlarm("pc.heartbeat");
+  await env.settle(150);
+  assert.equal(ownStarts(srv).length, 3);
+  const mine = [...srv.state.runs.values()].find((r) => r.device_id === 5);
+  assert.ok(mine, "本浏览器开始了这个时间点的批次");
+  assert.deepEqual([mine.trigger, mine.scheduled_slot, mine.ended], ["scheduled", "14:00", false]);
+  assert.deepEqual((await schedBook(env))[CID].done, ["14:00"], "开始了才记为处理过");
+  assert.ok(env.logs().some((t) => new RegExp(`定时 14:00：执行批次 #${mine.id} 已开始`).test(t)));
+});
+
 test("本地记录说这个浏览器还在执行：引擎还在 → 不发请求、不记、等它结束；引擎已经没了 → 先结束旧批次再开始定时批次", async () => {
   const { srv, env } = await boot({ manual: false, server: { now: AT_1359 } });
   let ping = { running: true, run_id: 9 };
@@ -1441,7 +1692,8 @@ test("服务端说时间点不对（422：账号刚改成手动、时间点删�
   assert.equal(runs[0].body.slot, "14:00");
   assert.equal(srv.state.runs.size, 0, "服务端 422，没有开始");
   assert.deepEqual((await schedBook(env))[CID].done, ["14:00"], "记为处理过：今天这个时间点不再触发");
-  assert.ok(env.logs().some((t) => /定时 14:00：开始执行失败：时间点 14:00 不在账号 环境-DEMO 的执行时间里（已刷新配置，今天这个时间点不再触发）/.test(t)));
+  // 服务端原话带上账号现在的执行时间（真实服务端 execution._check_slot）
+  assert.ok(env.logs().some((t) => t === "定时 14:00：开始执行失败：时间点 14:00 不在账号 环境-DEMO 的执行时间里（18:00）；已刷新配置，今天这个时间点不再触发"), env.logs().slice(-4).join(" | "));
   assert.deepEqual((await state(env)).config.heartbeat.account.schedule_times, ["18:00"], "配置已刷新");
   assert.ok(env.alarms.has("pc.sched:18:00"));
   assert.equal(env.alarms.has("pc.sched:14:00"), false);

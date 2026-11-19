@@ -11,6 +11,8 @@ import type {
   ImportCommitResult,
   OrderRow,
   SimulationResetResult,
+  SyncProblem,
+  SyncStats,
   VerifyWritebackResult,
 } from '@/api/types'
 import { displayValue, formatNumber } from './format'
@@ -48,21 +50,52 @@ export interface Summary {
 /** 同步结果里列出的问题记录条数上限 */
 export const SYNC_PROBLEM_SHOWN = 5
 
+/** 输入：一条记录级的问题 → 输出：「PO-DEMO-1：跳过，原因」；没有平台订单号时写「记录 recX」 */
+export function problemLine(p: Partial<SyncProblem>): string {
+  const who = (p.upstream_order_no ?? '').trim() || `记录 ${p.record_id ?? '—'}`
+  const reason = (p.reason ?? '').trim()
+  return `${who}：${labelOf(FEISHU_VERDICT_LABEL, p.verdict)}${reason ? `，${reason}` : ''}`
+}
+
+export interface ProblemLines {
+  /** 说整个连接的问题（scope = 'connection'）：只写原因 */
+  whole: string[]
+  /** 记录级的问题：「谁：结论，原因」，顺序同服务端 */
+  records: string[]
+}
+
+/**
+ * 输入：读取结果、读取记录或连接 last_stats 里的 problems（旧记录可能没有、或不是列表）→ 输出：连接级与记录级两组文字。
+ * 立即同步的提示、读取记录对话框、连接卡片共用，格式一致。
+ */
+export function problemLines(problems: unknown): ProblemLines {
+  const list = Array.isArray(problems) ? (problems as unknown[]).filter((p): p is Partial<SyncProblem> => !!p && typeof p === 'object') : []
+  return {
+    whole: list.filter((p) => p.scope === 'connection').map((p) => (p.reason ?? '').trim()).filter(Boolean),
+    records: list.filter((p) => p.scope !== 'connection').map(problemLine),
+  }
+}
+
+/**
+ * 输入：读取统计（读取记录的 stats）→ 输出：有问题的记录里没有保留样本的条数（服务端只留前 100 条样本）；
+ * 统计缺失时为 0。
+ */
+export function unsampledProblems(stats: SyncStats | null | undefined): number {
+  if (!stats) return 0
+  const n = (k: string) => (typeof stats[k] === 'number' ? (stats[k] as number) : 0)
+  return Math.max(0, n('skipped') + n('invalid') + n('conflict') - problemLines(stats.problems).records.length)
+}
+
 /**
  * 输入：连接名、立即同步的返回 → 输出：成功提示（有跳过 / 无效 / 待核实的记录时列出样本）。
- * 说整个连接的问题（scope = 'connection'，如来源表里找不到买家号列、本次没有更新指定）排在最前面，只写原因，
+ * 说整个连接的问题（scope = 'connection'，如来源表里找不到买家号列）排在最前面，只写原因，
  * 不占记录样本的名额，也不算进「另有 n 条」。
  */
 export function syncSummary(name: string, res: FeishuSyncResult): Summary {
   const parts = [statsText(res as unknown as Record<string, unknown>), allocationBrief(res.allocation)].filter(Boolean)
-  const problems = res.problems ?? []
-  const whole = problems.filter((p) => p.scope === 'connection')
-  const records = problems.filter((p) => p.scope !== 'connection')
-  const shown = records.slice(0, SYNC_PROBLEM_SHOWN).map((p) => {
-    const who = p.upstream_order_no || `记录 ${p.record_id ?? '—'}`
-    return `${who}：${labelOf(FEISHU_VERDICT_LABEL, p.verdict)}${p.reason ? `，${p.reason}` : ''}`
-  })
-  const warnings = [...whole.map((p) => (p.reason ?? '').trim()).filter(Boolean), ...shown]
+  const { whole, records } = problemLines(res.problems)
+  const shown = records.slice(0, SYNC_PROBLEM_SHOWN)
+  const warnings = [...whole, ...shown]
   const more = (res.skipped ?? 0) + (res.invalid ?? 0) + (res.conflict ?? 0) - shown.length
   if (shown.length && more > 0) warnings.push(`另有 ${formatNumber(more)} 条，见「读取记录」`)
   return { title: `已同步「${name}」`, message: parts.join('；'), warnings }

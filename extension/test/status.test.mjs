@@ -72,9 +72,9 @@ test("服务端明确拒绝：原话接在「连接失败：」后面；要填�
   assert.equal(gate.text, "连接失败：插件接口只接受本机请求：跨机器部署需要接入密钥，当前版本不支持。");
   const limited = panelStatus(snap(null, {
     registration: { ok: false, at: NOW, fails: 1, next_at: NOW + 42_000, halted: false, code: "RATE_LIMITED", message: "x" },
-    connection: { ok: false, at: NOW, kind: "http", code: "RATE_LIMITED", message: "登记的浏览器太多：请稍后再试" },
+    connection: { ok: false, at: NOW, kind: "http", code: "RATE_LIMITED", message: "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES" },
   }));
-  assert.equal(limited.text, "连接失败：登记的浏览器太多：请稍后再试。插件稍后会自动重试。");
+  assert.equal(limited.text, "连接失败：登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES。插件稍后会自动重试。");
 });
 
 test("还没有任何结果：正在连接服务端 <地址>（没有按钮，不要求所有者做什么）", () => {

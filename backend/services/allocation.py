@@ -89,14 +89,36 @@ def plan_date(order_row: dict[str, Any], today: date) -> date:
     return today if d is None or d < today else d
 
 
-
 def lock_workspace(conn, workspace_id: int) -> None:
     """输入：连接、工作区 → 输出：无。取这个工作区的分配咨询锁（事务级，同一事务里可重入，事务结束自动放开）。
 
     加锁顺序（契约 §3.2）：账号行 → 本锁 → 任务行。凡是「先锁任务行、最后触发分配」的事务（文件提交、飞书接收、
-    归档账号）都要在锁第一行任务之前先取本锁，否则会和别的分配互相等待成死锁。
+    归档账号）都要在锁第一行任务之前先取本锁，否则会和别的分配互相等待成死锁。账号行只用 FOR NO KEY UPDATE 锁
+    （accounts.get_row），不挡分配写回时外键检查要的 KEY SHARE；改账号时先取本锁再改账号行，改名还要先锁齐任务行
+    （lock_open_tasks：改名的 UPDATE 拿的行锁会挡外键检查）。
     """
     conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_LOCK_NS, workspace_id % 2_147_483_647))
+
+
+def lock_open_tasks(conn, workspace_id: int) -> None:
+    """输入：连接、工作区 → 输出：无。按 id 顺序锁上本工作区这次分配可能动到的全部任务行（待分配 / 已分配、没有在途
+    尝试的；是 allocate 的「池」的超集）。调用方须已持有 lock_workspace。
+
+    给账号改名用：名称在唯一约束里，改名的 UPDATE 会把账号行锁升级成挡外键检查（KEY SHARE）的那一档。领取、人工改派
+    都是「先锁任务行、再写引用账号的行（外键检查要 KEY SHARE）」；改名一方如果先改账号行、再去锁任务行，就会和它们
+    互相等待。所以改名先锁齐任务行（等它们做完）再改账号行，随后的分配在同一事务里重入这些行锁。
+    """
+    conn.execute(
+        """
+        SELECT o.id FROM procure.purchase_orders o
+        WHERE o.workspace_id = %s AND o.status IN ('queued', 'assigned')
+          AND NOT EXISTS (SELECT 1 FROM procure.purchase_attempts pa
+                          WHERE pa.purchase_order_id = o.id AND pa.status = ANY(%s))
+        ORDER BY o.id
+        FOR UPDATE OF o
+        """,
+        (workspace_id, _INFLIGHT),
+    ).fetchall()
 
 
 def allocate(conn, workspace_id: int, *, today: date | None = None, trigger: str, actor_kind: str = "system",

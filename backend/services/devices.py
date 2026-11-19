@@ -59,6 +59,9 @@ OUTDATED_MESSAGE = f"插件版本过旧：请重新构建并加载新版插件�
 MAX_DEVICES_MESSAGE = "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES"
 #: page_url 只收这两种协议
 _PAGE_URL_SCHEMES = ("http", "https")
+#: pg_advisory_xact_lock 命名空间：同一工作区的新登记串行地数名额、插入（allocation 7_310_431、feishu_intake
+#: 7_310_432、execution 7_310_433）
+_REGISTER_LOCK_NS = 7_310_434
 
 #: 心跳里账号配置要给插件的键（契约 §10「插件心跳」）。卡尾号与金额区间只在领取后的尝试载荷里。
 HEARTBEAT_ACCOUNT_KEYS = (
@@ -150,11 +153,13 @@ def _parse_version(v: Any) -> tuple[int, ...] | None:
 
 def check_ext_version(ext_version: Any) -> None:
     """输入：插件上报的版本 → 输出：无；能解析且低于 MIN_EXT_VERSION → PLUGIN_OUTDATED（409）。
-    缺失或解析不了的不拦。"""
-    got = _parse_version(ext_version)
+    缺失或解析不了的不拦。判定的是去掉 PostgreSQL 存不了的字符（storable_text）之后的版本——也就是会存下来的
+    那个：「0.1.0」后面跟一个 NUL 或半个代理项，照样按 0.1.0 拦，不会因为原文解析不了而放行、再以 0.1.0 入库。"""
+    ver = storable_text(ext_version) if isinstance(ext_version, str) else ext_version
+    got = _parse_version(ver)
     if got is not None and got < _parse_version(MIN_EXT_VERSION):
         raise DomainError("PLUGIN_OUTDATED", OUTDATED_MESSAGE, 409,
-                          {"ext_version": str(ext_version).strip(), "min_ext_version": MIN_EXT_VERSION})
+                          {"ext_version": ver.strip(), "min_ext_version": MIN_EXT_VERSION})
 
 
 # ── 登记与认证 ────────────────────────────────────────────────────────────────
@@ -231,6 +236,7 @@ def register(conn, device_token: Any, *, ext_version: Any = None, workspace_id: 
     - 令牌须符合 TOKEN_RE（否则 VALIDATION）；库里只存 sha256。
     - **幂等**：令牌已登记 → 返回那一行（更新最近联系时间与版本、清掉「已移除」），created=false，不看 workspace_id。
       并发登记同一个令牌靠 ON CONFLICT (token_hash) DO NOTHING + 重查，只会有一行。
+    - 同一工作区的新令牌按事务级咨询锁排队数名额、插入，并发登记也不会超过上限。
     - 新浏览器的工作区见 _workspace_for_new_device；名称是「浏览器 <id>」，之后只能在控制台改名。
     - 上限：工作区内**还在用**的浏览器（没有被移除、最近联系时间不早于 retention_cutoff）已到 settings.max_devices
       → RATE_LIMITED（429，MAX_DEVICES_MESSAGE）。被移除的、过了保留期没联系的行不占名额；只有新令牌查上限。
@@ -249,6 +255,14 @@ def register(conn, device_token: Any, *, ext_version: Any = None, workspace_id: 
     if touched is not None:
         return _register_out(conn, touched, created=False)
     ws = _workspace_for_new_device(conn, workspace_id)
+    # 同一工作区的新登记在这里排队，「数名额 + 插入」一个接一个做：否则名额只剩一个时两个新浏览器同时登记，各自
+    # 数到 max−1、都插得进去。排到之后先按令牌重查一次：排队期间同一个令牌可能已经登记成功了（并发重试），那是
+    # 已登记的浏览器再次联系，不查上限。锁在事务结束时释放；持有它时只会再锁这个令牌自己的那一行。
+    conn.execute("SELECT pg_advisory_xact_lock(%s::int, %s::int)", (_REGISTER_LOCK_NS, ws["id"] % 2_147_483_647))
+    existing = conn.execute("SELECT * FROM procure.devices WHERE token_hash = %s", (token_hash,)).fetchone()
+    touched = _touch(conn, existing, now, ver) if existing is not None else None
+    if touched is not None:
+        return _register_out(conn, touched, created=False)
     total = conn.execute(
         "SELECT count(*) AS n FROM procure.devices WHERE workspace_id = %s AND hidden_at IS NULL "
         "AND COALESCE(last_seen_at, created_at) >= %s",
@@ -321,7 +335,7 @@ def _clean_page_url(v: Any) -> str | None:
         return None
     if parts.scheme not in _PAGE_URL_SCHEMES or not host:
         return None
-    if ":" in host:                      # IPv6 字面量：hostname 去掉了方括号，拼回去
+    if parts.netloc.rpartition("@")[2].startswith("["):   # IP 字面量（IPv6、IPvFuture）：hostname 去掉了方括号，拼回去
         host = f"[{host}]"
     netloc = host if port is None else f"{host}:{port}"
     return f"{parts.scheme}://{netloc}{parts.path}"[:500]

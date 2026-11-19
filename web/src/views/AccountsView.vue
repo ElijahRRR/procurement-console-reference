@@ -17,11 +17,14 @@ watch(tab, (t) => void router.replace({ query: { ...route.query, tab: t } }))
 const accountsPanel = ref<InstanceType<typeof AccountsPanel>>()
 const browsersPanel = ref<InstanceType<typeof BrowsersPanel>>()
 
-/** 输入：浏览器页签里某个未登记的买家号 ID → 输出：无（切到账号页签，打开已填好 ID 的账号对话框） */
+/**
+ * 输入：浏览器页签里某个未登记的买家号 ID → 输出：无（切到账号页签，打开登记对话框：与待登记列表的「登记」一样
+ * 带上来源里的名称、来源指定了几笔任务与同名账号的提示）
+ */
 async function registerBuyer(customerId: string) {
   tab.value = 'accounts'
   await nextTick()
-  accountsPanel.value?.openRegister(customerId)
+  await accountsPanel.value?.registerBuyer(customerId)
 }
 </script>
 
