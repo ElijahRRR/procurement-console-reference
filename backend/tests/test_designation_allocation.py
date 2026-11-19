@@ -277,7 +277,7 @@ def test_manual_keeps_its_slot_designated_displaces_auto(conn, workspace):
 
 
 def test_manual_assignment_overrides_and_unassign_returns_to_the_designated_account(conn, workspace):
-    """验收 修订二 第 5 条：人工改派后留在改派账号期间不跟随来源；解除分配后回到来源指定的账号。"""
+    """验收 修订二 第 5 条：人工改派后留在改派账号期间不跟随来源；解除分配后下一次分配重新按来源指定（接得了就回到指定的账号）。"""
     ws, uid = workspace["id"], workspace["user_id"]
     a, b = _two(conn, ws)
     src = f.feishu_source(conn, ws, "recP01")

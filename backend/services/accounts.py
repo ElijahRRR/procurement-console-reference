@@ -10,8 +10,8 @@
 - 影响分配的配置变化（金额区间、每日额度、优先级、采购开关、站点，以及**名称与买家号 ID**：来源指定靠它们对应
   账号）以及新建（不论采购开关开没开）、恢复执行、归档后，立即按今天重新分配
   （allocation.allocate(trigger='account_change')）。暂停执行不重新分配：暂停的账号不参与自动分配，已分配给它的任务保留。
-  忽略 / 恢复一个买家号 ID 时，如果有待分配的任务指定了它，也重新分配一次（只会刷新这些任务的未分配原因：原因里写着
-  这个 ID 是否已被忽略）。
+  忽略 / 恢复一个买家号 ID 时，如果有待分配的任务指定了它，也重新分配一次（一次完整的分配：这些任务的未分配原因随即
+  写上 / 去掉「已被忽略」，别的任务照常落位）。
 - 加锁顺序（契约 §3.2）：账号行（FOR NO KEY UPDATE，不挡外键检查的 KEY SHARE）→ 工作区分配锁
   （allocation.lock_workspace）→ 任务行。改了影响分配的字段时先取分配锁再改账号行；改名还要先锁齐任务行再改
   账号行（名称在唯一约束里，改名的 UPDATE 拿的行锁会挡外键检查）；归档在锁它的任务行之前先取分配锁。
@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -80,11 +81,20 @@ def _money_field(v: Any, label: str, field: str, *, nullable: bool) -> Decimal |
     return m
 
 
-def _text_field(v: Any, label: str, field: str, max_len: int) -> str | None:
+def _text_field(v: Any, label: str, field: str, max_len: int, *, single_line: bool = False) -> str | None:
+    """输入：提交的值、中文名、字段名、最长字数、是否单行 → 输出：去掉首尾空白的文本（空为 None）。
+
+    非文本、超长 → VALIDATION。含 PostgreSQL 存不了的字符（NUL、不成对的代理项）→ VALIDATION，不替所有者悄悄删掉；
+    单行字段（账号名称）另外不收换行、制表符等控制字符（与浏览器名称同一条规则）。
+    """
     if v is None:
         return None
     if not isinstance(v, str):
         raise validation(f"{label}必须是文本", field=field)
+    if single_line and any(unicodedata.category(ch) in ("Cc", "Cs") for ch in v.strip()):
+        raise validation(f"{label}不能包含换行、制表符等控制字符", field=field)
+    if any(ch == "\x00" or unicodedata.category(ch) == "Cs" for ch in v):
+        raise validation(f"{label}不能包含无法保存的字符", field=field)
     s = v.strip()
     if len(s) > max_len:
         raise validation(f"{label}不能超过 {max_len} 个字", field=field)
@@ -102,7 +112,7 @@ def _validate(conn, ws: int, data: dict[str, Any], current: dict[str, Any] | Non
         if key not in _EDITABLE:
             raise validation(f"未知的账号字段：{key}", field=key)
         if key == "name":
-            name = _text_field(v, "账号名称", key, 64)
+            name = _text_field(v, "账号名称", key, 64, single_line=True)
             if not name:
                 raise validation("账号名称不能为空", field=key)
             out[key] = name
@@ -695,7 +705,8 @@ def ignore_buyer_id(conn, workspace_id: int, customer_id: Any, actor_user_id: in
     忽略后这个 ID 不再出现在待登记列表里，登录着它的浏览器显示「已忽略」、分不到任务。ID 形状不对 → VALIDATION；
     已登记在未归档账号上的 ID 不能忽略（VALIDATION：要停用它应关掉账号的采购开关或归档账号）。
     新忽略时写 'account.buyer_id_ignored' 事件；这时如果有待分配的任务由来源指定了这个 ID，立即重新分配一次
-    （trigger='account_change'），这些任务的未分配原因随即注明「已被忽略」——重新分配只改写原因，不产生订单事件。
+    （trigger='account_change'），这些任务的未分配原因随即注明「已被忽略」。这是一次完整的分配（同其他账号变化）：
+    指定这个 ID 的待分配任务只是原因变了、本身不产生订单事件，别的待分配任务照常落位（照常记事件）。
     重复忽略、没有任务指定的 ID 不触发分配。
     """
     cid = _customer_id_arg(customer_id)

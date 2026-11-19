@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from tests.api_helpers import (IMPORT_HEADERS, api, bearer, create_account, err, find_order,  # noqa: F401
                                identity, import_orders, import_row, ok, owner, plugin_client, register_device,
                                run_body, xlsx_bytes)
@@ -56,6 +60,29 @@ def test_account_validation_errors(owner):
     err(owner.patch(f"/api/v1/accounts/{acc['id']}", json={"daily_limit": -1}), 422, "VALIDATION")
     err(owner.patch("/api/v1/accounts/999999", json={"daily_limit": 1}), 404, "NOT_FOUND")
     err(owner.get("/api/v1/accounts/999999"), 404, "NOT_FOUND")
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "a\ud800b", "a\nb"])
+def test_account_name_with_control_or_unstorable_characters_is_422_not_500(owner, bad):
+    """账号名称含 NUL、不成对的代理项或换行：新建与修改都答 422（field = name），什么也不写；备注可以换行，
+    但同样不收存不了的字符。请求体按纯 ASCII 的 JSON 发（httpx 的 json= 编码不了代理项）。"""
+    headers = {"Content-Type": "application/json"}
+    body = json.dumps({"name": bad}).encode("ascii")
+    e = err(owner.post("/api/v1/accounts", content=body, headers=headers), 422, "VALIDATION")
+    assert e["detail"]["field"] == "name"
+    assert ok(owner.get("/api/v1/accounts"))["total"] == 0
+
+    acc = create_account(owner, name="环境-DEMO-A")
+    e = err(owner.patch(f"/api/v1/accounts/{acc['id']}", content=body, headers=headers), 422, "VALIDATION")
+    assert e["detail"]["field"] == "name"
+    assert ok(owner.get(f"/api/v1/accounts/{acc['id']}"))["name"] == "环境-DEMO-A"
+
+    if bad != "a\nb":
+        notes = json.dumps({"notes": bad}).encode("ascii")
+        e = err(owner.patch(f"/api/v1/accounts/{acc['id']}", content=notes, headers=headers), 422, "VALIDATION")
+        assert e["detail"]["field"] == "notes"
+    else:
+        assert ok(owner.patch(f"/api/v1/accounts/{acc['id']}", json={"notes": "第一行\n第二行"}))["notes"] == "第一行\n第二行"
 
 
 def test_browser_list_rename_remove_and_auto_restore(owner, api):

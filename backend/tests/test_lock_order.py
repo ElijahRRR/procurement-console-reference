@@ -12,6 +12,9 @@
 再锁齐任务行，最后才改账号行——(b)(c) 各有一个改名用例，另加 (e) 人工改派（锁任务行 → 写分配，外键 KEY SHARE）
 对给目标账号改名。
 
+清除模拟结果（锁任务行 → 最后恢复只因模拟结果暂停的账号、重新分配）也按这个顺序：先锁要恢复的账号行、再取分配锁，
+然后才锁任务行——(f) 清除对单独的一次分配、对改这个账号（优先级 / 改名）。
+
 执行模块的结果上报是另一条链（批次 → 任务 → 尝试 → 暂停账号，不取分配锁）：(g) 上报在途模拟尝试的结果对清除模拟
 结果——清除要等上报提交，不得先锁住这个人工暂停、不会被它恢复的账号。
 
@@ -295,6 +298,52 @@ def test_e_manual_assignment_vs_account_rename(clean_db, conn, workspace, monkey
                        "WHERE id = %s", (o["id"],)).fetchone()
     assert (got["status"], got["assigned_account_id"], got["assignment_kind"]) == ("assigned", a["id"], "manual")
 
+
+def _captcha_paused_source_task(conn, workspace) -> tuple[dict[str, Any], dict[str, Any]]:
+    """来源指定的任务 T 分给账号 A（kind source）；A 的模拟尝试遇到验证码 → A 只因模拟结果暂停，T 回到已分配
+    （仍在分配池里）。输出 (A, T)。"""
+    ws = workspace["id"]
+    a = fx.exec_account(conn, ws, name="环境-DEMO-A")
+    dev = fx.logged_in_device(conn, workspace, account=a)
+    o = f.ingest_ready_order(conn, ws, external_buyer_customer_id=a["amazon_customer_id"])
+    allocation.allocate(conn, ws, trigger="manual")
+    att = fx.claim(conn, dev, fx.start(conn, dev))
+    execution.report_result(conn, dev, att["attempt_id"], fx.failure_payload("CAPTCHA_ENCOUNTERED"))
+    assert simulation.paused_only_by_simulation(conn, ws, a["id"]) is True
+    got = fx.order_row(conn, o["id"])
+    assert (got["status"], got["assigned_account_id"], got["assignment_kind"]) == ("assigned", a["id"], "source")
+    return a, o
+
+
+@pytest.mark.parametrize("other", ["allocation", "priority", "rename"])
+def test_f_simulation_reset_vs_allocation_or_account_edit(clean_db, conn, workspace, monkeypatch, other):
+    """(f) 清除模拟结果锁住要回退的任务、在恢复账号 A（改 A 行并重新分配）之前停住；这时单独跑一次分配，或改账号 A
+    （优先级 / 改名）。清除要先锁 A 行、再取分配锁，然后才锁任务行。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    a, o = _captcha_paused_source_task(conn, workspace)
+    conn.commit()
+
+    gate = Gate()
+    real = accounts.resume
+
+    def paused(c, w, account_id, **kw):
+        if threading.current_thread().name == "lock-order-reset" and not gate.reached.is_set():
+            gate.hold()                                     # 任务行已锁，A 还没恢复
+        return real(c, w, account_id, **kw)
+
+    monkeypatch.setattr(accounts, "resume", paused)
+    patch = {"allocation": None, "priority": {"priority": 7}, "rename": {"name": "环境-DEMO-A-改名"}}[other]
+    second = ((lambda c: allocation.allocate(c, ws, trigger="manual")) if patch is None
+              else (lambda c: accounts.update(c, ws, a["id"], patch, uid)))
+    summary: dict[str, Any] = {}
+    result = _play(clean_db, gate, ("reset", lambda c: summary.update(simulation.reset(c, ws, uid))), (other, second))
+    assert result == {"reset": "ok", other: "ok"}
+    assert summary["accounts_resumed"] == [a["id"]] and summary["orders_restored"] == [o["id"]]
+    row = _account(conn, a["id"])
+    assert row["execution_paused"] is False
+    assert {k: row[k] for k in (patch or {})} == (patch or {})
+    got = fx.order_row(conn, o["id"])
+    assert (got["status"], got["assigned_account_id"], got["assignment_kind"]) == ("assigned", a["id"], "source")
 
 def test_g_result_report_vs_simulation_reset(clean_db, conn, workspace, monkeypatch):
     """(g) 账号 A 有在途的模拟尝试时被人工暂停；插件上报这笔「遇到验证码」（锁住批次、任务、尝试，随后要再暂停 A），

@@ -5,7 +5,7 @@
 - GET /allocation/last 读旧记录不坏；POST /allocation/run 重复执行结果相同；
 - GET /accounts/discovered 并入来源指定的买家号 ID（source_orders、browsers 为空、include_ignored 列出全部忽略的 ID）、
   概览 discovered_buyers；登记（新建账号 / 填到已有账号）后任务立刻分给它；
-- 人工改派优先，解除分配后回到来源指定的账号；重新上传改了买家号 → 时间线上有「来源指定的买家号变了」；
+- 人工改派优先，解除分配后下一次分配重新按来源指定：指定的账号接得了就分给它，接不了就停在待分配并写明原因；重新上传改了买家号 → 时间线上有「来源指定的买家号变了」；
 - 导出的「买家号」「买家号ID」「分配账号」三列，导出再导入不会把自动分配变成来源指定，也不会丢掉指定里的买家号 ID；
 - 飞书读取结果、读取记录与连接的 last_stats 里「找不到买家号列」的问题项，新记录暂不接收；
 - 跨工作区：指定只在自己的工作区里解析，待登记的买家号、忽略名单、导出互不可见。
@@ -379,7 +379,7 @@ def test_account_changes_reallocate_designated_tasks_without_falling_back_to_ano
 
 
 def test_manual_reassign_wins_and_unassign_returns_to_the_designated_account(owner):
-    """验收第 5 条（HTTP）：人工改派后留在改派账号期间不跟随来源；解除分配后回到来源指定的账号。"""
+    """验收第 5 条（HTTP）：人工改派后留在改派账号期间不跟随来源；解除分配后下一次分配重新按来源指定（接得了就回到指定的账号）。"""
     a, b = _two_accounts(owner)
     _import(owner, [_row("PO-DEMO-M0001", cid=ID_B)])
     oid = find_order(owner, "PO-DEMO-M0001")["id"]
@@ -631,8 +631,8 @@ def test_template_download_explains_the_two_buyer_columns(owner):
     assert notes["买家号"][2] == ("指定由哪个买家号采购，须与控制台的账号名称一致；留空由系统自动分配。"
                                "已有 AMZ 订单号的行表示历史采购使用的买家号。"
                                "文件来源要改指定请重新上传并填上新的买家号；空着重新上传不会清除指定")
-    assert notes["买家号ID"][2] == ("指定采购的买家号 ID（亚马逊 customerId，A 开头）；与「买家号」同时填写时以它为准。"
-                                 "留空由系统自动分配")
+    assert notes["买家号ID"][2] == ("指定采购的买家号 ID（亚马逊 customerId，A 开头）；与「买家号」同时填写时以它为准，"
+                                 "「买家号」对应到另一个账号时不分配、停在待分配。留空由系统自动分配")
     assert notes["买家号"][1] == notes["买家号ID"][1] != notes["平台订单号"][1]          # 两列都不是必填
 
 

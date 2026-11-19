@@ -144,8 +144,10 @@ def sync_connection(connection_id: int, ctx: deps.Console = Depends(deps.console
 
     problems 逐条是 {record_id, upstream_order_no, verdict, reason}。连接给「买家号」「买家号 ID」配了列、而来源表里
     找不到其中某一列时，problems 的第一条是整条连接的提示 {record_id: null, upstream_order_no: "买家号列",
-    verdict: "skipped", reason: "来源表里找不到买家号列「…」，本次没有更新指定", scope: "connection"}（不计入 skipped）：
-    这次读取不改任何任务的来源指定——没读到不等于清空。
+    verdict: "skipped", reason: "来源表里找不到买家号列「…」，这一列的指定保持上次读到的内容，新记录暂不接收",
+    scope: "connection"}（不计入 skipped；同时带在连接的 last_stats.problems 里）：读不到的那一列沿用上次读到的指定，
+    读得到的那一列照常更新；库里没有、又没有可信 AMZ 订单号的新记录这次不接收，计入 skipped，原因是「来源表里找不到
+    买家号列「…」，读不出这一行有没有指定买家号，暂不接收；恢复这一列或改字段对应后会自动接收」。
     读飞书失败时服务层已把失败的读取记录写进本事务：先提交它再返回错误（否则失败历史随回滚丢失）。
     """
     try:

@@ -3,7 +3,11 @@
 reset 依次做：
 
 0. 取本工作区的执行闸门（execution.execution_gate 独占锁）：等进行中的开始批次 / 领取提交，清除期间不会冒出
-   新的批次或尝试。
+   新的批次或尝试。随后按契约 §3.2 的加锁顺序（账号行 → 工作区分配锁 → 任务行）先锁住此刻只因模拟结果暂停、
+   第 4 步要恢复的账号行（FOR NO KEY UPDATE），再取工作区分配锁（allocation.lock_workspace），然后才锁批次与任务行：
+   第 4 步恢复账号要改账号行并重新分配，如果先锁了任务行再去等账号行 / 分配锁，会与同时进行的分配、改账号互相等待
+   成死锁。人工暂停等不会被恢复的账号不预先锁：插件对它在途尝试的结果上报是「批次 → 任务 → 尝试 → 账号」，
+   预先锁住它会与上报互相等待。
 1. 结束本工作区未结束的模拟批次（end_reason='simulation_reset'；在途尝试不按超时处理，下一步统一清除）。
 2. 这些任务的模拟尝试（尚未清除过的）→ aborted，resolution='simulation_reset'，说明「已清除模拟结果」。
    它们不再占额度（额度只数非 failed / aborted 的尝试）。
@@ -23,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from services import accounts, clock, events, execution, orders
+from services import accounts, allocation, clock, events, execution, orders
 from services.errors import DomainError
 from services.models import PRE_EXECUTION_STATUSES
 
@@ -72,6 +76,29 @@ def _apply_drift(conn, workspace_id: int, order_id: int, *, actor_kind: str, act
         orders.transition(conn, order, order["status"], actor_kind=actor_kind, actor_id=actor_id, updates=upd)
 
 
+def _lock_before_tasks(conn, workspace_id: int) -> None:
+    """输入：连接、工作区（调用方已持有独占执行闸门）→ 输出：无。锁住此刻只因模拟结果暂停的账号行（按 id 顺序，
+    FOR NO KEY UPDATE），再取工作区分配锁。见模块说明第 0 步。
+
+    在锁上之前判断「只因模拟结果暂停」：锁上之后这些账号的暂停 / 恢复都要等本事务结束，判断不会再变；判断与加锁
+    之间才被人工恢复或暂停的账号多锁一行也无妨，第 4 步按当时的状态重新判断。清除期间才被模拟结果暂停的账号
+    （上报先于清除提交）不在这里，第 4 步照常恢复它。
+    """
+    paused = conn.execute(
+        "SELECT id FROM procure.buyer_accounts WHERE workspace_id = %s AND execution_paused AND archived_at IS NULL "
+        "ORDER BY id",
+        (workspace_id,),
+    ).fetchall()
+    resumable = [r["id"] for r in paused if paused_only_by_simulation(conn, workspace_id, r["id"])]
+    if resumable:
+        conn.execute(
+            "SELECT id FROM procure.buyer_accounts WHERE workspace_id = %s AND id = ANY(%s::bigint[]) "
+            "ORDER BY id FOR NO KEY UPDATE",
+            (workspace_id, resumable),
+        ).fetchall()
+    allocation.lock_workspace(conn, workspace_id)
+
+
 def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
     """输入：工作区、操作人 → 输出：{runs_ended, attempts_reset, orders_restored, orders_skipped, accounts_resumed}。
 
@@ -80,6 +107,7 @@ def reset(conn, workspace_id: int, actor_user_id: int | None) -> dict[str, Any]:
     ws = workspace_id
     ak, aid = _actor(actor_user_id)
     execution.execution_gate(conn, ws, exclusive=True)
+    _lock_before_tasks(conn, ws)
     now = clock.now()
 
     runs = conn.execute(

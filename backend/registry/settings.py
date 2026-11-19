@@ -36,9 +36,10 @@ class Settings:
     login_fail_limit: int
     rate_window_s: int
     allowed_hosts: tuple[str, ...]
-    #: 一个工作区最多登记多少个浏览器（devices 行）；满了以后新登记 → 429
+    #: 一个工作区最多登记多少个还在用的浏览器（没有被移除、device_retention_days 天内联系过的 devices 行）；
+    #: 满了以后新令牌登记 → 429
     max_devices: int
-    #: 多少天没有联系、且没有任何批次 / 尝试引用的浏览器行由清扫任务删除
+    #: 多少天没有联系就不再占登记名额；其中没有任何批次 / 尝试引用的行由清扫任务删除
     device_retention_days: int
     #: 允许调用 /plugin 的扩展 ID 名单（小写）；空 = 不按扩展 ID 限制（仍拒绝网页来源）
     plugin_extension_ids: tuple[str, ...]
