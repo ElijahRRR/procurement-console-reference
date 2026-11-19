@@ -5,24 +5,34 @@
   账号上登记了哪个 ID，登录着这个买家号的浏览器就能执行它的任务。
 - **登记**：插件自己生成令牌，`register` 幂等地为它建一行（库里只存 sha256），没有任何人工步骤。令牌只是会话
   标识（把批次、尝试、回执归到同一个浏览器），不代表身份。浏览器的工作区在登记时确定，之后不变。
+- **登记上限**（settings.max_devices）只数「还在用」的浏览器：没有被移除（hidden_at 为空）、且最近联系时间
+  （从未联系过的按登记时间）在 settings.device_retention_days 天以内（截止时刻见 `retention_cutoff`，清扫删除闲置行
+  用的是同一个）。所以控制台「移除」立刻腾出名额，换了令牌留下的旧行过了保留期也不再占名额（执行过批次的旧行
+  清扫不会删，只是不再计数）。已登记的浏览器再次联系（包括被移除的、过了保留期的）不查上限。
 - **认证**：`authenticate` 只按令牌哈希找行（契约 §0 的认证查询例外）；`require_active` 按 (id, 工作区) 重读。
 - **身份上报**：`{signed_in, customer_id, site, page_url, conflict}`。买家号 ID 大写、去空白，形状不对就当作
-  没读到，绝不报错；`page_url` 只留 origin + path。存进 `identity`（附服务端时刻 at）与 `identity_at`；
+  没读到，绝不报错；`page_url` 只留 http / https 的 origin + path（去掉用户名密码、查询串与片段；别的协议、解析
+  不了的当作没有）。存进 `identity`（附服务端时刻 at）与 `identity_at`；
   `login_customer_id` = 已登录、读到 ID 且各标签页读数一致时的 ID，否则为空。
+- **插件送来的文本**（版本、UA、site、page_url）入库前先去掉 PostgreSQL 存不了的字符（NUL、不成对的代理项，
+  见 `storable_text`；执行协议里插件送来的文本用的是同一个函数）：坏字符不该变成 500。浏览器名称是所有者在
+  控制台填的，含控制字符直接 VALIDATION。
 - **登录状态**（`login_state`，由浏览器行算出）：unknown（从未上报）/ conflict / signed_out / no_id / signed_in。
 - **解析**（`resolve_login`，每次现算，不存）：signed_in 时在浏览器所属工作区找登记了这个 ID 的未归档账号 →
   ready；没有且 ID 在忽略名单里 → ignored；否则 unregistered。其余状态原样。插件侧状态全集见 PLUGIN_STATES。
   服务端不替插件创建账号：没登记的 ID 只留在浏览器行上，由控制台「待登记的买家号」列出（services/accounts）。
 - **过期**（stale）= `identity_at` 距现在超过 registry 的 identity_fresh_s。
 - **在线** = 3 分钟（ONLINE_WINDOW_S）内有联系。
-- **移除**只是把浏览器从列表里清掉（记 `hidden_at`，不动令牌）；它再次联系（心跳、身份上报、登记）时自动回到列表。
-  正在执行批次的浏览器不能移除。
+- **移除**只是把浏览器从列表里清掉（记 `hidden_at`，不动令牌），同时不再占登记名额；它再次联系（心跳、身份上报、
+  登记）时自动回到列表（不查上限）。正在执行批次的浏览器不能移除。
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -45,6 +55,10 @@ PLUGIN_STATES = ("unknown", "signed_out", "no_id", "conflict", "unregistered", "
 #: 令牌不认识时的说明（server/deps 的 401 用同一句）
 UNREGISTERED_MESSAGE = "这个浏览器还没有登记，插件会自动重新登记"
 OUTDATED_MESSAGE = f"插件版本过旧：请重新构建并加载新版插件（需要 {MIN_EXT_VERSION} 及以上）"
+#: 工作区里还在用的浏览器已到 settings.max_devices 时，新登记得到的 429 说明（写明所有者能做什么）
+MAX_DEVICES_MESSAGE = "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES"
+#: page_url 只收这两种协议
+_PAGE_URL_SCHEMES = ("http", "https")
 
 #: 心跳里账号配置要给插件的键（契约 §10「插件心跳」）。卡尾号与金额区间只在领取后的尝试载荷里。
 HEARTBEAT_ACCOUNT_KEYS = (
@@ -54,10 +68,11 @@ HEARTBEAT_ACCOUNT_KEYS = (
 )
 
 __all__ = [
-    "HEARTBEAT_ACCOUNT_KEYS", "LOGIN_STATES", "MIN_EXT_VERSION", "ONLINE_WINDOW_S", "PLUGIN_STATES", "TOKEN_RE",
-    "UNREGISTERED_MESSAGE", "UNSET", "authenticate", "browser_brief", "check_ext_version", "clean_identity",
-    "get_device", "heartbeat", "identity_stale", "list_devices", "login_customer_id", "login_state", "register",
-    "remove_device", "report_identity", "require_active", "resolve_login", "unauthorized", "update_device",
+    "HEARTBEAT_ACCOUNT_KEYS", "LOGIN_STATES", "MAX_DEVICES_MESSAGE", "MIN_EXT_VERSION", "ONLINE_WINDOW_S",
+    "PLUGIN_STATES", "TOKEN_RE", "UNREGISTERED_MESSAGE", "UNSET", "authenticate", "browser_brief",
+    "check_ext_version", "clean_identity", "get_device", "heartbeat", "identity_stale", "list_devices",
+    "login_customer_id", "login_state", "register", "remove_device", "report_identity", "require_active",
+    "resolve_login", "retention_cutoff", "storable_text", "unauthorized", "update_device",
 ]
 
 
@@ -72,17 +87,30 @@ def _iso(v: Any) -> str | None:
     return v.isoformat() if v is not None else None
 
 
+def storable_text(s: str) -> str:
+    """输入：文本 → 输出：去掉 PostgreSQL 存不了的字符后的文本：NUL（text 与 jsonb 都不收）、不成对的代理项
+    （编不成 UTF-8，也写不进 JSON 响应）。其余字符原样保留。插件送来的文本入库前都过这里（本模块的 _short、
+    services/execution 的 _text 与 _storable_json）。"""
+    return s.replace("\x00", "").encode("utf-8", "ignore").decode("utf-8")
+
+
 def _short(v: Any, n: int) -> str | None:
+    """输入：插件送来的值、最多几个字 → 输出：可以入库的文本（先去掉存不了的字符，再去首尾空白、截断）；
+    缺失或清完是空的 → None。绝不报错。"""
     if v is None:
         return None
-    s = str(v).strip()
+    s = storable_text(str(v)).strip()
     return s[:n] or None
 
 
 def _clean_name(v: Any) -> str:
+    """输入：控制台填的浏览器名称 → 输出：去掉首尾空白的名称。空、超过 64 个字、或含控制字符（NUL、换行、制表符等，
+    以及存不了的代理项）→ VALIDATION（field = name）；不替所有者悄悄改掉。"""
     if not isinstance(v, str) or not v.strip():
         raise validation("浏览器名称不能为空", field="name")
     s = v.strip()
+    if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in s):
+        raise validation("浏览器名称不能包含换行、制表符等控制字符", field="name")
     if len(s) > 64:
         raise validation("浏览器名称不能超过 64 个字", field="name")
     return s
@@ -186,6 +214,15 @@ def _register_out(conn, dev: dict[str, Any], *, created: bool) -> dict[str, Any]
             "workspace_name": ws["name"] if ws else None, "created": created}
 
 
+def retention_cutoff(now: datetime) -> datetime:
+    """输入：现在 → 输出：浏览器「还算在用」的截止时刻 = 现在 − settings.device_retention_days 天。
+
+    最近联系时间（COALESCE(last_seen_at, created_at)，从未联系过的按登记时间）早于它的行：不占登记名额（register），
+    其中没有任何批次 / 尝试引用的由清扫删除（execution._purge_idle_devices）。两处用的是同一个时刻。
+    """
+    return now - timedelta(days=int(settings.get().device_retention_days))
+
+
 def register(conn, device_token: Any, *, ext_version: Any = None, workspace_id: Any = None,
              user_agent: Any = None) -> dict[str, Any]:
     """输入：插件生成的令牌、插件版本、工作区 id（只在系统里有多个工作区时需要）、UA
@@ -195,7 +232,8 @@ def register(conn, device_token: Any, *, ext_version: Any = None, workspace_id: 
     - **幂等**：令牌已登记 → 返回那一行（更新最近联系时间与版本、清掉「已移除」），created=false，不看 workspace_id。
       并发登记同一个令牌靠 ON CONFLICT (token_hash) DO NOTHING + 重查，只会有一行。
     - 新浏览器的工作区见 _workspace_for_new_device；名称是「浏览器 <id>」，之后只能在控制台改名。
-    - 工作区内浏览器行数已到 settings.max_devices → RATE_LIMITED（429）。
+    - 上限：工作区内**还在用**的浏览器（没有被移除、最近联系时间不早于 retention_cutoff）已到 settings.max_devices
+      → RATE_LIMITED（429，MAX_DEVICES_MESSAGE）。被移除的、过了保留期没联系的行不占名额；只有新令牌查上限。
     - 版本能解析且低于 MIN_EXT_VERSION → PLUGIN_OUTDATED（409）。
     - 新登记写 'device.registered' 事件（detail：ext_version、user_agent 前 200 字）。
     """
@@ -211,10 +249,13 @@ def register(conn, device_token: Any, *, ext_version: Any = None, workspace_id: 
     if touched is not None:
         return _register_out(conn, touched, created=False)
     ws = _workspace_for_new_device(conn, workspace_id)
-    total = conn.execute("SELECT count(*) AS n FROM procure.devices WHERE workspace_id = %s",
-                         (ws["id"],)).fetchone()["n"]
+    total = conn.execute(
+        "SELECT count(*) AS n FROM procure.devices WHERE workspace_id = %s AND hidden_at IS NULL "
+        "AND COALESCE(last_seen_at, created_at) >= %s",
+        (ws["id"], retention_cutoff(now)),
+    ).fetchone()["n"]
     if total >= int(settings.get().max_devices):
-        raise DomainError("RATE_LIMITED", "登记的浏览器太多：请稍后再试", 429)
+        raise DomainError("RATE_LIMITED", MAX_DEVICES_MESSAGE, 429)
     inserted = conn.execute(
         """
         INSERT INTO procure.devices (workspace_id, name, token_hash, ext_version, user_agent, last_seen_at, created_at)
@@ -263,12 +304,36 @@ def require_active(conn, device: dict[str, Any], *, lock: bool = False) -> dict[
 # ── 身份、登录状态与解析 ──────────────────────────────────────────────────────
 
 
+def _clean_page_url(v: Any) -> str | None:
+    """输入：插件上报的页面地址 → 输出：`scheme://host[:port]/path`（最多 500 字）；当作没有 → None。绝不报错。
+
+    只收 http / https 的绝对地址，由解析出的各部分重新拼成：用户名密码、查询串、片段都不存。别的协议
+    （javascript:、chrome-extension: …）、没有主机的（相对路径）、解析不了的（方括号不配对、端口不是数字 …）
+    一律当作没有——不退回去存原文，原文里可能带着查询串。
+    """
+    url = _short(v, 2000)
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in _PAGE_URL_SCHEMES or not host:
+        return None
+    if ":" in host:                      # IPv6 字面量：hostname 去掉了方括号，拼回去
+        host = f"[{host}]"
+    netloc = host if port is None else f"{host}:{port}"
+    return f"{parts.scheme}://{netloc}{parts.path}"[:500]
+
+
 def clean_identity(identity: Any) -> dict[str, Any]:
     """输入：插件上报的身份 {signed_in, customer_id, site, page_url, conflict?} → 输出：清洗后的同名字典。
 
     customer_id 去掉所有空白、转大写，须符合 accounts.CUSTOMER_ID_RE 且不超过 64 位，否则当作没读到（None），
-    绝不报错；signed_in 只认布尔 true；conflict 取布尔；page_url 只留 origin + path（不存查询串与片段）。
-    只有整个身份不是对象时才 VALIDATION。
+    绝不报错；signed_in 只认布尔 true；conflict 取布尔；page_url 只留 http / https 的 origin + path（见
+    _clean_page_url：不存用户名密码、查询串与片段，别的协议与解析不了的当作没有）；site 与 page_url 里 PostgreSQL
+    存不了的字符（NUL、不成对的代理项）先去掉。只有整个身份不是对象时才 VALIDATION。
     """
     if not isinstance(identity, dict):
         raise validation("身份信息格式不对", field="identity")
@@ -276,16 +341,11 @@ def clean_identity(identity: Any) -> dict[str, Any]:
     cid = "".join(raw.split()).upper() if isinstance(raw, str) else None
     if not cid or len(cid) > 64 or not accounts.CUSTOMER_ID_RE.match(cid):
         cid = None
-    url = _short(identity.get("page_url"), 2000)
-    if url:
-        parts = urlsplit(url)
-        url = (f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.scheme and parts.netloc
-               else url.split("?", 1)[0].split("#", 1)[0])[:500] or None
     return {
         "signed_in": identity.get("signed_in") is True,
         "customer_id": cid,
         "site": _short(identity.get("site"), 8),
-        "page_url": url,
+        "page_url": _clean_page_url(identity.get("page_url")),
         "conflict": bool(identity.get("conflict")),
     }
 
@@ -547,7 +607,8 @@ def _locked(conn, workspace_id: int, device_id: Any) -> dict[str, Any]:
 
 def update_device(conn, workspace_id: int, device_id: Any, *, name: Any = UNSET,
                   actor_user_id: int | None) -> dict[str, Any]:
-    """输入：工作区、浏览器、新名称（UNSET = 不改）、操作人 → 输出：浏览器。只能改名。"""
+    """输入：工作区、浏览器、新名称（UNSET = 不改）、操作人 → 输出：浏览器。只能改名；名称为空、超过 64 个字或
+    含控制字符 → VALIDATION（field = name）。"""
     dev = _locked(conn, workspace_id, device_id)
     if name is not UNSET:
         n = _clean_name(name)
@@ -564,7 +625,8 @@ def remove_device(conn, workspace_id: int, device_id: Any, actor_user_id: int | 
     """输入：工作区、浏览器、操作人 → 输出：浏览器（hidden_at 非空）。
 
     只是把它从列表里清掉：记 hidden_at、写 'device.removed' 事件，不动令牌、不结束任何批次；这个浏览器再次联系时
-    自动回到列表。它有未结束的执行批次 → CONFLICT。已移除的原样返回。要停止某个买家号的采购，应暂停账号。
+    自动回到列表。被移除的浏览器不再占登记名额（register 的上限只数没有移除的），所以名额满了时在这里就能腾出来。
+    它有未结束的执行批次 → CONFLICT。已移除的原样返回。要停止某个买家号的采购，应暂停账号。
     """
     dev = _locked(conn, workspace_id, device_id)
     if dev["hidden_at"] is not None:

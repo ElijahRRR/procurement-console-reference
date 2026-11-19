@@ -279,6 +279,31 @@ def test_start_conflict_maps_each_unique_index(conn, workspace):
             "execution_runs_slot_once"} <= indexes
 
 
+def test_start_conflict_on_a_slot_answers_by_whether_its_run_finished_not_by_index_name(conn, workspace):
+    """两个浏览器同时为同一个时间点开始：…_per_account 与 …_slot_once 都会撞上，数据库报哪个不一定。答复只看事实：
+    占着时间点的批次还在执行 → ACCOUNT_BUSY（带持有者）；它以 finished 结束了 → SLOT_DONE。"""
+    acc = fx.exec_account(conn, workspace["id"], purchase_mode="scheduled", schedule_times=["09:30"], name="环境-DEMO-A")
+    holder = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-1")
+    late = devices.authenticate(conn, fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-2")["token"])
+    names = ("execution_runs_slot_once", "execution_runs_one_active_per_account", "", "some_future_index")
+    run_id = fx.start(conn, holder, trigger="scheduled", slot="09:30")
+    for name in names:
+        e = execution._start_conflict(conn, late, acc, TODAY, "09:30", name)
+        assert e.code == "ACCOUNT_BUSY" and e.http_status == 409, name
+        assert e.detail["holder_device_id"] == holder["id"] and e.detail["holder_device_name"] == "定时-DEMO-1"
+    assert execution._slot_finished(conn, workspace["id"], acc["id"], TODAY, "09:30") is False
+    execution.finish_run(conn, holder, run_id)
+    assert execution._slot_finished(conn, workspace["id"], acc["id"], TODAY, "09:30") is True
+    for name in names + ("execution_runs_one_active_per_device",):
+        e = execution._start_conflict(conn, late, acc, TODAY, "09:30", name)
+        assert (e.code, e.message) == ("SLOT_DONE", "这个时间点今天已经执行过"), name
+    # 别的日期、别的时间点、手动批次都不算「这个时间点已经执行过」
+    assert execution._slot_finished(conn, workspace["id"], acc["id"], TODAY + timedelta(days=1), "09:30") is False
+    assert execution._slot_finished(conn, workspace["id"], acc["id"], TODAY, "10:00") is False
+    assert execution._start_conflict(conn, late, acc, TODAY, None, "execution_runs_one_active_per_account").code == \
+        "ACCOUNT_BUSY"
+
+
 # ── 定时批次与时间点 ──────────────────────────────────────────────────────────
 
 
@@ -295,14 +320,18 @@ def test_scheduled_run_records_slot_and_slot_runs_once_per_day(conn, workspace):
     run = fx.run_row(conn, out["run_id"])
     assert run["trigger"] == "scheduled" and run["scheduled_slot"] == "09:30" and run["bj_date"] == TODAY
     assert _run_events(conn)[0]["detail"]["scheduled_slot"] == "09:30"
-    # 同一时间点还在执行：别的浏览器来问 → SLOT_DONE（不是 ACCOUNT_BUSY，它不用下一分钟再问）
+    # 同一时间点还在执行：别的浏览器来问 → ACCOUNT_BUSY（带持有者，下一分钟再问）。还没执行完，不能说「已经执行过」：
+    # 批次要是没跑完就结束，时间点会重新空出来，那时得有人接手。
     e = _err(fx.start_run, conn, other, trigger="scheduled", slot="09:30")
-    assert e.code == "SLOT_DONE" and e.http_status == 409 and e.message == "这个时间点今天已经执行过"
-    # 另一个时间点：账号被占用 → ACCOUNT_BUSY（下一分钟再问）
+    assert e.code == "ACCOUNT_BUSY" and e.http_status == 409
+    assert e.detail["holder_device_id"] == dev["id"] and e.detail["holder_device_name"] == "定时-DEMO-1"
+    # 另一个时间点：账号被占用 → 同样是 ACCOUNT_BUSY
     assert _err(fx.start_run, conn, other, trigger="scheduled", slot="10:00").code == "ACCOUNT_BUSY"
     execution.finish_run(conn, dev, out["run_id"])
-    # 正常结束之后这个时间点今天不再执行；另一个时间点可以
-    assert _err(fx.start_run, conn, other, trigger="scheduled", slot="09:30").code == "SLOT_DONE"
+    # 正常结束之后才是 SLOT_DONE：这个时间点今天不再执行；另一个时间点可以
+    e = _err(fx.start_run, conn, other, trigger="scheduled", slot="09:30")
+    assert e.code == "SLOT_DONE" and e.http_status == 409 and e.message == "这个时间点今天已经执行过"
+    assert e.detail == {}
     assert _err(fx.start_run, conn, dev, trigger="scheduled", slot="09:30").code == "SLOT_DONE"
     second = fx.start_run(conn, other, trigger="scheduled", slot="10:00")
     assert fx.run_row(conn, second["run_id"])["scheduled_slot"] == "10:00"
@@ -328,6 +357,52 @@ def test_slot_is_free_again_when_the_run_did_not_finish(conn, workspace):
     fx.refresh_identity(conn, dev, acc)
     second = fx.start(conn, dev, trigger="scheduled", slot="09:30")
     assert second != first and fx.run_row(conn, second)["scheduled_slot"] == "09:30"
+
+
+@pytest.mark.parametrize("death", ["lease_expired", "buyer_block"])
+def test_slot_held_by_an_unfinished_run_is_account_busy_and_is_picked_up_after_the_run_dies(conn, workspace, death):
+    """到点时两个浏览器都登录着同一个买家号：A 开了这个时间点的批次，B 来问。批次还在跑时 B 得到 ACCOUNT_BUSY
+    （插件不记这个时间点，下一分钟再问），而不是「已经执行过」——否则 A 的批次没跑完就结束（浏览器崩了租约过期，
+    或结算页登录的是别的买家号被护栏拦下）之后，时间点虽然空出来了，却没有人会再来问，这个时间点的任务要等到
+    下一个时间点。B 再问时接手，把放下的那一笔做完；正常结束之后两个浏览器才得到 SLOT_DONE。"""
+    ws = workspace["id"]
+    acc = fx.exec_account(conn, ws, name="环境-DEMO-定时", purchase_mode="scheduled", schedule_times=["09:30"])
+    a = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-A")
+    b = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-B")
+    order = fx.assigned_order(conn, ws, acc)
+    run_a = fx.start(conn, a, trigger="scheduled", slot="09:30")
+    first = fx.claim(conn, a, run_a)
+
+    e = _err(fx.start_run, conn, b, trigger="scheduled", slot="09:30")
+    assert e.code == "ACCOUNT_BUSY" and e.http_status == 409
+    assert e.detail == {"holder_device_id": a["id"], "holder_device_name": "定时-DEMO-A", "since": NOW.isoformat()}
+    assert fx.run_row(conn, run_a)["ended_at"] is None and f.count(conn, "execution_runs") == 1
+
+    if death == "lease_expired":
+        clock.freeze(NOW + timedelta(seconds=400))
+        assert execution.sweep(conn)["expired_runs"] == [run_a]
+        fx.refresh_identity(conn, b, acc)
+    else:
+        v = execution.submit_guard(conn, a, first["attempt_id"],
+                                   fx.facts_for(conn, order, customer_id=fx.customer_id(999_999)))
+        assert v["code"] == "IDENTITY_MISMATCH"
+    assert fx.run_row(conn, run_a)["end_reason"] == {"lease_expired": "lease_expired",
+                                                     "buyer_block": "identity_mismatch"}[death]
+    assert fx.order_row(conn, order["id"])["status"] == "assigned"
+
+    run_b = fx.start(conn, b, trigger="scheduled", slot="09:30")                   # 空出来的时间点被接手
+    second = fx.claim(conn, b, run_b)
+    assert second["order_id"] == order["id"] and second["attempt_no"] == 2
+    assert fx.run_row(conn, run_b)["scheduled_slot"] == "09:30"
+    # B 的批次还在跑：A 再来问也是 ACCOUNT_BUSY
+    fx.refresh_identity(conn, a, acc)
+    assert _err(fx.start_run, conn, a, trigger="scheduled", slot="09:30").detail["holder_device_id"] == b["id"]
+    assert fx.complete_success(conn, b, second)["order_status"] == "purchased"
+    execution.finish_run(conn, b, run_b)
+    for dev in (a, b):
+        e = _err(fx.start_run, conn, dev, trigger="scheduled", slot="09:30")
+        assert (e.code, e.message) == ("SLOT_DONE", "这个时间点今天已经执行过")
+    assert f.count(conn, "execution_runs", "scheduled_slot = '09:30'") == 2
 
 
 def test_manual_run_blocks_scheduled_start_with_account_busy_not_slot_done(conn, workspace):

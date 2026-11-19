@@ -1,6 +1,6 @@
 """HTTP：浏览器自动登记与新的开始批次规则（契约 §5）——POST /plugin/v1/register 的每一种返回码、幂等与并发、
 旧版插件（0.1.0、不带 customer_id）得到看得懂的报错、登录状态全集与身份清洗、行被清扫删掉后 401 → 重新登记、
-开始批次的拒绝码（DEVICE_BUSY / IDENTITY_MISMATCH / SLOT_DONE …）、执行中途换买家号、护栏 buyer 项、
+开始批次的拒绝码（DEVICE_BUSY / IDENTITY_MISMATCH / ACCOUNT_BUSY / SLOT_DONE …）、执行中途换买家号、护栏 buyer 项、
 /auth/me 给出工作区 id。全部数据虚构（DEMO 名称、A1DEMO… 买家号 ID）。"""
 
 from __future__ import annotations
@@ -205,6 +205,13 @@ def test_login_states_and_identity_cleaning_over_http(owner, api):
         assert got["state"] == "ready" and got["customer_id"] == DEMO_CUSTOMER_ID and got["stale"] is False
         # 已登录但 signed_in 不是布尔 true：不算登录
         assert report({**identity(DEMO_CUSTOMER_ID), "signed_in": "yes"}, via)["state"] == "signed_out"
+    # 解析不了的 page_url：当作没有，不连累买家号（以前是 500，身份与最近联系时间都没记下）
+    for via in ("heartbeat", "identity"):
+        got = report({**identity(DEMO_CUSTOMER_ID), "page_url": "http://[::1"}, via)
+        assert got["state"] == "ready" and got["customer_id"] == DEMO_CUSTOMER_ID
+    with tx() as conn:
+        ident = conn.execute("SELECT identity FROM procure.devices WHERE id = %s", (dev["device_id"],)).fetchone()
+    assert ident["identity"]["page_url"] is None and ident["identity"]["customer_id"] == DEMO_CUSTOMER_ID
     # 身份不是对象才是参数错误
     err(plugin.post("/plugin/v1/heartbeat", json={"identity": "A1DEMO000001"}, headers=h), 422, "VALIDATION")
     err(plugin.post("/plugin/v1/identity", headers=h), 422, "VALIDATION")
@@ -266,8 +273,9 @@ def test_purged_browser_gets_401_then_reregisters_with_the_same_token(owner, api
 
 
 def test_scheduled_runs_need_a_due_slot_and_run_once_per_slot(owner, api):
-    """定时批次（北京 10:00）：必须带账号执行时间里已到点的 slot，否则 422（说明原因）；同一个时间点今天执行过 → 409
-    SLOT_DONE；两个浏览器登录同一个买家号时，第二个得到的是 SLOT_DONE 而不是又跑一遍。"""
+    """定时批次（北京 10:00）：必须带账号执行时间里已到点的 slot，否则 422（说明原因）。两个浏览器登录同一个买家号时，
+    第二个不会又跑一遍：第一个的批次还在执行 → 409 ACCOUNT_BUSY（带持有者，插件下一分钟再问）；它正常结束之后，
+    同一个时间点今天执行过 → 409 SLOT_DONE（插件记成已处理）。"""
     acc = create_account(owner, purchase_mode="scheduled", schedule_times=["09:30", "11:00"])
     manual = create_account(owner, name="环境-DEMO-手动", amazon_customer_id="A1DEMO000002")
     plugin = plugin_client(api)
@@ -291,16 +299,18 @@ def test_scheduled_runs_need_a_due_slot_and_run_once_per_slot(owner, api):
     with tx() as conn:
         row = conn.execute("SELECT * FROM procure.execution_runs WHERE id = %s", (run["run_id"],)).fetchone()
     assert row["trigger"] == "scheduled" and row["scheduled_slot"] == "09:30" and str(row["bj_date"]) == "2026-10-31"
-    # 进行中：另一个浏览器同一个时间点 → SLOT_DONE（先于 ACCOUNT_BUSY）；手动开 → ACCOUNT_BUSY
+    # 进行中：另一个浏览器同一个时间点 → ACCOUNT_BUSY（还没执行完，不能说「已经执行过」）；手动开也是 ACCOUNT_BUSY
     body = err(plugin.post("/plugin/v1/runs", json=run_body(acc, trigger="scheduled", slot="09:30"), headers=h2),
-               409, "SLOT_DONE")
-    assert body["message"] == "这个时间点今天已经执行过"
+               409, "ACCOUNT_BUSY")
+    assert body["detail"]["holder_device_id"] == dev["device_id"] and "正由浏览器" in body["message"]
+    assert set(body["detail"]) == {"holder_device_id", "holder_device_name", "since"}
     err(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h2), 409, "ACCOUNT_BUSY")
     ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/finish", json={"reason": "finished"}, headers=h))
-    # 结束后：同一个时间点今天不再执行；手动随时可以
+    # 正常结束后：同一个时间点今天不再执行（两个浏览器都一样）；手动随时可以
     for hh in (h, h2):
-        err(plugin.post("/plugin/v1/runs", json=run_body(acc, trigger="scheduled", slot="09:30"), headers=hh),
-            409, "SLOT_DONE")
+        body = err(plugin.post("/plugin/v1/runs", json=run_body(acc, trigger="scheduled", slot="09:30"), headers=hh),
+                   409, "SLOT_DONE")
+        assert body["message"] == "这个时间点今天已经执行过" and body["detail"] == {}
     again = ok(plugin.post("/plugin/v1/runs", json=run_body(acc), headers=h2))
     with tx() as conn:
         assert conn.execute("SELECT scheduled_slot FROM procure.execution_runs WHERE id = %s",
@@ -310,6 +320,33 @@ def test_scheduled_runs_need_a_due_slot_and_run_once_per_slot(owner, api):
     clock.freeze(NOW + timedelta(days=1))
     ok(plugin.post("/plugin/v1/heartbeat", json={"identity": identity(DEMO_CUSTOMER_ID)}, headers=h))
     ok(plugin.post("/plugin/v1/runs", json=run_body(acc, trigger="scheduled", slot="09:30"), headers=h))
+
+
+def test_slot_whose_run_died_is_taken_over_by_the_browser_that_asked_while_it_was_running(owner, api):
+    """到点时在线的第二个浏览器：批次还在跑时得到的是 ACCOUNT_BUSY，不是 SLOT_DONE，所以它不会把这个时间点记掉；
+    第一个浏览器没跑完就断了（租约过期）之后，它再问就接手，把这个时间点的任务做完。"""
+    acc = create_account(owner, purchase_mode="scheduled", schedule_times=["09:30"])
+    import_orders(owner, [import_row("PO-DEMO-SLOT-1")])
+    assert find_order(owner, "PO-DEMO-SLOT-1")["status"] == "assigned"
+    plugin = plugin_client(api)
+    first, second = register_device(plugin, acc), register_device(plugin, acc)
+    h1, h2 = bearer(first["token"]), bearer(second["token"])
+    slot = run_body(acc, trigger="scheduled", slot="09:30")
+    run = ok(plugin.post("/plugin/v1/runs", json=slot, headers=h1))
+    att = ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/next", headers=h1))["attempt"]
+    assert att is not None
+    body = err(plugin.post("/plugin/v1/runs", json=slot, headers=h2), 409, "ACCOUNT_BUSY")
+    assert body["detail"]["holder_device_id"] == first["device_id"]
+    clock.freeze(NOW + timedelta(seconds=400))                              # 第一个浏览器再没有心跳
+    assert sweep_wf.run()["expired_runs"] == [run["run_id"]]
+    assert find_order(owner, "PO-DEMO-SLOT-1")["status"] == "assigned"
+    ok(plugin.post("/plugin/v1/heartbeat", json={"identity": identity(DEMO_CUSTOMER_ID)}, headers=h2))
+    again = ok(plugin.post("/plugin/v1/runs", json=slot, headers=h2))        # 下一分钟再问：接手
+    taken = ok(plugin.post(f"/plugin/v1/runs/{again['run_id']}/next", headers=h2))["attempt"]
+    assert taken["order_id"] == att["order_id"] and taken["attempt_no"] == 2
+    with tx() as conn:
+        rows = conn.execute("SELECT id, end_reason, scheduled_slot FROM procure.execution_runs ORDER BY id").fetchall()
+    assert [(r["end_reason"], r["scheduled_slot"]) for r in rows] == [("lease_expired", "09:30"), (None, "09:30")]
 
 
 # ── 执行中途换了买家号、护栏 buyer 项 ─────────────────────────────────────────

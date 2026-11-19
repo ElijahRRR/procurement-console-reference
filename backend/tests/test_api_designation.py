@@ -6,8 +6,8 @@
 - GET /accounts/discovered 并入来源指定的买家号 ID（source_orders、browsers 为空、include_ignored 列出全部忽略的 ID）、
   概览 discovered_buyers；登记（新建账号 / 填到已有账号）后任务立刻分给它；
 - 人工改派优先，解除分配后回到来源指定的账号；重新上传改了买家号 → 时间线上有「来源指定的买家号变了」；
-- 导出的「买家号」「分配账号」两列，导出再导入不会把自动分配变成来源指定；
-- 飞书读取结果里「找不到买家号列」的问题项；
+- 导出的「买家号」「买家号ID」「分配账号」三列，导出再导入不会把自动分配变成来源指定，也不会丢掉指定里的买家号 ID；
+- 飞书读取结果、读取记录与连接的 last_stats 里「找不到买家号列」的问题项，新记录暂不接收；
 - 跨工作区：指定只在自己的工作区里解析，待登记的买家号、忽略名单、导出互不可见。
 
 全部数据虚构（环境-DEMO-A、A1DEMO…、PO-DEMO-…）。
@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import io
+from datetime import timedelta
 
 import openpyxl
 import pytest
@@ -36,7 +37,8 @@ STATS_KEYS = {"considered", "assigned", "coverage", "fill", "designated", "unass
 NOT_REGISTERED = ("来源指定的买家号 ID A1DEMO999999（买家号「环境-DEMO-新」）还没有登记为账号；"
                   "在「账号与浏览器」登记后会自动分配")
 BAD_SHAPE = "来源指定的买家号 ID「12345」格式不对（应以 A 开头，至少 9 位大写字母或数字）；在来源里改正或清空后会重新分配"
-NO_SUCH_NAME = "来源指定的买家号「#N/A」没有同名账号；新建同名账号、在来源里改正，或改派到其他账号"
+ERROR_VALUE = "来源的买家号是表格错误值 #N/A，读不出指定的买家号；在来源里改正后会重新分配"
+ADVICE = "未采用；要改请在主来源里改，或在控制台改派（这条来源之后再改买家号，会按改后的应用）"
 
 
 def _row(no: str, name: str | None = None, cid: str | None = None, **kw):
@@ -105,7 +107,7 @@ def test_import_preview_issues_then_commit_assigns_by_designation(owner):
     by_no = {u["upstream_order_no"]: u for u in alloc["unassigned"]}
     assert {no: (u["reason"], u["designated"]) for no, u in by_no.items()} == {
         "PO-DEMO-D0003": (NOT_REGISTERED, True), "PO-DEMO-D0006": (BAD_SHAPE, True),
-        "PO-DEMO-D0007": (NO_SUCH_NAME, True)}
+        "PO-DEMO-D0007": (ERROR_VALUE, True)}
     assert all(set(u) == {"order_id", "upstream_order_no", "reason", "designated"} for u in alloc["unassigned"])
     assert ok(owner.get("/api/v1/allocation/last")) == alloc
 
@@ -129,7 +131,7 @@ def test_import_preview_issues_then_commit_assigns_by_designation(owner):
     assert rows["PO-DEMO-D0004"]["assigned_account"]["id"] == a["id"]        # A 当天首单（保底）
     assert (rows["PO-DEMO-D0006"]["status"], rows["PO-DEMO-D0006"]["status_reason"]) == ("queued", BAD_SHAPE)
     assert rows["PO-DEMO-D0006"]["designated_buyer"] == {"customer_id": "12345", "name": None, "account": None}
-    assert (rows["PO-DEMO-D0007"]["status"], rows["PO-DEMO-D0007"]["status_reason"]) == ("queued", NO_SUCH_NAME)
+    assert (rows["PO-DEMO-D0007"]["status"], rows["PO-DEMO-D0007"]["status_reason"]) == ("queued", ERROR_VALUE)
     assert rows["PO-DEMO-D0007"]["designated_buyer"] == {"customer_id": None, "name": "#N/A", "account": None}
     assert all("designated_buyer" in r for r in rows.values())
     assert all(set(r["designated_buyer"]) == DESIGNATED_KEYS for r in rows.values() if r["designated_buyer"])
@@ -522,17 +524,21 @@ def _export(client, **params) -> list[dict]:
 
 
 def test_export_buyer_column_is_the_designation_and_assigned_account_is_separate(owner, api):
-    """导出（契约 §7）：没有采购结果时「买家号」只写来源指定的买家号，已分配的账号在另一列「分配账号」；有采购结果后
-    「买家号」是采购账号。导出文件原样再上传，自动分配的任务不会变成来源指定。"""
+    """导出（契约 §7）：没有采购结果时「买家号」「买家号ID」只写来源指定的两列，已分配的账号在另一列「分配账号」；
+    有采购结果后这两列是采购账号的名称与它登记的买家号 ID。导出文件原样再上传，自动分配的任务不会变成来源指定。"""
     a, b = _two_accounts(owner)
     imp = _import(owner, [_row("PO-DEMO-X0001", name="环境-DEMO-B"), _row("PO-DEMO-X0002"),
                           _row("PO-DEMO-X0003", cid=ID_B), _row("PO-DEMO-X0004", name="环境-DEMO-无")])
-    assert exports.EXPORT_HEADERS[:5] == ["平台订单号", "状态", "买家号", "分配账号", "AMZ订单号"]
+    assert exports.EXPORT_HEADERS[:6] == ["平台订单号", "状态", "买家号", "买家号ID", "分配账号", "AMZ订单号"]
     by_no = {r["平台订单号"]: r for r in _export(owner, view="all")}
-    assert (by_no["PO-DEMO-X0001"]["买家号"], by_no["PO-DEMO-X0001"]["分配账号"]) == ("环境-DEMO-B", "环境-DEMO-B")
-    assert (by_no["PO-DEMO-X0002"]["买家号"], by_no["PO-DEMO-X0002"]["分配账号"]) == (None, "环境-DEMO-A")
-    assert (by_no["PO-DEMO-X0003"]["买家号"], by_no["PO-DEMO-X0003"]["分配账号"]) == (None, "环境-DEMO-B")
-    assert (by_no["PO-DEMO-X0004"]["买家号"], by_no["PO-DEMO-X0004"]["分配账号"]) == ("环境-DEMO-无", None)
+
+    def cols(no):
+        return by_no[no]["买家号"], by_no[no]["买家号ID"], by_no[no]["分配账号"]
+
+    assert cols("PO-DEMO-X0001") == ("环境-DEMO-B", None, "环境-DEMO-B")
+    assert cols("PO-DEMO-X0002") == (None, None, "环境-DEMO-A")
+    assert cols("PO-DEMO-X0003") == (None, ID_B, "环境-DEMO-B")
+    assert cols("PO-DEMO-X0004") == ("环境-DEMO-无", None, None)
     assert by_no["PO-DEMO-X0004"]["状态"] == "待分配" and "没有同名账号" in by_no["PO-DEMO-X0004"]["异常原因"]
     batch = {r["平台订单号"]: r for r in _export(owner, batch_id=imp["upload"]["batch_id"])}
     assert batch == by_no
@@ -551,13 +557,14 @@ def test_export_buyer_column_is_the_designation_and_assigned_account_is_separate
                          "amounts": {"total": "25.00"}}, headers=h))
     ok(plugin.post(f"/plugin/v1/runs/{run['run_id']}/finish", json={}, headers=h))
     bought = {r["平台订单号"]: r for r in _export(owner, view="all")}["PO-DEMO-X0002"]
-    assert (bought["状态"], bought["买家号"], bought["分配账号"], bought["结果来源"]) == \
-        ("已采购", "环境-DEMO-A", "环境-DEMO-A", "模拟")
+    assert (bought["状态"], bought["买家号"], bought["买家号ID"], bought["分配账号"], bought["结果来源"]) == \
+        ("已采购", "环境-DEMO-A", ID_A, "环境-DEMO-A", "模拟")
 
     # 导出文件原样再上传：「分配账号」不被认成买家号列；自动分配的 / 已买的任务都不会多出指定
     data = owner.get("/api/v1/exports/orders.xlsx", params={"view": "all"}).content
     up = upload(owner, data, filename="采购结果-DEMO.xlsx")
     assert up["suggested_mapping"]["买家号"] == "external_buyer_account" and up["suggested_mapping"]["分配账号"] is None
+    assert up["suggested_mapping"]["买家号ID"] == "external_buyer_customer_id"
     ok(owner.post(f"/api/v1/imports/{up['batch_id']}/preview", json={"sheet": up["sheet"],
                                                                      "mapping": up["suggested_mapping"]}))
     ok(owner.post(f"/api/v1/imports/{up['batch_id']}/commit"))
@@ -568,6 +575,46 @@ def test_export_buyer_column_is_the_designation_and_assigned_account_is_separate
     assert rows["PO-DEMO-X0003"]["designated_buyer"] == {"customer_id": ID_B, "name": None,
                                                          "account": {"id": b["id"], "name": b["name"]}}
     assert rows["PO-DEMO-X0004"]["designated_buyer"]["name"] == "环境-DEMO-无"
+
+
+def test_export_reimport_keeps_id_and_name_designation(owner):
+    """ALLOC-1（HTTP）：指定同时写了买家号 ID 与买家号的任务，导出文件原样再上传后一列不丢——指定、状态、账号、
+    分配方式、说明都不变，预览里没有「来源指定的买家号由…改为…」，时间线上没有 order.designation_changed。
+    之前导出没有「买家号ID」列：ID 被悄悄丢掉，任务被拉回待分配，或者落到名称指向的另一个账号上。"""
+    a, b = _two_accounts(owner)
+    day = {"建议采购日期": "2026-10-31"}                               # 来源给了日期：导出再上传时别的字段也都不变
+    _import(owner, [
+        _row("PO-DEMO-Y0001", cid=ID_B, name="店铺小号-DEMO", **day),  # ID 命中 B，名称谁也对不上
+        _row("PO-DEMO-Y0002", cid=ID_B, name="环境-DEMO-A", **day),    # ID 与名称指向不同账号：不分配
+        _row("PO-DEMO-Y0003", cid=ID_B, name="环境-DEMO-B", **day),    # ID 与名称都是 B
+        _row("PO-DEMO-Y0004", cid=ID_B, **day),                        # 只有 ID
+    ])
+    keys = ("status", "status_reason", "assigned_account", "assignment_kind", "assignment_note", "designated_buyer")
+    before = {no: {k: r[k] for k in keys} for no, r in _rows(owner).items()}
+    acc_b = {"id": b["id"], "name": "环境-DEMO-B"}
+    assert before["PO-DEMO-Y0001"]["assignment_note"] == \
+        f"按来源的买家号 ID {ID_B}（来源写的买家号「店铺小号-DEMO」与账号名称不同）"
+    assert (before["PO-DEMO-Y0002"]["status"], before["PO-DEMO-Y0002"]["assigned_account"]) == ("queued", None)
+    assert "不是同一个账号" in before["PO-DEMO-Y0002"]["status_reason"]
+    assert before["PO-DEMO-Y0003"]["designated_buyer"] == {"customer_id": ID_B, "name": "环境-DEMO-B",
+                                                           "account": acc_b}
+
+    by_no = {r["平台订单号"]: r for r in _export(owner, view="all")}
+    assert [(by_no[f"PO-DEMO-Y000{i}"]["买家号ID"], by_no[f"PO-DEMO-Y000{i}"]["买家号"]) for i in (1, 2, 3, 4)] == [
+        (ID_B, "店铺小号-DEMO"), (ID_B, "环境-DEMO-A"), (ID_B, "环境-DEMO-B"), (ID_B, None)]
+    data = owner.get("/api/v1/exports/orders.xlsx", params={"view": "all"}).content
+    up = upload(owner, data, filename="采购结果-DEMO.xlsx")
+    assert up["suggested_mapping"]["买家号ID"] == "external_buyer_customer_id"
+    pv = ok(owner.post(f"/api/v1/imports/{up['batch_id']}/preview",
+                       json={"sheet": up["sheet"], "mapping": up["suggested_mapping"]}))
+    assert [(r["verdict"], r["reason"]) for r in pv["rows"]["rows"]] == [("unchanged", None)] * 4
+    cm = ok(owner.post(f"/api/v1/imports/{up['batch_id']}/commit"))
+    assert cm["stats"]["unchanged"] == 4 and cm["stats"]["update"] == 0
+    after = {no: {k: r[k] for k in keys} for no, r in _rows(owner).items()}
+    assert after == before
+    for no, r in _rows(owner).items():
+        kinds = {e["kind"] for e in ok(owner.get(f"/api/v1/orders/{r['id']}"))["events"]}
+        assert not {"order.designation_changed", "order.designation_not_adopted"} & kinds, no
 
 
 def test_template_download_explains_the_two_buyer_columns(owner):
@@ -601,7 +648,9 @@ def fake(monkeypatch):
 
 def test_feishu_sync_reports_a_missing_buyer_column_and_keeps_the_designation(owner, fake):
     """验收第 4 条（HTTP，飞书）：改了买家号 → 立即读取后任务改到新账号；来源表里找不到买家号列 → 读取结果第一条
-    问题项说明「本次没有更新指定」（scope = connection，不计入 skipped），任务的指定不变。"""
+    问题项说明这一列的指定保持上次读到的内容、新记录暂不接收（scope = connection，不计入 skipped），任务的指定不变；
+    这条连接级问题也带在连接的 last_stats.problems 里（定时读取时控制台的连接卡片靠它提示），新记录不会被建成
+    没有指定的任务分给别的账号。"""
     a, b = _two_accounts(owner)
     fake.add_record(ff.DEMO_APP, ff.DEMO_TABLE, "recDEMO0001",
                     ff.order_fields("PO-DEMO-S0001", 买家号id=ff.text(ID_A)))
@@ -626,9 +675,10 @@ def test_feishu_sync_reports_a_missing_buyer_column_and_keeps_the_designation(ow
     for rec in table["records"].values():
         rec.pop("买家号id", None)
     sync = ok(owner.post(f"/api/v1/feishu/connections/{cid}/sync"))
-    assert sync["problems"][0] == {"record_id": None, "upstream_order_no": "买家号列", "verdict": "skipped",
-                                   "reason": "来源表里找不到买家号列「买家号id」，本次没有更新指定",
-                                   "scope": "connection"}
+    notice = {"record_id": None, "upstream_order_no": "买家号列", "verdict": "skipped",
+              "reason": "来源表里找不到买家号列「买家号id」，这一列的指定保持上次读到的内容，新记录暂不接收",
+              "scope": "connection"}
+    assert sync["problems"] == [notice]
     assert sync["skipped"] == 0 and sync["update"] == 0
     row = find_order(owner, "PO-DEMO-S0001")
     assert (row["assignment_kind"], row["assigned_account"]["id"]) == ("source", b["id"])
@@ -636,16 +686,55 @@ def test_feishu_sync_reports_a_missing_buyer_column_and_keeps_the_designation(ow
     runs = ok(owner.get(f"/api/v1/feishu/connections/{cid}/runs"))
     assert runs["rows"][0]["ok"] is True and runs["rows"][0]["stats"]["problems"][0]["scope"] == "connection"
 
+    # 定时读取（后台调度走的路）：这期间表里多了一条新记录，买家号写在还读得到的「买家号」列里。
+    # 读不全它的指定 → 暂不接收（不建任务，更不会自动分给别的账号）；连接卡片读 last_stats.problems 就能提示
+    from workflows import feishu_intake as intake_workflow
+
+    fake.add_record(ff.DEMO_APP, ff.DEMO_TABLE, "recDEMO0002",
+                    ff.order_fields("PO-DEMO-S0002", 买家号=ff.text("环境-DEMO-B")))
+    clock.freeze(clock.now() + timedelta(hours=30))
+    scheduled = intake_workflow.run()                                         # 不带连接 id = 定时读取
+    assert scheduled["due"] == 1 and scheduled["connections"][str(cid)]["skipped"] == 1
+    listed = {c["id"]: c for c in ok(owner.get("/api/v1/feishu/connections"))["rows"]}[cid]
+    assert listed["last_error"] is None and listed["last_stats"]["problems"] == [notice]
+    assert listed["last_stats"]["skipped"] == 1 and listed["last_stats"]["new"] == 0
+    latest = ok(owner.get(f"/api/v1/feishu/connections/{cid}/runs"))["rows"][0]
+    assert latest["trigger"] == "schedule" and latest["stats"]["problems"] == [notice, {
+        "record_id": "recDEMO0002", "upstream_order_no": "PO-DEMO-S0002", "verdict": "skipped",
+        "reason": "来源表里找不到买家号列「买家号id」，读不出这一行有没有指定买家号，暂不接收；"
+                  "恢复这一列或改字段对应后会自动接收"}]
+    assert "PO-DEMO-S0002" not in _rows(owner)
+    assert all(r["assignment_kind"] != "auto" for r in _rows(owner).values())
+
     # 另一种来源（文件）第一次提到这笔任务、带了不同的买家号：飞书是主来源，文件的不采用，预览里写明
     up = upload(owner, xlsx_bytes([_row("PO-DEMO-S0001", cid=ID_A, 建议采购日期="2026-10-31")], headers=HEADERS))
     pv = ok(owner.post(f"/api/v1/imports/{up['batch_id']}/preview",
                        json={"sheet": up["sheet"], "mapping": up["suggested_mapping"]}))
     assert pv["rows"]["rows"][0]["issues"] == [
-        f"文件来源的买家号「{ID_A}」与任务现有的指定「{ID_B}」不同，未采用（要改请在主来源里改，或在控制台改派）"]
+        f"文件来源的买家号「{ID_A}」与任务现有的指定「{ID_B}」不同，{ADVICE}"]
     ok(owner.post(f"/api/v1/imports/{up['batch_id']}/commit"))
     row = find_order(owner, "PO-DEMO-S0001")
     assert (row["assignment_kind"], row["assigned_account"]["id"]) == ("source", b["id"])
     assert row["designated_buyer"]["customer_id"] == ID_B and row["source_kinds"] == ["feishu", "file"]
+    # 没采用的那一句不只在预览里：任务时间线上有一条 order.designation_not_adopted
+    events = [e for e in ok(owner.get(f"/api/v1/orders/{row['id']}"))["events"]
+              if e["kind"] == "order.designation_not_adopted"]
+    assert len(events) == 1 and events[0]["detail"]["source"]["kind"] == "file"
+    assert events[0]["detail"]["stated"] == {"customer_id": ID_A, "name": None}
+    assert events[0]["detail"]["current"] == {"customer_id": ID_B, "name": None}
+    assert events[0]["detail"]["previous"] is None
+
+    # 列找回来之后：连接上的提醒消失（last_stats 不再带 problems），之前暂不接收的新记录自动接收并按指定分配
+    for fdef in table["fields"]:
+        if fdef["field_name"] == "买家号ID（改名）":
+            fdef["field_name"] = "买家号id"
+    clock.freeze(clock.now() + timedelta(hours=30))
+    sync = ok(owner.post(f"/api/v1/feishu/connections/{cid}/sync"))
+    assert sync["new"] == 1 and sync["problems"] == []
+    listed = {c["id"]: c for c in ok(owner.get("/api/v1/feishu/connections"))["rows"]}[cid]
+    assert "problems" not in listed["last_stats"]
+    new_row = find_order(owner, "PO-DEMO-S0002")
+    assert (new_row["assignment_kind"], new_row["assigned_account"]["id"]) == ("source", b["id"])
 
 
 # ── 跨工作区 ─────────────────────────────────────────────────────────────────

@@ -341,24 +341,31 @@ def test_buyer_block_rederives_the_task_when_the_source_changed_after_claim(conn
 
 
 def test_buyer_block_ending_a_scheduled_run_leaves_the_slot_free_for_another_browser(conn, workspace):
-    """定时批次被 buyer 项拦截结束：和租约过期一样不占这个时间点（只有 finished 才占），登录着正确买家号的另一个
-    浏览器今天还能为同一个时间点开批次，把放下的那一笔做完。"""
+    """定时批次被 buyer 项拦截结束：和租约过期一样不占这个时间点（只有 finished 才算「已经执行过」），登录着正确
+    买家号的另一个浏览器今天还能为同一个时间点开批次，把放下的那一笔做完。接手的是到点时就在线的浏览器：批次还
+    在跑时它来问过，得到的是 ACCOUNT_BUSY 而不是 SLOT_DONE，所以没有把这个时间点记掉。接手的批次在跑时，后来才
+    登记的第三个浏览器同样得到 ACCOUNT_BUSY；正常结束之后三个浏览器都是 SLOT_DONE。"""
     ws = workspace["id"]
     acc = fx.exec_account(conn, ws, name="环境-DEMO-定时", purchase_mode="scheduled", schedule_times=["09:30"])
     dev = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-1")
+    pc = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-2")       # 到点时就在线
     order = fx.assigned_order(conn, ws, acc)
     run_id = fx.start(conn, dev, trigger="scheduled", slot="09:30")
     a = fx.claim(conn, dev, run_id)
+    asked = _err(fx.start_run, conn, pc, trigger="scheduled", slot="09:30")           # 批次还在跑：不是 SLOT_DONE
+    assert asked.code == "ACCOUNT_BUSY" and asked.detail["holder_device_id"] == dev["id"]
     execution.submit_guard(conn, dev, a["attempt_id"], fx.facts_for(conn, order, customer_id=OTHER))
     run = fx.run_row(conn, run_id)
     assert (run["end_reason"], run["scheduled_slot"]) == ("identity_mismatch", "09:30")
-    pc = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-2")
     again = fx.start(conn, pc, trigger="scheduled", slot="09:30")
+    late = fx.logged_in_device(conn, workspace, account=acc, name="定时-DEMO-3")     # 批次结束之后才来的
+    assert _err(fx.start_run, conn, late, trigger="scheduled", slot="09:30").code == "ACCOUNT_BUSY"
     b = fx.claim(conn, pc, again)
     assert b["order_id"] == order["id"] and b["attempt_no"] == 2
     assert fx.complete_success(conn, pc, b)["order_status"] == "purchased"
     execution.finish_run(conn, pc, again)
-    assert _err(fx.start_run, conn, dev, trigger="scheduled", slot="09:30").code == "SLOT_DONE"
+    for d in (dev, pc, late):
+        assert _err(fx.start_run, conn, d, trigger="scheduled", slot="09:30").code == "SLOT_DONE"
 
 
 def test_run_end_reason_labels_cover_the_new_and_the_legacy_reason(conn, workspace):

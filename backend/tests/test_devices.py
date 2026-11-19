@@ -150,13 +150,84 @@ def test_register_refuses_beyond_max_devices_per_workspace(conn, workspace, monk
     other = f.make_workspace(conn)
     first = fx.device_token()
     devices.register(conn, first, workspace_id=workspace["id"])
-    hidden = devices.register(conn, fx.device_token(), workspace_id=workspace["id"])
-    devices.remove_device(conn, workspace["id"], hidden["device_id"], None)      # 已移除的行也占名额
+    devices.register(conn, fx.device_token(), workspace_id=workspace["id"])
     e = _err(devices.register, conn, TOKEN, workspace_id=workspace["id"])
-    assert e.code == "RATE_LIMITED" and e.http_status == 429 and e.message == "登记的浏览器太多：请稍后再试"
+    assert e.code == "RATE_LIMITED" and e.http_status == 429 and e.detail == {}
+    # 说明里写的是所有者能做的事；「请稍后再试」是错的——等多久名额都不会自己空出来
+    assert e.message == devices.MAX_DEVICES_MESSAGE == \
+        "登记的浏览器太多：请在控制台「账号与浏览器」里移除不用的浏览器，或调大 PC_MAX_DEVICES"
+    assert f.count(conn, "devices", "workspace_id = %s", (workspace["id"],)) == 2            # 被拒绝的没有留下行
     assert devices.register(conn, first, workspace_id=workspace["id"])["created"] is False   # 已登记的不受影响
     assert devices.register(conn, TOKEN, workspace_id=other["id"])["created"] is True        # 别的工作区另算
     assert settings.get().max_devices == 2
+
+
+def test_removing_a_browser_frees_a_slot_and_its_return_is_not_capped(conn, workspace, monkeypatch):
+    """上限只数没有被移除的浏览器：名额满了，所有者在控制台移除一个，马上就能再登记一个（不靠清扫删行，也不用改
+    配置）。被移除的浏览器再联系时回到列表、不查上限，所以显示出来的可以比上限多出回来的那几个；新令牌照样被拒绝。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    _setting(monkeypatch, max_devices=2)
+    keep = fx.registered_device(conn, workspace)
+    gone = fx.registered_device(conn, workspace)
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    devices.remove_device(conn, ws, gone["id"], uid)
+    assert [d["id"] for d in devices.list_devices(conn, ws)] == [keep["id"]]
+    assert execution.sweep(conn)["removed_devices"] == []                        # 行还在，只是不再占名额
+    new = devices.register(conn, TOKEN)
+    assert new["created"] is True
+    e = _err(devices.register, conn, fx.device_token())                          # 又满了
+    assert e.code == "RATE_LIMITED" and "稍后再试" not in e.message
+    # 被移除的那个再联系（心跳 / 登记都一样）：回到列表，不查上限
+    clock.freeze(NOW + timedelta(minutes=1))
+    assert devices.heartbeat(conn, gone)["device"]["id"] == gone["id"]
+    assert devices.register(conn, gone["token"])["created"] is False
+    assert sorted(d["id"] for d in devices.list_devices(conn, ws)) == sorted([keep["id"], gone["id"],
+                                                                              new["device_id"]])
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 再移除两个才低于上限
+    devices.remove_device(conn, ws, gone["id"], uid)
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    devices.remove_device(conn, ws, keep["id"], uid)
+    assert devices.register(conn, fx.device_token())["created"] is True
+
+
+def test_max_devices_ignores_browsers_not_seen_within_retention(conn, workspace, monkeypatch):
+    """换了令牌留下的旧行过了保留期（PC_DEVICE_RETENTION_DAYS 天没有联系）就不再占名额。执行过批次的旧行清扫不会删
+    （留给历史记录显示名称），以前它们永远占着名额：攒到上限后谁也登记不进来，而且等多久都没用。"""
+    ws = workspace["id"]
+    _setting(monkeypatch, max_devices=2)
+    days = settings.get().device_retention_days
+    acc = fx.exec_account(conn, ws)
+    stale = []
+    for i, hidden_at in enumerate((None, NOW)):
+        d = f.make_device(conn, ws, name=f"旧环境-DEMO-{i}", last_seen_at=NOW - timedelta(days=days + 1),
+                          hidden_at=hidden_at)
+        run = f.make_run(conn, ws, acc["id"], d["id"])
+        conn.execute("UPDATE procure.execution_runs SET ended_at = %s, end_reason = 'finished' WHERE id = %s",
+                     (NOW - timedelta(days=days + 1), run["id"]))
+        stale.append(d)
+    assert execution.sweep(conn)["removed_devices"] == []                        # 有批次的行留作历史
+    assert f.count(conn, "devices", "workspace_id = %s", (ws,)) == 2
+    first = devices.register(conn, TOKEN)
+    assert first["created"] is True                                              # 旧行不占名额
+    edge = f.make_device(conn, ws, name="正好 30 天", last_seen_at=NOW - timedelta(days=days))
+    assert devices.retention_cutoff(NOW) == NOW - timedelta(days=days)
+    e = _err(devices.register, conn, fx.device_token())                          # 刚登记的 + 正好在保留期边上的 = 2
+    assert e.code == "RATE_LIMITED" and e.http_status == 429 and e.message == devices.MAX_DEVICES_MESSAGE
+    clock.freeze(NOW + timedelta(seconds=1))                                     # 边上的那个过了保留期
+    assert devices.register(conn, fx.device_token())["created"] is True
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 从未联系过的按登记时间算
+    conn.execute("UPDATE procure.devices SET last_seen_at = NULL, created_at = %s WHERE id = %s",
+                 (NOW - timedelta(days=days + 5), first["device_id"]))
+    assert devices.register(conn, fx.device_token())["created"] is True
+    # 旧环境回来了：照常认它（不查上限），之后又算在用
+    row = devices.heartbeat(conn, {"id": stale[0]["id"], "workspace_id": ws})
+    assert row["device"]["id"] == stale[0]["id"]
+    assert _err(devices.register, conn, fx.device_token()).code == "RATE_LIMITED"
+    # 清扫用的是同一个截止时刻：不再占名额的行里，没有历史的被删掉，有批次的留着
+    assert execution.sweep(conn)["removed_devices"] == sorted([edge["id"], first["device_id"]])
+    assert f.count(conn, "devices", "id = %s", (stale[1]["id"],)) == 1
 
 
 def test_default_limits_come_from_registry():
@@ -232,13 +303,92 @@ def test_clean_identity_shape_flags_and_page_url():
     assert devices.clean_identity({"signed_in": "true", "customer_id": "A1DEMO00000"})["signed_in"] is False
     assert devices.clean_identity({})  == {"signed_in": False, "customer_id": None, "site": None, "page_url": None,
                                            "conflict": False}
-    assert devices.clean_identity({"page_url": "/gp/css?x=1#y"})["page_url"] == "/gp/css"
+    assert devices.clean_identity({"page_url": "/gp/css?x=1#y"})["page_url"] is None     # 没有主机：不存
     assert devices.login_customer_id({"signed_in": False, "customer_id": "A1DEMO00000", "conflict": False}) is None
     assert devices.login_customer_id(None) is None
     for bad in ("signed in", None, ["x"], 5):
         with pytest.raises(DomainError) as e:
             devices.clean_identity(bad)
         assert e.value.code == "VALIDATION"
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("https://www.amazon.com/gp/css/order-history", "https://www.amazon.com/gp/css/order-history"),
+    ("HTTPS://WWW.Amazon.COM:8443/Gp/Buy?x=1#y", "https://www.amazon.com:8443/Gp/Buy"),
+    ("http://www.amazon.com", "http://www.amazon.com"),
+    ("https://www.amazon.com/?ref=DEMO", "https://www.amazon.com/"),
+    # 用户名密码不存
+    ("https://demo-user:demo-pass@www.amazon.com/p?q=1", "https://www.amazon.com/p"),
+    ("https://demo-user@www.amazon.com:443/p", "https://www.amazon.com:443/p"),
+    ("http://[::1]:8790/a/b?x", "http://[::1]:8790/a/b"),
+    # 别的协议、没有主机、不是地址：当作没有
+    ("javascript:alert(1)", None), ("chrome-extension://abcdefghijklmnop/popup.html", None),
+    ("file:///etc/hosts", None), ("data:text/html,demo", None), ("about:blank", None), ("ftp://demo.example/x", None),
+    ("//www.amazon.com/gp/css", None), ("www.amazon.com/gp/css?x=1", None), ("https:///gp/css", None),
+    ("https://", None), ("", None), ("   ", None), (None, None), (5, None), (["https://www.amazon.com/"], None),
+    ({"href": "https://www.amazon.com/"}, None),
+    # 解析不了的（urlsplit 抛 ValueError）：当作没有，不是 500，也不退回去存原文
+    ("http://[::1", None), ("https://[amazon]/gp/css/order-history?session=DEMO", None),
+    ("https://www.amazon.com]/x", None), ("//[x/y", None), ("https://[zz]/x", None),
+    ("https://www.amazon.com:demo/x", None), ("https://www.amazon.com:99999/x", None),
+    # PostgreSQL 存不了的字符先去掉
+    ("https://www.amazon.com/a\x00b", "https://www.amazon.com/ab"),
+    ("https://www.amazon.com/a\ud800b?x=\udfff", "https://www.amazon.com/ab"),
+])
+def test_clean_identity_page_url_keeps_only_http_origin_and_path(raw, clean):
+    out = devices.clean_identity({"signed_in": True, "customer_id": "A1DEMO00000", "page_url": raw})
+    assert out["page_url"] == clean
+    assert out["customer_id"] == "A1DEMO00000" and out["signed_in"] is True      # 坏地址不连累别的字段
+
+
+def test_clean_identity_page_url_is_capped_at_500_chars():
+    out = devices.clean_identity({"page_url": "https://www.amazon.com/" + "a" * 3000})
+    assert len(out["page_url"]) == 500 and out["page_url"].startswith("https://www.amazon.com/aaa")
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("US\x00", "US"), ("\x00", None), ("U\x00S", "US"), ("\ud800", None), ("U\udc00S", "US"), (" US ", "US"),
+    ("\x00" * 20 + "US-EAST-LONG", "US-EAST-"), ("美国\x00", "美国"), ("😀\x00", "😀"),
+])
+def test_clean_identity_drops_characters_postgres_cannot_store(raw, clean):
+    """NUL（text 与 jsonb 都不收）与不成对的代理项（编不成 UTF-8）在入库前去掉；别的字符（含表情）原样保留。"""
+    assert devices.clean_identity({"site": raw})["site"] == clean
+    assert devices._short(raw, 8) == clean
+
+
+@pytest.mark.parametrize("field,value", [
+    ("site", "U\x00S"), ("site", "\ud800"), ("page_url", "https://www.amazon.com/a\x00b"),
+    ("page_url", "https://www.amazon.com/\ud800"), ("page_url", "http://[::1"), ("page_url", "javascript:alert(1)"),
+])
+def test_report_with_unstorable_text_is_cleaned_and_stored(conn, workspace, field, value):
+    """身份里带 NUL、不成对的代理项、解析不了的地址：照常存下（坏的部分去掉或当作没有），买家号与最近联系时间不丢。"""
+    acc = fx.exec_account(conn, workspace["id"])
+    dev = fx.registered_device(conn, workspace)
+    clock.freeze(NOW + timedelta(minutes=1))
+    out = devices.report_identity(conn, dev, {**fx.identity(acc["amazon_customer_id"]), field: value})
+    assert out["login"]["state"] == "ready" and out["login"]["customer_id"] == acc["amazon_customer_id"]
+    row = devices.authenticate(conn, dev["token"])
+    assert row["last_seen_at"] == NOW + timedelta(minutes=1)
+    stored = row["identity"][field]
+    assert stored is None or ("\x00" not in stored and "\ud800" not in stored)
+    conn.commit()                                                                # 真的写得进去
+
+
+@pytest.mark.parametrize("version", ["0.2.0\x00", "\x00", "a\x00b", "0.2.0\ud800", "\ud800"])
+def test_ext_version_and_user_agent_with_unstorable_characters_do_not_break_register_or_heartbeat(
+        conn, workspace, version):
+    clean = version.replace("\x00", "").replace("\ud800", "") or None
+    out = devices.register(conn, TOKEN, ext_version=version, user_agent="DEMO-UA\x00 \udfff尾")
+    row = devices.authenticate(conn, TOKEN)
+    assert out["created"] is True and row["ext_version"] == clean and row["user_agent"] == "DEMO-UA 尾"
+    assert _events(conn, row["id"], "device.registered")[0]["detail"] == {"ext_version": clean,
+                                                                          "user_agent": "DEMO-UA 尾"}
+    assert devices.heartbeat(conn, row, ext_version=version)["device"]["id"] == row["id"]
+    assert devices.report_identity(conn, row, fx.identity(None), ext_version=version)["login"]["state"] == "no_id"
+    assert devices.register(conn, TOKEN, ext_version=version)["created"] is False
+    assert devices.authenticate(conn, TOKEN)["ext_version"] == clean
+    assert not _events(conn, row["id"], "device.ext_version_changed")           # 清完是同一个版本，不算变化
+    conn.commit()
 
 
 def test_report_with_bad_customer_id_is_stored_as_not_read(conn, workspace):
@@ -499,6 +649,17 @@ def test_update_device_only_renames(conn, workspace):
     for bad in (" ", "", None, 5, "长" * 65):
         e = _err(devices.update_device, conn, ws, dev["id"], name=bad, actor_user_id=workspace["user_id"])
         assert e.code == "VALIDATION" and e.detail["field"] == "name"
+    # 控制字符（NUL、换行、制表符、ESC、DEL、C1 …）与存不了的代理项：拒绝，不是 500，也不悄悄改掉
+    for bad in ("a\x00b", "\x00", "两行\n名称", "制表\t符", "回\r车", "\x1b[31m红", "DEL\x7f", "C\x851", "代理\ud800项",
+                "长" * 70 + "\x00"):
+        e = _err(devices.update_device, conn, ws, dev["id"], name=bad, actor_user_id=workspace["user_id"])
+        assert e.code == "VALIDATION" and e.http_status == 422 and e.detail == {"field": "name"}, repr(bad)
+        assert e.message == "浏览器名称不能包含换行、制表符等控制字符"
+    assert devices.get_device(conn, ws, dev["id"])["name"] == "AdsPower-DEMO-改名"
+    assert len(_events(conn, dev["id"], "device.updated")) == 1
+    # 首尾的空白（含换行）照旧去掉；中间的空格、中文标点、表情都可以
+    out = devices.update_device(conn, ws, dev["id"], name="\n Mac-DEMO 二号（备用）😀\t", actor_user_id=None)
+    assert out["name"] == "Mac-DEMO 二号（备用）😀"
     other_ws = f.make_workspace(conn)
     e = _err(devices.update_device, conn, other_ws["id"], dev["id"], name="x", actor_user_id=other_ws["user_id"])
     assert e.code == "NOT_FOUND"

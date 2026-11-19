@@ -203,13 +203,22 @@ class UpstreamRecord:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+#: 上游记录里承载来源指定的两个字段（买家号 ID、买家号；services/designation.RECORD_KEYS 就是它）
+BUYER_RECORD_KEYS = ("external_buyer_customer_id", "external_buyer_account")
+
+
 @dataclass
 class SourceRef:
     """一条上游记录来自哪里。飞书：connection_id + record_id；文件：batch_id + row_no。
 
-    buyer_readable：来源这次是否读得到「买家号」「买家号 ID」两列。飞书连接给它们配了列、而列在来源表里找不到
-    （被改名或删除）时为 False，字段对应里这两个字段都没配列时也是 False：这次读取对来源指定不表态，既不设置也不
-    清除任务上的指定（没读到不等于清空）。文件来源恒为 True。
+    来源这次读没读到「买家号」「买家号 ID」是**按列**说的（没读到不等于清空，契约 §2.1）：
+
+    - buyer_unread：这次**没读到**的记录字段名（BUYER_RECORD_KEYS 里的名字）。飞书：字段对应里没给它配列，或配的任一
+      候选列在来源表里找不到（被改名或删除）；文件：批次的列对应里没有对应到这个字段。没读到的字段这次既不设置也不清除
+      任务上的指定，来源关联里沿用上次读到的值。
+    - buyer_readable=False：两个字段都没读到（等同 buyer_unread 列全两个），这次读取对来源指定不表态。
+
+    两者合起来的结果统一用 services/designation.unread_keys(source) 取，别处不要各自拼。
     """
 
     kind: str                               # feishu / file
@@ -219,8 +228,13 @@ class SourceRef:
     batch_id: int | None = None
     row_no: int | None = None
     buyer_readable: bool = True
+    buyer_unread: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        self.buyer_unread = tuple(self.buyer_unread or ())
+        unknown = [k for k in self.buyer_unread if k not in BUYER_RECORD_KEYS]
+        if unknown:
+            raise ValueError(f"buyer_unread 里有未知的字段名 {unknown}")
         if self.kind == "feishu" and (self.connection_id is None or not self.record_id):
             raise ValueError("飞书来源需要 connection_id 与 record_id")
         if self.kind == "file" and (self.batch_id is None or self.row_no is None):

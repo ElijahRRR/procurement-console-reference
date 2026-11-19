@@ -375,8 +375,8 @@ def missing_buyer_columns(field_map: dict[str, Any], field_types: dict[str, int]
     """输入：field_map、来源表的 {列名: 字段类型} → 输出：字段对应给「买家号」「买家号 ID」配了、而来源表里已经找不到的
     列名（按对应顺序、去重）；都在、或这两个字段没配列 → []。
 
-    非空 = 这次读取读不到来源指定（列被改名或删除）：调用方按「没读到不等于清空」处理（SourceRef.buyer_readable=False），
-    不能把它当成来源清空了指定。是否读得到统一看 buyer_columns_readable（两个字段都没配列也算读不到，但不报问题）。
+    只管「配了却找不到」（列被改名或删除），给提示文案与「新记录暂不接收」用；没配列是所有者自己的设置，不在这里。
+    哪个字段这次没读到统一看 unread_buyer_keys。
     """
     out: list[str] = []
     for key in BUYER_FIELD_KEYS:
@@ -386,14 +386,20 @@ def missing_buyer_columns(field_map: dict[str, Any], field_types: dict[str, int]
     return out
 
 
-def buyer_columns_readable(field_map: dict[str, Any], field_types: dict[str, int]) -> bool:
-    """输入：field_map、来源表的 {列名: 字段类型} → 输出：这次读取是否读得到来源指定。
+def unread_buyer_keys(field_map: dict[str, Any], field_types: dict[str, int]) -> tuple[str, ...]:
+    """输入：field_map、来源表的 {列名: 字段类型} → 输出：这次读取**没读到**的买家号字段（BUYER_FIELD_KEYS 里的名字，
+    同序；也是 SourceRef.buyer_unread 要的记录字段名）。
 
-    读得到 = 「买家号」「买家号 ID」至少有一个配了列，而且配的列在来源表里都找得到。两个字段都没配列（连接本来就不读
-    买家号，或所有者后来取消了对应）同样算读不到：没读到不等于清空，之前写下的指定不能因为取消对应就被整批清掉。
+    一个字段没读到 = 字段对应里**没给它配列**，或配的**任一候选列**（含回退列，如「买家号1」）在来源表里找不到：少了一列
+    候选，就说不准这个字段的值该是什么。按列判断：「买家号 ID」那一列不见了不影响「买家号」照常读取，反过来也一样。
+    没读到不等于清空（契约 §2.1）：没读到的字段既不设置也不清除任务上的指定；两个都在结果里 = 这次读取对来源指定不表态。
     """
-    mapped = any(_candidates(field_map.get(key)) for key in BUYER_FIELD_KEYS)
-    return mapped and not missing_buyer_columns(field_map, field_types)
+    out: list[str] = []
+    for key in BUYER_FIELD_KEYS:
+        cols = _candidates(field_map.get(key))
+        if not cols or any(col not in field_types for col in cols):
+            out.append(key)
+    return tuple(out)
 
 
 def record_to_values(fields: dict[str, Any], field_map: dict[str, Any],

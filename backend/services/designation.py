@@ -7,8 +7,10 @@
 
 - 来源行**没有可信的 AMZ 订单号**、且「买家号 ID」或「买家号」非空 → 这一行**指定**了采购账号；两列都空 → 自动分配。
 - 来源行**有可信的 AMZ 订单号** → 对指定**不表态**（SILENT）：既不设置也不清除任务上的指定（这两列此时只是「谁买的」）。
-- **没读到不等于清空**：来源表里找不到买家号列（SourceRef.buyer_readable=False）同样是 SILENT；表格错误值由
-  normalize 原样留在字段里，成为一个解析不了的指定（任务留在待分配），不会被当成留空。
+- **没读到不等于清空，而且按列算**：来源这次没读到的字段（unread_keys：飞书连接没给它配列、或配的列在来源表里找不到；
+  文件批次没有对应到它）既不设置也不清除，来源关联里沿用上次读到的值；两个字段都没读到 → SILENT。一条关联**从来没读到过**
+  的字段记在它存下的规范化记录里（UNREAD_MARK，见 never_read），第一次读到时按首次关联对待。表格错误值由 normalize 原样
+  留在字段里，成为一个解析不了的指定（任务留在待分配，resolve 直接给出原因、不去匹配账号），不会被当成留空。
 - 指定的任务绝不悄悄落到别的账号：解析不出账号、或指定账号此刻接不了 → 留在待分配并写明原因（resolve 的 problem、
   placement_problem）。优先级：人工改派（固定）> 来源指定 > 自动。
 
@@ -25,7 +27,7 @@ from decimal import Decimal
 from typing import Any, Iterable
 
 from services import normalize
-from services.models import CUSTOMER_ID_RE
+from services.models import BUYER_RECORD_KEYS, CUSTOMER_ID_RE
 
 
 class _Silent:
@@ -43,9 +45,16 @@ SILENT: Any = _Silent()
 #: 任务上存指定的两列（清洗后的买家号 ID、买家号）
 ORDER_COLUMNS = ("designated_customer_id", "designated_buyer_name")
 #: 上游记录里对应的两个字段（同序）
-RECORD_KEYS = ("external_buyer_customer_id", "external_buyer_account")
+RECORD_KEYS = BUYER_RECORD_KEYS
 #: 事件：来源指定的买家号变了 {changes: {designated_customer_id: [旧, 新], designated_buyer_name: [旧, 新]}, source}
 EVENT_KIND = "order.designation_changed"
+#: 事件：来源写的（或清空的）买家号没有被采用 {source, stated: {customer_id, name}, previous: {customer_id, name} | None,
+#: current: {customer_id, name}}。stated = 这条来源这次说的；previous = 它上次说的（只有「清空了一个没被采用的买家号」
+#: 时非空，此时 stated 两项为 None）；current = 任务现有的指定。同一条来源关联只记一次。
+EVENT_NOT_ADOPTED = "order.designation_not_adopted"
+#: order_sources.normalized 里的标记键：这条关联**从来没读到过**的字段名列表（RECORD_KEYS 里的名字，同序）。
+#: 列表为空时不写这个键；没有这个键的关联 = 两个字段都读到过。
+UNREAD_MARK = "buyer_unread"
 #: assignment_kind 取值：按来源指定分配
 KIND = "source"
 #: 指定被来源清空、任务留在不参与自动分配的账号上时的分配说明
@@ -100,6 +109,33 @@ def label_or_empty(customer_id: str | None, name: str | None) -> str:
     return label(customer_id, name) or EMPTY_LABEL
 
 
+def label_both(customer_id: str | None, name: str | None) -> str:
+    """输入：指定的两列 → 输出：两部分都写的标签「名称（ID）」（与任务详情一致）；只有一部分就写那一部分；
+    都没有写「（未指定）」。"""
+    if customer_id and name:
+        return f"{name}（{customer_id}）"
+    return customer_id or name or EMPTY_LABEL
+
+
+def _label_parts(customer_id: str | None, name: str | None) -> str:
+    parts = ([f"买家号 {name}"] if name else []) + ([f"买家号 ID {customer_id}"] if customer_id else [])
+    return "、".join(parts) or EMPTY_LABEL
+
+
+def labels(a: tuple[str | None, str | None], b: tuple[str | None, str | None]) -> tuple[str, str]:
+    """输入：两组指定 (买家号 ID, 买家号)（要在同一句话里对比着写的新旧两边）→ 输出：各自给人看的标签。
+
+    照常按 label_or_empty（有 ID 写 ID，否则写名称）；两组不同、却显示成同一个标签时（只有名称变了、ID 没变）改用
+    label_both（名称（ID））；还分不开（同一段文字从一列挪到了另一列）就把列名写出来。两组不同就一定给出不同的标签，
+    不会出现「由「X」改为「X」」。
+    """
+    for fmt in (label_or_empty, label_both, _label_parts):
+        la, lb = fmt(*a), fmt(*b)
+        if la != lb or tuple(a) == tuple(b):
+            break
+    return la, lb
+
+
 # ── 来源行是否表态 ────────────────────────────────────────────────────────────
 
 
@@ -108,19 +144,42 @@ def _said(v: Any) -> Any:
     return None if normalize.is_placeholder(v) else v
 
 
-def statement(record: Any, readable: bool = True) -> Any:
-    """输入：规范化后的上游记录（UpstreamRecord 或同形状对象）、来源这次是否读得到买家号两列
-    → 输出：SILENT，或清洗后的 (买家号 ID, 买家号)（可以是 (None, None) = 表态为「没有指定」）。
+def unread_keys(source: Any) -> tuple[str, ...]:
+    """输入：来源引用（SourceRef 或同形状对象；None = 都读到了）→ 输出：来源这次**没读到**的字段名（RECORD_KEYS 里的
+    名字，同序）。buyer_readable=False → 两个都没读到；否则取 buyer_unread。读没读到只从这里取。"""
+    if source is None:
+        return ()
+    if not getattr(source, "buyer_readable", True):
+        return RECORD_KEYS
+    unread = set(getattr(source, "buyer_unread", None) or ())
+    return tuple(k for k in RECORD_KEYS if k in unread)
 
-    SILENT：记录带可信 AMZ 订单号（normalize.amazon_order_no_ok），或 readable=False。格式不对的单号不算可信，
-    指定照常生效。
+
+def never_read(normalized: Any) -> tuple[str, ...]:
+    """输入：来源关联存下的规范化记录（order_sources.normalized，可为 None）→ 输出：这条关联从来没读到过的字段名
+    （RECORD_KEYS 里的名字，同序）；没有标记（含升级前存下的关联）→ ()，即两个字段都读到过。"""
+    mark = (normalized or {}).get(UNREAD_MARK) if isinstance(normalized, dict) else None
+    if not isinstance(mark, (list, tuple)):
+        return ()
+    return tuple(k for k in RECORD_KEYS if k in mark)
+
+
+def statement(record: Any, readable: bool = True, unread: Iterable[str] = ()) -> Any:
+    """输入：规范化后的上游记录（UpstreamRecord 或同形状对象）、来源这次是否读得到买家号两列、这次没读到的字段名
+    （RECORD_KEYS 里的名字，通常是 unread_keys(source)）
+    → 输出：SILENT，或清洗后的 (买家号 ID, 买家号)（可以是 (None, None) = 表态为「没有指定」；没读到的字段记 None）。
+
+    SILENT：记录带可信 AMZ 订单号（normalize.amazon_order_no_ok），或 readable=False，或两个字段都没读到。格式不对的
+    单号不算可信，指定照常生效。
     """
-    if not readable or record is None:
+    skip = set(unread or ())
+    if not readable or record is None or all(k in skip for k in RECORD_KEYS):
         return SILENT
     if normalize.amazon_order_no_ok(getattr(record, "external_amz_order_no", None)):
         return SILENT
-    return (clean_customer_id(_said(getattr(record, "external_buyer_customer_id", None))),
-            clean_name(_said(getattr(record, "external_buyer_account", None))))
+    k_id, k_name = RECORD_KEYS
+    return (None if k_id in skip else clean_customer_id(_said(getattr(record, k_id, None))),
+            None if k_name in skip else clean_name(_said(getattr(record, k_name, None))))
 
 
 def is_empty(stmt: Any) -> bool:
@@ -183,6 +242,8 @@ def resolve(customer_id: str | None, name: str | None, accounts: Iterable[dict[s
     """输入：清洗后的买家号 ID、买家号、本工作区**全部**账号行（含已归档）、忽略名单里的 ID
     → 输出：Resolution（两列都空 → 全为 None 的结果）。
 
+    0. 买家号 ID 或买家号是表格错误值（#N/A、#REF! 等，normalize.is_error_value）→ 原因「读不出指定的买家号」，**不去
+       匹配账号**（名叫 #N/A 的账号也接不走这种任务）；两个都是错误值时说买家号 ID。先于下面的规则。
     1. 有买家号 ID：形状不对 → 原因；未归档账号 A 登记着它 → 命中 A（同时写了名称：名称按第 2 条对应到别的未归档
        账号 → 原因「不是同一个账号」；名称谁也对不上 → 仍命中 A，说明里注明名称不同）；没有未归档账号登记：
        只有已归档账号登记着 → 原因；名称对应到某个未归档账号 → 原因（那个账号没填 ID / 填的是别的 ID）；
@@ -192,6 +253,11 @@ def resolve(customer_id: str | None, name: str | None, accounts: Iterable[dict[s
     """
     if not customer_id and not name:
         return Resolution()
+    if normalize.is_error_value(customer_id):
+        return Resolution(problem=f"来源的买家号 ID 是表格错误值 {_show(customer_id)}，读不出指定的买家号；"
+                                  "在来源里改正后会重新分配")
+    if normalize.is_error_value(name):
+        return Resolution(problem=f"来源的买家号是表格错误值 {_show(name)}，读不出指定的买家号；在来源里改正后会重新分配")
     rows = _by_name(accounts)
     live = [a for a in rows if a.get("archived_at") is None]
     gone = [a for a in rows if a.get("archived_at") is not None]

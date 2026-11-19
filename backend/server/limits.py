@@ -9,14 +9,15 @@
      扩展 service worker 连本机端口，从不带它们。（代理可以不带这些头，所以这只是多一道闸，不是保证：本机的反向
      代理仍然不要转发 /plugin 路径。）
   3. Host 头必须是本机名（127.0.0.1 / localhost / ::1）——**不**看 settings.host 与 PC_ALLOWED_HOSTS。
-  4. Origin 头存在且是网页来源（http / https，或不透明来源 `null`）→ 拒绝。配置了 settings.plugin_extension_ids
-     （PC_PLUGIN_EXTENSION_IDS）时，Origin 还必须是 `chrome-extension://<名单里的 ID>`，没带 Origin 也拒绝。
+  4. Origin 头存在且是网页来源（http / https，或不透明来源 `null`）→ 拒绝；解析不了的 Origin（例如方括号不配对的
+     `http://[::1`）同样拒绝，不会变成 500。配置了 settings.plugin_extension_ids（PC_PLUGIN_EXTENSION_IDS）时，
+     Origin 还必须是 `chrome-extension://<名单里的 ID>`，没带 Origin 也拒绝。
   5. POST 必须带 `Content-Type: application/json`（允许 `; charset=…`）。网页要带这个头就得先发预检，而本服务的
      OPTIONS 不给 CORS 头，所以网页的表单或 no-cors 请求进不来（包括不需要令牌的 /plugin/v1/register）。
 - **HostOriginMiddleware**（防 DNS 重绑定）：Host 头必须是本机地址（127.0.0.1、localhost、::1）、settings.host
   或 settings.allowed_hosts（PC_ALLOWED_HOSTS，逗号分隔）里的名字，否则 403 FORBIDDEN——包括没有登录要求的
-  /api/v1/auth/setup 与 /auth/login。/api 下的写请求带 Origin 时，Origin 的主机名也必须在名单里
-  （/plugin 的 Origin 由上面的入口闸检查）。
+  /api/v1/auth/setup 与 /auth/login。/api 下的写请求带 Origin 时，Origin 的主机名也必须在名单里，解析不了的
+  Origin 同样 403（/plugin 的 Origin 由上面的入口闸检查）。
 - **BodyLimitMiddleware**：按路由限制请求体字节数，不管有没有 Content-Length（分块上传也算）：
   POST /api/v1/imports 为上传上限 + multipart 余量，其他一律 1 MB。超过 → 413，不等认证、不把整个请求体读进内存。
   Content-Length 已超限的直接拒绝；否则边读边数，超过就停（读到的部分交给应用之前就拒绝）。
@@ -27,7 +28,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from server.serialize import error_body
 
@@ -77,17 +78,26 @@ async def _send_error(send: Any, status: int, code: str, message: str, detail: d
     await send({"type": "http.response.body", "body": raw})
 
 
+def _split_origin(origin: str) -> SplitResult | None:
+    """输入：Origin 头的值 → 输出：urlsplit 的结果；解析不了（urlsplit 对方括号不配对、不是 IP 的方括号主机等抛
+    ValueError）→ None，由调用方按「来源不符」拒绝。Origin 是对端随便填的，不能让它变成未处理的异常。"""
+    try:
+        return urlsplit(origin)
+    except ValueError:
+        return None
+
+
 def is_plugin_path(path: str) -> bool:
     """输入：请求路径 → 输出：是否归 /plugin 入口闸管（以 /plugin/ 开头）。"""
     return path.startswith(PLUGIN_PATH_PREFIX)
 
 
 def _extension_id(origin: str | None) -> str | None:
-    """输入：Origin 头 → 输出：`chrome-extension://<ID>` 里的扩展 ID（小写）；不是这种来源 → None。"""
+    """输入：Origin 头 → 输出：`chrome-extension://<ID>` 里的扩展 ID（小写）；不是这种来源、或解析不了 → None。"""
     if not origin:
         return None
-    parts = urlsplit(origin.strip())
-    if parts.scheme.lower() != EXTENSION_ORIGIN_SCHEME or not parts.netloc:
+    parts = _split_origin(origin.strip())
+    if parts is None or parts.scheme.lower() != EXTENSION_ORIGIN_SCHEME or not parts.netloc:
         return None
     return parts.netloc.lower()
 
@@ -126,8 +136,9 @@ class PluginGateMiddleware:
         origin = _header(scope, b"origin")
         if origin is not None:
             value = origin.strip().lower()
-            if value == "null" or urlsplit(value).scheme in ("http", "https"):
-                return PLUGIN_WEB_ORIGIN_MESSAGE
+            parts = _split_origin(value)
+            if value == "null" or parts is None or parts.scheme in ("http", "https"):
+                return PLUGIN_WEB_ORIGIN_MESSAGE       # 解析不了的来源和网页来源一样不放行
         if self.extension_ids and _extension_id(origin) not in self.extension_ids:
             return PLUGIN_EXTENSION_MESSAGE
         if scope.get("method", "GET").upper() == "POST" and not _is_json(_header(scope, b"content-type")):
@@ -163,8 +174,8 @@ class HostOriginMiddleware:
         method = scope.get("method", "GET").upper()
         origin = _header(scope, b"origin")
         if origin and scope["path"].startswith("/api/") and method not in ("GET", "HEAD", "OPTIONS"):
-            parts = urlsplit(origin)
-            if parts.scheme not in ("http", "https") or _host_name(parts.netloc) not in self.allowed:
+            parts = _split_origin(origin)
+            if parts is None or parts.scheme not in ("http", "https") or _host_name(parts.netloc) not in self.allowed:
                 await _send_error(send, 403, "FORBIDDEN", FORBIDDEN_ORIGIN_MESSAGE)
                 return
         await self.app(scope, receive, send)

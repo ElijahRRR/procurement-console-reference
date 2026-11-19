@@ -16,8 +16,9 @@ def export_orders(batch_id: int | None = Query(None, ge=1), view: str | None = N
                   ctx: deps.Console = Depends(deps.console)):
     """输入：batch_id（优先）或视图（缺省 all）→ 输出：采购结果 xlsx 附件；批次不存在 → 404，未提交 → 422。
 
-    「买家号」列：有采购结果写采购账号，没有写来源指定的买家号（没有指定留空）；已分配的账号另在「分配账号」列，
-    这样导出文件改一改再上传时，自动分配的结果不会变成来源指定。"""
+    「买家号」「买家号ID」两列：有采购结果写采购账号的名称与它登记的买家号 ID，没有写来源指定的买家号与买家号 ID
+    （没有指定的那一列留空）；已分配的账号另在「分配账号」列。这样导出文件原样或改一改再上传时，来源指定一列不丢，
+    自动分配的结果也不会变成来源指定。"""
     data = exports.orders_xlsx(ctx.conn, ctx.workspace_id, batch_id=batch_id, view=view or None)
     stamp = f"{clock.bj_today():%Y%m%d}"
     name = f"采购结果-批次{batch_id}-{stamp}.xlsx" if batch_id is not None else f"采购结果-{view or 'all'}-{stamp}.xlsx"

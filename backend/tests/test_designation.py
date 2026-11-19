@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 
 from services import designation as dz
-from services.models import UpstreamRecord
+from services.models import SourceRef, UpstreamRecord
 
 T0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
 T1 = datetime(2026, 11, 2, tzinfo=timezone.utc)
@@ -66,6 +66,26 @@ def test_id_shape_and_labels():
     assert dz.label("A1DEMO0000", "环境-DEMO-A") == "A1DEMO0000"         # 有 ID 写 ID
     assert dz.label(None, "环境-DEMO-A") == "环境-DEMO-A" and dz.label(None, None) is None
     assert dz.label_or_empty(None, None) == "（未指定）"
+    # 两部分都写的格式：名称（ID），与任务详情一致；只有一部分就写那一部分
+    assert dz.label_both("A1DEMO0000", "环境-DEMO-A") == "环境-DEMO-A（A1DEMO0000）"
+    assert dz.label_both("A1DEMO0000", None) == "A1DEMO0000" and dz.label_both(None, "环境-DEMO-A") == "环境-DEMO-A"
+    assert dz.label_both(None, None) == "（未指定）"
+
+
+def test_labels_never_show_two_different_designations_as_the_same_text():
+    """ING-7：新旧两边对比着写时，按「有 ID 写 ID」显示成同一个标签（只有名称变了）就改用 名称（ID）；
+    不能出现「由「X」改为「X」」。"""
+    assert dz.labels(("A1DEMO0000", None), ("A1DEMO0001", None)) == ("A1DEMO0000", "A1DEMO0001")     # 照常：有 ID 写 ID
+    assert dz.labels((None, None), (None, "环境-DEMO-A")) == ("（未指定）", "环境-DEMO-A")
+    assert dz.labels(("A1DEMO0000", "环境-DEMO-A"), ("A1DEMO0001", "环境-DEMO-B")) == ("A1DEMO0000", "A1DEMO0001")
+    assert dz.labels(("A1DEMO0000", None), ("A1DEMO0000", "环境-DEMO-B")) == (
+        "A1DEMO0000", "环境-DEMO-B（A1DEMO0000）")
+    assert dz.labels(("A1DEMO0000", "环境-DEMO-A"), ("A1DEMO0000", "环境-DEMO-B")) == (
+        "环境-DEMO-A（A1DEMO0000）", "环境-DEMO-B（A1DEMO0000）")
+    # 同一段文字从一列挪到了另一列：把列名写出来
+    assert dz.labels((None, "A1DEMO0000"), ("A1DEMO0000", None)) == ("买家号 A1DEMO0000", "买家号 ID A1DEMO0000")
+    same = dz.labels(("A1DEMO0000", "环境-DEMO-A"), ("A1DEMO0000", "环境-DEMO-A"))                   # 本来就相同：照常
+    assert same == ("A1DEMO0000", "A1DEMO0000")
 
 
 # ── 来源行是否表态 ────────────────────────────────────────────────────────────
@@ -94,6 +114,46 @@ def test_statement_is_silent_with_a_credible_order_number_or_when_unreadable():
     assert not dz.SILENT and repr(dz.SILENT) == "SILENT"
 
 
+def test_statement_leaves_an_unread_field_out_and_is_silent_when_both_are_unread():
+    """读没读到按列算：没读到的字段记 None（不是「表态为空」，由调用方保持原值）；两个都没读到才不表态。"""
+    both = rec(external_buyer_customer_id="A1DEMO0000", external_buyer_account="环境-DEMO-A")
+    k_id, k_name = dz.RECORD_KEYS
+    assert (k_id, k_name) == ("external_buyer_customer_id", "external_buyer_account")
+    assert dz.statement(both, unread=(k_id,)) == (None, "环境-DEMO-A")
+    assert dz.statement(both, unread=(k_name,)) == ("A1DEMO0000", None)
+    assert dz.statement(both, unread=dz.RECORD_KEYS) is dz.SILENT
+    assert dz.statement(both, unread=()) == ("A1DEMO0000", "环境-DEMO-A")
+    with_no = rec(external_amz_order_no="111-0000000-0000001", external_buyer_account="环境-DEMO-A")
+    assert dz.statement(with_no, unread=(k_id,)) is dz.SILENT                 # 可信单号仍然优先
+
+
+def test_unread_keys_is_the_one_place_that_reads_the_source_flags():
+    k_id, k_name = dz.RECORD_KEYS
+
+    def src(**kw):
+        return SourceRef(kind="file", snapshot={}, batch_id=1, row_no=2, **kw)
+
+    assert dz.unread_keys(src()) == () and dz.unread_keys(None) == ()
+    assert dz.unread_keys(src(buyer_unread=(k_name,))) == (k_name,)
+    assert dz.unread_keys(src(buyer_unread=[k_name, k_id])) == (k_id, k_name)          # 列表也收，按固定顺序
+    assert dz.unread_keys(src(buyer_readable=False)) == dz.RECORD_KEYS                 # 原义：两个都没读到
+    assert dz.unread_keys(src(buyer_readable=False, buyer_unread=(k_id,))) == dz.RECORD_KEYS
+    with pytest.raises(ValueError):
+        src(buyer_unread=("buyer_account",))                                           # 写错的字段名不能悄悄当成读到了
+
+
+def test_never_read_reads_the_marker_stored_on_a_link():
+    k_id, k_name = dz.RECORD_KEYS
+    assert dz.UNREAD_MARK == "buyer_unread"
+    assert dz.never_read(None) == () and dz.never_read({}) == ()                       # 旧关联没有标记 = 都读到过
+    assert dz.never_read({"buyer_unread": [k_name]}) == (k_name,)
+    assert dz.never_read({"buyer_unread": [k_name, k_id, "别的"]}) == (k_id, k_name)
+    assert dz.never_read({"buyer_unread": "external_buyer_account"}) == ()             # 形状不对按没有标记
+    # 带标记的规范化记录照样能还原成 UpstreamRecord（多出来的键被忽略）
+    stored = {**rec(external_buyer_account="环境-DEMO-A").to_json(), "buyer_unread": [k_id]}
+    assert UpstreamRecord.from_json(stored).external_buyer_account == "环境-DEMO-A"
+
+
 @pytest.mark.parametrize("placeholder", ["无", "—", "N/A", "n/a", "0", "/", " - ", "没有", "#"])
 def test_statement_treats_placeholders_as_not_written(placeholder):
     """旧版存下的规范化记录里占位写法还是原文：statement 也按没写处理（回填与「上次说的」都靠它）。"""
@@ -107,7 +167,30 @@ def test_statement_keeps_spreadsheet_error_values_as_an_unresolvable_designation
     said = dz.statement(rec(external_buyer_account="#N/A"))
     assert said == (None, "#N/A") and not dz.is_empty(said)
     assert dz.resolve(None, "#N/A", ALL).account is None
-    assert dz.resolve("#REF!", None, ALL).problem.startswith("来源指定的买家号 ID「#REF!」格式不对")
+    assert dz.resolve("#REF!", None, ALL).account is None
+
+
+def test_error_literal_is_reported_as_unreadable_not_as_a_missing_account():
+    """WEB-8：表格错误值（#N/A、#REF! …）的原因说的是「读不出指定的买家号」，不再建议「新建同名账号」；
+    也不去匹配账号——名叫 #N/A 的账号接不走这种任务。"""
+    named = acc(9, "#N/A", "A1DEMO0008")
+    pool = [*ALL, named]
+    r = dz.resolve(None, "#N/A", pool)
+    assert r.account is None and r.note is None
+    assert r.problem == "来源的买家号是表格错误值 #N/A，读不出指定的买家号；在来源里改正后会重新分配"
+    assert dz.resolve(None, " #n/a ".strip(), pool).account is None                    # 大小写不同也认得
+    r = dz.resolve("#REF!", None, pool)
+    assert r.account is None
+    assert r.problem == "来源的买家号 ID 是表格错误值 #REF!，读不出指定的买家号；在来源里改正后会重新分配"
+    # 两个都是错误值：说买家号 ID；ID 正常而名称是错误值：也不按 ID 分走（读不出的那一列可能指向别的账号）
+    assert dz.resolve("#VALUE!", "#N/A", pool).problem.startswith("来源的买家号 ID 是表格错误值 #VALUE!")
+    r = dz.resolve("A1DEMO0000", "#N/A", pool)
+    assert r.account is None and r.problem.startswith("来源的买家号是表格错误值 #N/A")
+    r = dz.resolve("#DIV/0!", "环境-DEMO-A", pool)
+    assert r.account is None and r.problem.startswith("来源的买家号 ID 是表格错误值 #DIV/0!")
+    # 普通的名称、以 # 开头但不是错误值的名称照旧按名称解析
+    assert dz.resolve(None, "环境-DEMO-A", pool).account == A
+    assert dz.resolve(None, "#1 号", [*pool, acc(10, "#1 号")]).account["id"] == 10
 
 
 def test_order_helpers():

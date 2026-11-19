@@ -8,6 +8,8 @@
   库里还没有的单命中准入规则（采购状态「已拍单」却没有 AMZ 订单号等，见 normalize.admission_skip_reason）→ invalid
   并写明原因；其余经 orders.ingest(dry_run=True, admission=…) 得出结论（已有任务也做准入检查：采购方移走、
   采购状态变为已拍单 / 拿回 → 待核实）。问题（issues）里写明「停在待确认」「停在资料待补齐」等。一行出错只让该行 invalid。
+  批次的列对应里没有对应到「买家号」/「买家号ID」的那个字段算**没读到**（SourceRef.buyer_unread，见 _buyer_unread）：
+  没读到不等于清空，那一列既不设置也不清除任务上的指定；预览与提交用同一份列对应。
   文件的准入规则：normalize.FILE_ADMISSION_DEFAULTS（导入历史采购 = 是、售后状态「已取消」= 上游取消）之上叠加
   工作区设置（settings_svc.file_admission），预览接口再传的 admission 优先。实际用的规则存在批次上，提交时沿用。
   每次预览整体替换该批次的 import_rows；结论原因与预计状态存在 normalized._preview 里（不改表结构）。
@@ -28,7 +30,8 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from services import allocation, clock, events, feishu_connections, file_mapping, normalize, orders, settings_svc, sheet_io
+from services import (allocation, clock, designation, events, feishu_connections, file_mapping, normalize, orders,
+                      settings_svc, sheet_io)
 from services.errors import DomainError, conflict, not_found, validation
 from services.models import SourceRef, UpstreamRecord
 
@@ -238,11 +241,19 @@ def _clean_mapping(mapping: Any, headers: list[str]) -> dict[str, str | None]:
     return out
 
 
+def _buyer_unread(mapping: dict[str, str | None] | None) -> tuple[str, ...]:
+    """输入：批次的列对应 {表头: 系统字段 | None} → 输出：这份文件**没读到**的买家号字段（designation.RECORD_KEYS 里的
+    名字）：列对应里没有任何一列对应到它。两个都没对应 = 这份文件对来源指定不表态。"""
+    mapped = {key for key in (mapping or {}).values() if key}
+    return tuple(key for key in designation.RECORD_KEYS if key not in mapped)
+
+
 def _evaluate(conn, ws: int, batch_id: int, sheet: sheet_io.Sheet, mapping: dict[str, str | None],
               admission: dict[str, Any]) -> list[dict[str, Any]]:
     """逐行规范化并预演，返回 import_rows 要写的内容（含 _preview 说明）。不写库。"""
     recs = [(row_no, raw, file_mapping.normalize_row(raw, mapping, admission))
             for raw, row_no in zip(sheet.rows, sheet.row_numbers)]
+    unread = _buyer_unread(mapping)
     keys = sorted({r.upstream_order_no for _, _, r in recs if r.upstream_order_no})
     known = {x["upstream_order_no"] for x in conn.execute(
         "SELECT upstream_order_no FROM procure.purchase_orders WHERE workspace_id = %s AND upstream_order_no = ANY(%s)",
@@ -267,7 +278,7 @@ def _evaluate(conn, ws: int, batch_id: int, sheet: sheet_io.Sheet, mapping: dict
             if skip:
                 out.append({**item, "verdict": "invalid", "reason": skip})
                 continue
-        src = SourceRef(kind="file", snapshot=raw_j, batch_id=batch_id, row_no=row_no)
+        src = SourceRef(kind="file", snapshot=raw_j, batch_id=batch_id, row_no=row_no, buyer_unread=unread)
         try:
             oc = orders.ingest(conn, ws, rec, src, dry_run=True, admission=admission)
         except (DomainError, ArithmeticError, ValueError, TypeError) as exc:   # 一行数据离谱只让这一行无效
@@ -407,6 +418,7 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
     adm = adm_row["admission"] if adm_row and adm_row["admission"] else _file_admission(conn, workspace_id, None)
     found = conn.execute("SELECT * FROM procure.import_rows WHERE batch_id = %s AND workspace_id = %s ORDER BY row_no",
                          (b["id"], workspace_id)).fetchall()
+    unread = _buyer_unread(b["mapping"])                # 与预览用的同一份列对应：没对应到的买家号字段算没读到
     items: list[dict[str, Any]] = []
     for r in found:
         norm = dict(r["normalized"] or {})
@@ -415,7 +427,8 @@ def commit(conn, workspace_id: int, batch_id: int, actor_user_id: int | None) ->
             items.append({"verdict": "invalid", "status": None})
             continue
         rec = UpstreamRecord.from_json(norm)
-        src = SourceRef(kind="file", snapshot=r["raw"] or {}, batch_id=b["id"], row_no=r["row_no"])
+        src = SourceRef(kind="file", snapshot=r["raw"] or {}, batch_id=b["id"], row_no=r["row_no"],
+                        buyer_unread=unread)
         try:
             with conn.transaction():
                 oc = orders.ingest(conn, workspace_id, rec, src, actor_kind=ak, actor_id=aid, admission=adm)

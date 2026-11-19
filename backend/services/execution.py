@@ -7,6 +7,9 @@
   （execution_runs_one_active_per_device），一个账号的一个定时时间点一天只执行一次（execution_runs_slot_once）。
   开始批次前先查一遍给出「谁在执行、从何时开始」，真正的互斥靠插入时的唯一索引；冲突在 SAVEPOINT 里捕获，
   调用方事务仍可用。
+- 定时时间点的两种答复：这个时间点今天已有以 finished 结束的定时批次 → SLOT_DONE（插件把它记成今天已处理）；
+  它的批次**还在执行** → ACCOUNT_BUSY（带持有者，插件下一分钟再问）。批次没跑完就结束（租约过期、护栏 buyer 项
+  拦截、清除模拟结果）时时间点重新空出来，当时在线的另一个浏览器下一分钟就能接手，而不是早早把这个时间点记掉。
 - 一笔任务、一个账号同时只有一个在途尝试（claimed / checking / guard_passed / submitting / verifying）。
 - 每个调用都核对批次 / 尝试属于**这个浏览器**（库里的 devices 行；它的工作区登记时确定、之后不变；否则 404，
   不泄露存在性），并且批次仍有效（未结束且租约未过期，否则 409 LEASE_LOST）。已结束尝试的重复结果上报例外：
@@ -40,6 +43,11 @@
 - 回执不丢：已登记提交的尝试在租约过期、尚未清扫时照常接收结果；已是「结果待核实」后才送到的不同结果
   （迟到的回执）只记录、不改状态（_late_receipt）；控制台已核实（已下单 / 未下单）后才送到的不同结果同样只记录，
   与核实结论矛盾时提醒并挡住重新领取（_late_receipt_after_resolution）。
+
+插件送来的文本（进度的阶段与细节、等待验证的说明、结果体里的单号 / 错误码 / 说明 / 配送文字、结束批次的原因与
+说明）入库前先去掉 PostgreSQL 存不了的字符（NUL、不成对的代理项；devices.storable_text）：页面文字被截断在一个
+表情中间就会带出半个代理项，不该让进度、回执因此变成 500。结算页事实例外：护栏按原样的事实判定（不把值「修好」
+再比对），判定之后才清理要入库、要返回的事实与裁决（见 submit_guard）。
 
 账号被本模块暂停时，除 accounts.pause 写的 'account.paused' 外，另写一条 PAUSE_MARKER_KIND 事件
 {cause: result_unknown | account_error, simulated, attempt_id, code}，供「清除模拟结果」判断哪些账号
@@ -131,10 +139,23 @@ def _id(v: Any, what: str) -> int:
 
 
 def _text(v: Any, n: int) -> str | None:
+    """输入：插件送来的值、最多几个字 → 输出：可以入库的文本（去掉存不了的字符、首尾空白，再截断）；空 → None。"""
     if v is None:
         return None
-    s = str(v).strip()
+    s = devices.storable_text(str(v)).strip()
     return s[:n] or None
+
+
+def _storable_json(v: Any) -> Any:
+    """输入：JSON 值（插件送来的细节，或护栏的事实与裁决）→ 输出：同样的结构，字符串（含字典的键）里 PostgreSQL
+    存不了的字符（NUL、不成对的代理项）已去掉；别的类型原样返回。入库、写事件、返回给插件之前用。"""
+    if isinstance(v, str):
+        return devices.storable_text(v)
+    if isinstance(v, dict):
+        return {(devices.storable_text(k) if isinstance(k, str) else k): _storable_json(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_storable_json(x) for x in v]
+    return v
 
 
 def _jsonable(v: Any) -> Any:
@@ -338,7 +359,11 @@ def execution_gate(conn, workspace_id: int, *, exclusive: bool = False) -> None:
     """输入：连接、工作区、是否独占 → 输出：无（事务级咨询锁，事务结束释放）。
 
     开始批次与领取取共享锁（彼此不排队）；清除模拟结果取独占锁，等进行中的开始 / 领取提交后才动手，清除期间
-    也不会冒出新的批次或尝试（否则新领取的尝试会被一并清掉、任务却卡在采购中）。调用方须在加任何行锁之前取。
+    也不会冒出新的批次或尝试（否则新领取的尝试会被一并清掉、任务却卡在采购中）。
+
+    调用方须在加批次 / 任务 / 尝试 / 账号的行锁之前取；浏览器行可以先锁（开始批次如此：先 FOR UPDATE 锁浏览器行、
+    查它自己的未结束批次，再取闸门，见模块说明的加锁顺序）。这个顺序之所以安全，是因为持有独占锁的一方（清除模拟
+    结果）从不锁浏览器行——以后也不得去锁，否则会和「拿着浏览器行等闸门」的开始批次互相等待。
     """
     fn = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
     conn.execute(f"SELECT {fn}(%s::int, %s::int)", (_LOCK_NS, int(workspace_id) % 2_147_483_647))
@@ -952,12 +977,16 @@ def _norm_slot(slot: Any) -> str:
     return f"{int(m.group(1)):02d}:{m.group(2)}"
 
 
-def _slot_taken(conn, workspace_id: int, account_id: int, bj_date: date, slot: str) -> bool:
-    """输入：账号、北京日期、时间点 → 输出：这个时间点今天是否已有未结束、或以 finished 结束的定时批次
-    （与唯一索引 execution_runs_slot_once 同口径；租约过期、被清除模拟结果结束的不算）。"""
+def _slot_finished(conn, workspace_id: int, account_id: int, bj_date: date, slot: str) -> bool:
+    """输入：账号、北京日期、时间点 → 输出：这个时间点今天是否已有以 finished 结束的定时批次（= 已经执行过）。
+
+    比唯一索引 execution_runs_slot_once 的口径窄：索引还让**未结束**的定时批次占着时间点（防并发重复开始），但那时
+    还不能说「已经执行过」——批次可能没跑完就结束（租约过期、护栏 buyer 项拦截、清除模拟结果），时间点随之空出来。
+    未结束的那种由占用检查回答 ACCOUNT_BUSY。
+    """
     return conn.execute(
         "SELECT 1 FROM procure.execution_runs WHERE workspace_id = %s AND account_id = %s AND bj_date = %s "
-        "AND scheduled_slot = %s AND trigger = 'scheduled' AND (ended_at IS NULL OR end_reason = 'finished') LIMIT 1",
+        "AND scheduled_slot = %s AND trigger = 'scheduled' AND end_reason = 'finished' LIMIT 1",
         (workspace_id, account_id, bj_date, slot),
     ).fetchone() is not None
 
@@ -996,10 +1025,13 @@ def start_run(conn, device: dict[str, Any], *, customer_id: Any = None, trigger:
     6. 账号：工作区内未归档、登记了这个 ID 的账号；没有 → ACCOUNT_NOT_REGISTERED（403）。
     7. 账号已暂停 → ACCOUNT_PAUSED（403）；simulated 不是 true → REAL_PURCHASE_DISABLED（403，本阶段一律拒绝）。
     8. 定时：必须带 slot；账号须是定时模式、slot 在它的执行时间里、北京时间今天已到点（否则 VALIDATION）；同一
-       (账号, 北京日期, slot) 已有未结束或以 finished 结束的定时批次 → SLOT_DONE（409）。手动批次不记 slot。
-    9. 账号已有未结束的批次 → ACCOUNT_BUSY（409，detail 为持有者）。
-    10. 插入（SAVEPOINT）；唯一索引冲突按索引名映射成 ACCOUNT_BUSY / DEVICE_BUSY / SLOT_DONE（两个浏览器同时为
-        同一个时间点开始时，后到的按第 8 步的顺序得到 SLOT_DONE）。
+       (账号, 北京日期, slot) 已有以 finished 结束的定时批次 → SLOT_DONE（409，「已经执行过」是真的，插件据此把
+       这个时间点记成今天已处理）。手动批次不记 slot。
+    9. 账号已有未结束的批次 → ACCOUNT_BUSY（409，detail 为持有者）。**包括同一个时间点还在执行的定时批次**：
+       它可能没跑完就结束，那时时间点重新空出来，所以后到的浏览器得到的是「下一分钟再问」而不是「已经执行过」；
+       它正常结束之后再问才是 SLOT_DONE。
+    10. 插入（SAVEPOINT）；唯一索引冲突见 _start_conflict：两个浏览器同时为同一个时间点开始时，后到的稳定得到
+        ACCOUNT_BUSY（带持有者），不随数据库报哪个索引而变。
     """
     dev = devices.require_active(conn, device, lock=True)
     if trigger not in TRIGGERS:
@@ -1043,10 +1075,11 @@ def start_run(conn, device: dict[str, Any], *, customer_id: Any = None, trigger:
     scheduled_slot = _norm_slot(slot) if trigger == "scheduled" else None       # 手动批次不记时间点
     if scheduled_slot is not None:
         _check_slot(acc, scheduled_slot, now)
-    # 先读持有者、再查时间点、最后才报「账号被占用」：两句各取一次快照，这样只要此刻已有同一时间点的定时批次
-    # （哪怕它正是刚提交的持有者），后到的一律得到 SLOT_DONE，而不是随并发时序在两个码之间摇摆。
+    # 先读持有者、再查时间点、最后才报「账号被占用」：两句各取一次快照，持有者如果恰好在两句之间正常结束了
+    # 同一个时间点的批次，后到的得到的是 SLOT_DONE（此刻的事实），而不是带着一个已经不在的持有者的 ACCOUNT_BUSY。
+    # 时间点的批次还在执行时走不到 SLOT_DONE：只有 finished 才算「已经执行过」，其余由下面的占用检查回答。
     holder = _holder(conn, ws, acc["id"])
-    if scheduled_slot is not None and _slot_taken(conn, ws, acc["id"], today, scheduled_slot):
+    if scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
         raise _slot_done()
     if holder is not None:
         raise _busy(holder, acc["name"])
@@ -1077,18 +1110,25 @@ def _start_conflict(conn, dev: dict[str, Any], acc: dict[str, Any], today: date,
                     constraint: str) -> DomainError:
     """输入：开始批次插入时撞上的唯一索引名 → 输出：对应的 409。
 
-    并发下先查后插没拦住的冲突：两个浏览器同时为同一个定时时间点开始时两个索引都会撞上，数据库报哪个不一定，
-    所以先按第 8 步的口径重查时间点（→ SLOT_DONE），其余按索引名：…_per_device → DEVICE_BUSY，
-    …_slot_once → SLOT_DONE，…_per_account（及认不出的）→ ACCOUNT_BUSY。
+    并发下先查后插没拦住的冲突：两个浏览器同时为同一个定时时间点开始时 …_per_account 与 …_slot_once 两个索引都会
+    撞上，数据库报哪个不一定，所以不能只看索引名：
+
+    1. 先按第 8 步的口径重查时间点：今天已有以 finished 结束的定时批次 → SLOT_DONE。
+    2. …_per_device → DEVICE_BUSY。
+    3. 其余（…_per_account、…_slot_once 及认不出的）：账号此刻有未结束的批次 → ACCOUNT_BUSY（带持有者）。撞上的
+       正是同一个时间点还在执行的批次时也走这里——它还没跑完，不能说「已经执行过」。
+    4. 已经没有持有者了：撞的是 …_slot_once → SLOT_DONE（占着时间点的批次在这两句之间结束了）；否则 ACCOUNT_BUSY
+       （不带持有者）。
     """
     ws = dev["workspace_id"]
-    if scheduled_slot is not None and _slot_taken(conn, ws, acc["id"], today, scheduled_slot):
-        return _slot_done()
-    if constraint == "execution_runs_slot_once":
+    if scheduled_slot is not None and _slot_finished(conn, ws, acc["id"], today, scheduled_slot):
         return _slot_done()
     if constraint == "execution_runs_one_active_per_device":
         return _device_busy(_device_run(conn, dev))
-    return _busy(_holder(conn, ws, acc["id"]), acc["name"])
+    holder = _holder(conn, ws, acc["id"])
+    if holder is None and constraint == "execution_runs_slot_once":
+        return _slot_done()
+    return _busy(holder, acc["name"])
 
 
 def _stop_reason(dev: dict[str, Any], acc: dict[str, Any] | None) -> str | None:
@@ -1413,7 +1453,7 @@ def progress(conn, device: dict[str, Any], attempt_id: Any, *, stage: Any, detai
     _set_attempt(conn, att, **cols)
     events.record(conn, att["workspace_id"], "attempt", att["id"], "attempt.progress", actor_kind="device",
                   actor_id=dev["id"], order_id=order["id"],
-                  detail={"stage": st, "detail": _small(detail) if detail is not None else None,
+                  detail={"stage": st, "detail": _small(_storable_json(detail)) if detail is not None else None,
                           "continue": cancel is None, "cancel_reason": cancel, "cancel_code": code})
     return {"continue": cancel is None, "cancel_reason": cancel, "cancel_code": code}
 
@@ -1475,7 +1515,8 @@ def _buyer_blocked(conn, dev: dict[str, Any], run: dict[str, Any], att: dict[str
 def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> dict[str, Any]:
     """输入：浏览器行、尝试、结算页事实 → 输出：护栏裁决（services/guard.evaluate 的结果）。
 
-    事实先经 guard.sanitize_facts 规范化（只留契约 §4 的键、卡号只留后 4 位），判定与入库都用规范化后的事实。
+    事实先经 guard.sanitize_facts 规范化（只留契约 §4 的键、卡号只留后 4 位），判定与入库都用规范化后的事实；
+    判定之后、入库与返回之前，事实与裁决里 PostgreSQL 存不了的字符（NUL、不成对的代理项）会被去掉（判定时不去）。
     按任务与账号**当前**的有效值判定。放行 → 尝试 guard_passed；拦截 → 尝试 failed（error_code 为拦截码）、
     任务 exception（原因为拦截码的中文说明；上游已取消则 cancelled），批次可以继续下一笔。
     例外：buyer 项拦截（拦截码 IDENTITY_MISMATCH，结算页读到的买家号 ID 不是批次账号登记的 ID）按中止类落地并
@@ -1497,6 +1538,9 @@ def submit_guard(conn, device: dict[str, Any], attempt_id: Any, facts: Any) -> d
         raise not_found("买家账号")
     guard_input = guard.sanitize_facts(facts)
     verdict = _evaluate_guard(conn, guard_input, order, acc)
+    # 判定用的是原样的事实：带坏字符的值不会先被「修好」再去比对（去掉字符可能把不相等的变成相等，买家号 ID、ASIN、
+    # 币种都是整段比对的）。入库、写事件、返回给插件之前才去掉 PostgreSQL 存不了的字符。
+    guard_input, verdict = _storable_json(guard_input), _storable_json(verdict)
     now = clock.now()
     if verdict["verdict"] == "pass":
         _set_attempt(conn, att, status="guard_passed", stage="guard_passed", guard_input=guard_input,
@@ -1994,11 +2038,12 @@ def _plugin_detail(v: Any) -> str | None:
     文本再截；空 → None。"""
     if v is None:
         return None
+    v = _storable_json(v)
     if not isinstance(v, str):
         try:
             v = json.dumps(_jsonable(v), ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError):
-            v = str(v)
+            v = devices.storable_text(str(v))
     return v.strip()[:_PLUGIN_DETAIL_MAX] or None
 
 
@@ -2031,7 +2076,8 @@ def sweep(conn, now: datetime | None = None) -> dict[str, Any]:
     跨全部工作区（后台任务）：租约已过期的批次 → 结束（lease_expired），它们的在途尝试按 _settle_inflight 处理；
     另把「所属批次已结束」的在途尝试一并收尾。被别的事务锁住的批次跳过（SKIP LOCKED），下一轮再处理。
     最后清理浏览器行：最近联系时间早于 settings.device_retention_days 天、且没有任何批次 / 尝试引用的行直接删除
-    （自动登记会不断留下换了令牌的旧行；有批次或尝试的行要留着给历史记录显示名称）。
+    （自动登记会不断留下换了令牌的旧行；有批次或尝试的行要留着给历史记录显示名称——它们过了保留期同样不再占
+    登记名额，见 devices.register）。
     """
     t = now or clock.now()
     out: dict[str, Any] = {"expired_runs": [], "orphan_attempts": [], "removed_devices": [], "aborted": 0,
@@ -2072,9 +2118,10 @@ def _purge_idle_devices(conn, now: datetime) -> list[int]:
     """输入：连接、现在 → 输出：被删除的浏览器行 id（升序）。
 
     条件：最近联系时间（从未联系过的按登记时间）早于 device_retention_days 天，且没有任何执行批次、采购尝试引用它。
+    截止时刻取 devices.retention_cutoff——登记上限用的是同一个：过了它的行不再占名额，这里再把其中没有历史的删掉。
     正被别的事务锁着的行（正在登记、心跳、开始批次）跳过。
     """
-    cutoff = now - timedelta(days=int(settings.get().device_retention_days))
+    cutoff = devices.retention_cutoff(now)
     rows = conn.execute(
         """
         WITH idle AS (

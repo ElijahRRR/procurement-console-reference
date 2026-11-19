@@ -1,6 +1,7 @@
 """执行协议加固：提交登记前按最新配置复核护栏（v1 §3.3「最终提交前重新校验有效限价和配送配置」、v2 默认 5）、
 身份新鲜度在领取与提交前也生效、候选任务只是被锁着时不算「没有任务」、清除模拟结果与开始批次 / 领取互斥、
-尝试种类规则、结算事实只存规范化后的内容（卡号只留后 4 位）。全部数据虚构。"""
+尝试种类规则、结算事实只存规范化后的内容（卡号只留后 4 位）、插件送来的文本里 PostgreSQL 存不了的字符
+（NUL、不成对的代理项）不变成 500。全部数据虚构。"""
 
 from __future__ import annotations
 
@@ -359,4 +360,115 @@ def test_non_dict_guard_facts_block_without_storing_raw(conn, workspace):
     assert v["verdict"] == "block"
     stored = fx.attempt_row(conn, a["attempt_id"])["guard_input"]
     assert set(stored) == set(guard.FACT_KEYS) and all(x is None for x in stored.values())
+
+
+# ── 插件送来的文本里 PostgreSQL 存不了的字符 ─────────────────────────────────
+
+#: NUL（text 与 jsonb 都不收）；半个代理项（页面文字被截断在一个表情中间时会带出来，编不成 UTF-8）
+BAD_CHARS = ["\x00", "\ud83d"]
+
+
+def _last_event(conn, kind):
+    return conn.execute("SELECT * FROM procure.events WHERE kind = %s ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+
+
+@pytest.mark.parametrize("bad", BAD_CHARS)
+def test_unstorable_characters_in_progress_verifying_result_and_finish_text_are_dropped(conn, workspace, bad):
+    """进度的阶段与细节、等待验证的说明、结果体里的单号 / 说明 / 配送文字、结束批次的原因与说明：带 NUL 或半个
+    代理项时去掉坏字符照常处理（以前这些请求全是 500：进度报不上去，回执也收不下来）。"""
+    ws = workspace["id"]
+    acc, dev = _env(conn, workspace)
+    order = fx.assigned_order(conn, ws, acc)
+    run_id = fx.start(conn, dev)
+    a = fx.claim(conn, dev, run_id)
+    out = execution.progress(conn, dev, a["attempt_id"], stage=f" check{bad}out ",
+                             detail={f"k{bad}": [f"v{bad}", 1, None, {"深": f"层 😀{bad}"}]})
+    assert out == {"continue": True, "cancel_reason": None, "cancel_code": None}
+    assert fx.attempt_row(conn, a["attempt_id"])["stage"] == "checkout"
+    ev = _last_event(conn, "attempt.progress")["detail"]
+    assert ev["stage"] == "checkout" and ev["detail"] == {"k": ["v", 1, None, {"深": "层 😀"}]}
+    assert _err(execution.progress, conn, dev, a["attempt_id"], stage=bad).code == "VALIDATION"   # 清完是空的
+    fx.to_submitted(conn, dev, a)
+    execution.mark_verifying(conn, dev, a["attempt_id"], f"3DS{bad} 验证")
+    assert fx.order_row(conn, order["id"])["status_reason"] == "等待银行人工验证：3DS 验证"
+    assert _last_event(conn, "attempt.verifying")["detail"] == {"note": "3DS 验证"}
+    payload = fx.success_payload(a, order_no=fx.sim_order_no(a) + bad, error_detail=f"备注 😀{bad}",
+                                 delivery={"text": f"Arriving 😀{bad} soon", "date": None, "days": 3})
+    assert execution.report_result(conn, dev, a["attempt_id"], payload)["order_status"] == "purchased"
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["amazon_order_no"] == fx.sim_order_no(a) and att["delivery_text"] == "Arriving 😀 soon"
+    assert execution.report_result(conn, dev, a["attempt_id"], payload)["duplicate"] is True     # 重复上报照样认得
+    done = execution.finish_run(conn, dev, run_id, f"fin{bad}ished", {"note": f"done{bad}", f"键{bad}": bad})
+    assert done["end_reason"] == "finished"
+    ended = _last_event(conn, "run.ended")["detail"]
+    assert ended["plugin_reason"] == "finished" and json.loads(ended["plugin_detail"]) == {"note": "done", "键": ""}
+    conn.commit()                                                              # 全部写得进库
+
+
+@pytest.mark.parametrize("bad", BAD_CHARS)
+def test_unstorable_characters_in_failure_detail_and_string_finish_detail_are_dropped(conn, workspace, bad):
+    ws = workspace["id"]
+    acc, dev = _env(conn, workspace)
+    order = fx.assigned_order(conn, ws, acc)
+    run_id = fx.start(conn, dev)
+    a = fx.claim(conn, dev, run_id)
+    out = execution.report_result(conn, dev, a["attempt_id"],
+                                  fx.failure_payload(f"item_un{bad}available", f"Currently unavailable 😀{bad}"))
+    assert out["attempt_status"] == "failed"
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["error_code"] == "ITEM_UNAVAILABLE" and att["error_detail"] == "Currently unavailable 😀"
+    assert bad not in (fx.order_row(conn, order["id"])["status_reason"] or "")
+    execution.finish_run(conn, dev, run_id, "finished", f"  收尾 😀{bad}  ")
+    assert _last_event(conn, "run.ended")["detail"]["plugin_detail"] == "收尾 😀"
+    conn.commit()
+
+
+@pytest.mark.parametrize("bad", BAD_CHARS)
+def test_guard_stores_and_returns_facts_without_unstorable_characters(conn, workspace, bad):
+    """只用来展示、不参与放行的文字（配送说明、配送方）带坏字符：照常判定、放行；存下的事实与返回给插件的裁决里
+    已经没有坏字符，提交登记前的复核（用的是存下的事实）照常通过。"""
+    ws = workspace["id"]
+    acc, dev = _env(conn, workspace)
+    order = fx.assigned_order(conn, ws, acc)
+    a = fx.claim(conn, dev, fx.start(conn, dev))
+    facts = fx.facts_for(conn, order, delivery={**_days(3), "text": f"Arriving 😀{bad} soon"},
+                         fulfillment=f"ama{bad}zon")
+    v = execution.submit_guard(conn, dev, a["attempt_id"], facts)
+    assert v["verdict"] == "pass" and v["fulfillment"] == "amazon"
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["status"] == "guard_passed" and att["guard_input"]["delivery"]["text"] == "Arriving 😀 soon"
+    assert att["guard_input"]["fulfillment"] == "amazon"
+    json.dumps(v, ensure_ascii=False, default=str).encode("utf-8")              # 写得进 JSON 响应
+    assert execution.mark_submitting(conn, dev, a["attempt_id"])["ok"] is True
+    conn.commit()
+
+
+@pytest.mark.parametrize("bad", BAD_CHARS)
+@pytest.mark.parametrize("field", ["currency", "customer_id", "asin"])
+def test_guard_does_not_repair_compared_values_that_carry_unstorable_characters(conn, workspace, field, bad):
+    """要整段比对的值（币种、买家号 ID、ASIN）带坏字符：护栏按原样判定——不会先把坏字符去掉、凑成一个相等的值再
+    放行。照样拦截；清理只发生在判定之后，所以拦截原因、存下的事实与裁决、任务上的说明都写得进库。"""
+    ws = workspace["id"]
+    acc, dev = _env(conn, workspace)
+    order = fx.assigned_order(conn, ws, acc)
+    run_id = fx.start(conn, dev)
+    a = fx.claim(conn, dev, run_id)
+    facts = fx.facts_for(conn, order)
+    assert facts["currency"] == "USD"
+    if field == "customer_id":
+        facts["customer_id"] = facts["customer_id"][:4] + bad + facts["customer_id"][4:]
+    elif field == "asin":
+        facts["items"][0]["asin"] = facts["items"][0]["asin"][:3] + bad + facts["items"][0]["asin"][3:]
+    else:
+        facts[field] = facts[field][:2] + bad + facts[field][2:]
+    v = execution.submit_guard(conn, dev, a["attempt_id"], facts)
+    assert v["verdict"] == "block", v
+    att = fx.attempt_row(conn, a["attempt_id"])
+    assert att["status"] in ("failed", "aborted") and att["guard_verdict"]["verdict"] == "block"
+    o = fx.order_row(conn, order["id"])
+    blob = json.dumps([v, att["guard_input"], att["guard_verdict"], att["error_detail"], o["status_reason"]],
+                      ensure_ascii=False, default=str)
+    assert bad not in blob
+    blob.encode("utf-8")
+    conn.commit()
 

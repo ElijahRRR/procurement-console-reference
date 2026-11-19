@@ -17,11 +17,12 @@
   执行中未提交的写在任务的 conflict 上（插件据此中止，见 execution）；已登记提交之后（结果待核实、已采购、待决定
   重采）的记 HOLD_DEFERRED_KIND 事件，任务回到开始前时由 execution.drift_updates 转成 conflict。
 - **来源指定的买家号**（designated_customer_id / designated_buyer_name，规则见 services/designation）：来源行没有可信
-  AMZ 订单号时，「买家号 ID」「买家号」两列是对采购账号的指定；带可信单号的行、读不到这两列的读取不表态。接收只把
-  「这条来源相对上次说的不同」应用到任务上（首次关联只认非空，且只有任务还没有指定、或来源是主来源种类时才采用），
-  任何状态都写、单独记 'order.designation_changed' 事件，**不进冲突 / 关注 / 采购开始后修改那套逻辑**；接收不直接改
-  分配，开始前的任务由 _assignment_problem 把「已不符合指定」的非人工分配解除，随后的分配按指定落位。解除分配、
-  同意重采、处理冲突、清除模拟结果都不动这两列。
+  AMZ 订单号时，「买家号 ID」「买家号」两列是对采购账号的指定；带可信单号的行不表态，读没读到按列算（没读到的那一列
+  既不设置也不清除，两列都没读到的读取不表态）。接收只把「这条来源相对上次说的不同」应用到任务上（首次关联只认非空，
+  且只有任务还没有指定、或来源是主来源种类时才采用；规则全文见 _designation_change），任何状态都写、单独记
+  'order.designation_changed' 事件，没采用的记 'order.designation_not_adopted' 事件，**不进冲突 / 关注 / 采购开始后
+  修改那套逻辑**；接收不直接改分配，开始前的任务由 _assignment_problem 把「已不符合指定」的非人工分配解除，随后的
+  分配按指定落位。解除分配、同意重采、处理冲突、清除模拟结果都不动这两列。
 - 人工动作都写带操作者的事件；本模块的动作**不自动触发重新分配**（契约 §3.2 的触发点只有来源导入/同步后、
   人工点「重新分配」、账号配置变化、每日 00:01），回到「待分配」的任务等待下一次分配。
 """
@@ -154,7 +155,7 @@ class IngestOutcome:
     """ingest 的结论。verdict：new / update / unchanged / conflict / historical / invalid。
 
     changes：{字段: [任务现值, 来源新值]}（含因状态未应用的差异；来源指定变了时带扁平键 designated_customer_id /
-    designated_buyer_name，只列变了的）；issues：规范化问题 + 状态提示；
+    designated_buyer_name，只列变了的）；issues：规范化问题 + 状态提示 + 来源指定没被采用的说明；
     reason：结论说明；status：处理后（dry_run 时为预计）的任务状态。
     """
 
@@ -688,15 +689,23 @@ def _upsert_link(conn, workspace_id: int, order_id: int, link: dict[str, Any] | 
 def link_normalized(record: UpstreamRecord, source: SourceRef, link: dict[str, Any] | None) -> dict[str, Any]:
     """输入：规范化记录、来源引用、已有的来源关联（没有为 None）→ 输出：要存进 order_sources.normalized 的记录。
 
-    来源这次读不到买家号两列（source.buyer_readable=False）时，这两个字段沿用关联里上次读到的值（首次关联则为空）：
-    没读到不等于清空，「这条来源上次说的指定」保持为最后一次真正读到的内容，列恢复后才能认出期间的修改（含清空）。
-    feishu_intake 的「与上次完全相同」快速路径用同一个函数比较。
+    读没读到买家号按列算（designation.unread_keys(source)）：**只有这次没读到的字段**沿用关联里上次读到的值（首次关联
+    则为空）：没读到不等于清空，「这条来源上次说的指定」保持为最后一次真正读到的内容，列恢复后才能认出期间的修改
+    （含清空）。读到了的字段照常存这次的值。
+
+    另记一个标记 designation.UNREAD_MARK：这条关联**从来没读到过**的字段名（首次关联 = 这次没读到的；已有关联 =
+    旧标记里这次仍然没读到的）。这样的字段第一次读到时，_designation_change 按首次关联对待（不能凭「与上次不同」盖掉
+    主来源的指定）。列表为空时**不写这个键**：两列都读到过的关联（含升级前存下的）逐字不变，feishu_intake 的「与上次
+    完全相同」快速路径照旧命中（它用同一个函数比较）。
     """
     out = record.to_json()
-    if not source.buyer_readable:
-        old = (link or {}).get("normalized") or {}
-        for key in designation.RECORD_KEYS:
-            out[key] = old.get(key)
+    unread = designation.unread_keys(source)
+    old = (link or {}).get("normalized") or {}
+    for key in unread:
+        out[key] = old.get(key)
+    never = unread if link is None else tuple(k for k in designation.never_read(old) if k in unread)
+    if never:
+        out[designation.UNREAD_MARK] = list(never)
     return out
 
 
@@ -775,12 +784,14 @@ def ingest(conn, workspace_id: int, record: UpstreamRecord, source: SourceRef, *
       * 外部 AMZ 订单号：开始前 / 异常 → purchased（建 external 尝试，任务上待核实的 external_order_no 冲突随之作废）；
         单号格式不对、已属别的任务 → conflict；任务正在执行 / 已有不同单号 → needs_attention。
       * 同种来源直接应用的新值，让任务上同种来源冲突里这些字段的旧「来源新值」作废（见 _drop_superseded_fields）。
-      * 来源指定的买家号（见模块说明与 services/designation）：新任务 → 这一行表态且非空就写进任务。已有任务
-        （任何状态；本系统已真实采购成功的、行上的单号正是本任务已登记单号的不处理）：这条来源关联过 → 这次说的与它
-        上次说的不同才应用（含清空，不分主次来源；上次不表态时只有这次非空才应用）；首次关联 → 非空、且任务还没有
-        指定或来源是主来源种类才应用，否则只在问题里说明。比较是清洗后两列逐字相等。应用后与任务现值不同 → 写两列、
-        结论至少为 update、记 'order.designation_changed' 事件（只有指定变了时 reason 写「来源指定的买家号由…改为…」）；
-        任务当前是人工改派 → 照样写两列并在问题里说明暂不生效。
+      * 来源指定的买家号（见模块说明与 services/designation；规则全文在 _designation_change）：读没读到按列算，没读到
+        的那一列既不设置也不清除。新任务 → 这一行表态且非空就写进任务。已有任务（任何状态；本系统已真实采购成功的、
+        行上的单号正是本任务已登记单号的不处理）：这条来源关联过 → 它读到过的列这次与上次不同才应用（含清空，不分主次
+        来源；上次不表态时只有这次非空才应用；清空的是一个当初没被采用的买家号 → 不应用）；首次关联（含这条关联
+        第一次读到某一列）→ 非空、且任务还没有指定或来源是主来源种类才应用。没采用的两种情况都在问题里说明，并记
+        'order.designation_not_adopted' 事件（同一条关联只记一次）。比较是清洗后逐字相等。应用后与任务现值不同 →
+        写两列、结论至少为 update、记 'order.designation_changed' 事件（只有指定变了时 reason 写「来源指定的买家号
+        由…改为…」，两边显示成同一个标签时写成「名称（ID）」）；任务当前是人工改派 → 照样写两列并在问题里说明暂不生效。
     - 每次都 upsert order_sources（快照、规范化记录、指纹、last_seen_at）。dry_run=True 时给出同样的结论但不写库。
     """
     order_no = (record.upstream_order_no or "").strip()
@@ -879,9 +890,9 @@ def _ingest_new(conn, ws, record, source, issues, actor_kind, actor_id, dry_run,
             verdict = "historical"
             row["external_amz_order_no"] = ext_no
             reason = f"来源已有 AMZ 订单号 {ext_no}，按历史采购登记，不重新下单"
-    said = designation.statement(record, source.buyer_readable)
+    said = designation.statement(record, unread=designation.unread_keys(source))
     if said is not designation.SILENT and not designation.is_empty(said):
-        # 来源指定的买家号：没有可信单号、两列任一非空（格式不对的单号不算可信，指定照常生效）
+        # 来源指定的买家号：没有可信单号、读到的两列任一非空（格式不对的单号不算可信，指定照常生效；没读到的那一列为空）
         row["designated_customer_id"], row["designated_buyer_name"] = said
     row["missing_fields"] = compute_missing_fields(row)
     status = derive_status(row)
@@ -1381,9 +1392,12 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
                                                              "status": status}))
 
     # ③b 来源指定的买家号（独立一段：任何状态都处理，不进上面的冲突 / 采购开始后修改 / 关注逻辑）
-    des_changes, des_issue = _designation_change(conn, order, link, record, prev, source)
+    des_changes, des_issue, des_event = _designation_change(conn, order, link, record, prev, source)
     if des_issue:
         issues = issues + [des_issue]
+    if des_event:
+        # 来源写的（或清空的）买家号没被采用：留一条事件（同一条关联只会记一次：下次读取它说的与上次相同）
+        evs.append((designation.EVENT_NOT_ADOPTED, {"source": src, **des_event}))
     if des_changes:
         only_designation = not changes and reason is None
         new_pair = tuple(des_changes.get(c, [None, order[c]])[1] for c in designation.ORDER_COLUMNS)
@@ -1393,8 +1407,8 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
         verdict_flags.add("update")
         evs.append((designation.EVENT_KIND, {"changes": des_changes, "source": src}))
         if only_designation:
-            reason = (f"来源指定的买家号由「{designation.label_or_empty(*designation.of_order(order))}」"
-                      f"改为「{designation.label_or_empty(*new_pair)}」")
+            was, becomes = designation.labels(designation.of_order(order), new_pair)
+            reason = f"来源指定的买家号由「{was}」改为「{becomes}」"
             if status not in PRE and status not in ("cancelled", "closed"):
                 reason += "；任务已开始采购，不影响这一次"
         if order["assignment_kind"] == "manual" and order["assigned_account_id"] is not None and any(new_pair):
@@ -1481,48 +1495,92 @@ def _ingest_existing(conn, ws, order, link, record, source, issues, actor_kind, 
     return IngestOutcome(verdict, order["id"], _j(changes), issues, reason, row["status"])
 
 
+def _pair_out(pair: tuple[str | None, str | None] | None) -> dict[str, Any] | None:
+    return None if pair is None else {"customer_id": pair[0], "name": pair[1]}
+
+
 def _designation_change(conn, order: dict[str, Any], link: dict[str, Any] | None, record: UpstreamRecord,
-                        prev: UpstreamRecord | None, source: SourceRef) -> tuple[dict[str, list[Any]], str | None]:
+                        prev: UpstreamRecord | None, source: SourceRef,
+                        ) -> tuple[dict[str, list[Any]], str | None, dict[str, Any] | None]:
     """输入：任务行、这条来源的关联（首次关联为 None）、本次与上次的规范化记录、来源引用
     → 输出：(要写的指定变化 {designated_customer_id: [旧, 新], designated_buyer_name: [旧, 新]}（只列变了的；
-    没有变化为空 dict）, 没采用时给预览的说明 | None)。不写库。
+    没有变化为空 dict）, 没采用时给人看的说明 | None, 没采用时 'order.designation_not_adopted' 事件的
+    {stated, previous, current} | None)。不写库。
 
-    - 这次不表态（带可信 AMZ 订单号、或来源读不到买家号列）→ 不处理；
-    - 已关联过：上次表态过、这次与上次不同 → 应用这次的（含清空，不分主次来源）；上次不表态 → 只有这次非空才应用；
-    - 首次关联：这次非空，且任务还没有指定或来源是主来源种类 → 应用；非空但不满足、且与任务现值不同 → 不应用，给说明；
-    - 本系统已真实采购成功的任务不处理（行上的买家号可能是写回写的）；行上的 AMZ 订单号就是这笔任务已经登记过的单号
-      （含模拟单号，例如把导出的采购结果改一改再上传）→ 同样不处理：这两列此时只是「谁买的」；
-    - 比较是清洗后的两列作为一组**逐字相等**（不用 _same：名称大小写、空白的修正也要能生效）。
+    记 R = 这次读得到的字段（designation.unread_keys(source) 之外的）；now = 这次清洗后的两列，没读到的字段记 None。
+
+    1. 不处理：R 为空（两列都没读到）、记录带可信 AMZ 订单号（这两列此时只是「谁买的」）；行上的 AMZ 订单号就是这笔
+       任务已经登记过的单号（含模拟单号，例如把导出的采购结果改一改再上传）；本系统已真实采购成功的任务（行上的买家号
+       可能是写回写的）。
+    2. 已关联过。before = 这条来源上次的表态；never = 关联标记里它从来没读到过的字段（designation.never_read）。
+       - before 不表态（上次带可信单号）→ 只有 now 非空才应用 now（没读到的字段按 None）。
+       - 否则 merged = 读得到的字段取这次的值，没读到的字段取 before 的值：
+         a. R − never 里有字段的值与 before 不同 = 这条来源自己改了 → 应用 merged（含清空，不分主次来源）。
+            例外：merged 为空、任务现有指定非空、且 before ≠ 任务现有指定（它清空的是一个当初没被采用的买家号）→
+            不应用，说明「…清空了买家号…，任务现有的指定…不是这条来源写的，保持不变」并记事件。
+         b. 否则，R ∩ never 里有字段这次读到了非空值（这条关联第一次读到这一列）→ 把 merged 当首次关联的表态走第 3 条。
+         c. 否则不处理。
+    3. 首次关联（或 2b）。stmt = 这次的表态（2b 时是 merged）：
+       - stmt 为空 → 不处理（首次关联的空不清除）；
+       - 任务还没有指定 → 应用；
+       - stmt 在**读得到的字段上**与任务现有指定相同 → 不处理（没读到的那一列保持任务现值，不清空）；
+       - 来源种类 = 任务主来源种类 → 应用 stmt（首次关联时没读到的字段写 None，即两列作为一组替换）；
+       - 否则不应用，说明「…与任务现有的指定…不同，未采用…」并记事件。
+    4. 比较是清洗后的值**逐字相等**（不用 _same：名称大小写、空白的修正也要能生效）。
     """
-    now = designation.statement(record, source.buyer_readable)
+    unread = set(designation.unread_keys(source))
+    now = designation.statement(record, unread=unread)
     if now is designation.SILENT:
-        return {}, None
+        return {}, None, None
     own_no = _clean_text(record.external_amz_order_no)
     if own_no and own_no in _known_amazon_nos(conn, order):
-        return {}, None
+        return {}, None, None
     current = designation.of_order(order)
+    readable = [i for i, key in enumerate(designation.RECORD_KEYS) if key not in unread]
+    who = _kind_zh(source.kind)
     apply: tuple[str | None, str | None] | None = None
-    rejected = False
+    first: tuple[str | None, str | None] | None = None      # 按首次关联对待的表态（第 3 条）
+    issue: str | None = None
+    event: dict[str, Any] | None = None
     if link is not None:
         before = designation.statement(prev)
         if before is designation.SILENT:
             if not designation.is_empty(now):
                 apply = now
-        elif now != before:
-            apply = now
-    elif not designation.is_empty(now):
-        if not any(current) or source.kind == order["primary_source_kind"]:
-            apply = now
         else:
-            rejected = now != current
-    if (apply is None or apply == current) and not rejected:
-        return {}, None
+            never = set(designation.never_read(link.get("normalized")))
+            merged = tuple(before[i] if key in unread else now[i] for i, key in enumerate(designation.RECORD_KEYS))
+            seen = [i for i in readable if designation.RECORD_KEYS[i] not in never]
+            fresh = [i for i in readable if designation.RECORD_KEYS[i] in never]
+            if any(now[i] != before[i] for i in seen):
+                if designation.is_empty(merged) and any(current) and before != current:
+                    was, kept = designation.labels(before, current)
+                    issue = f"{who}来源清空了买家号「{was}」，任务现有的指定「{kept}」不是这条来源写的，保持不变"
+                    event = {"stated": _pair_out((None, None)), "previous": _pair_out(before),
+                             "current": _pair_out(current)}
+                else:
+                    apply = merged
+            elif any(now[i] for i in fresh):
+                first = merged
+    else:
+        first = now
+    if first is not None and not designation.is_empty(first):
+        if not any(current) or (source.kind == order["primary_source_kind"]
+                                and any(first[i] != current[i] for i in readable)):
+            apply = first
+        elif any(first[i] != current[i] for i in readable):
+            said, kept = designation.labels(first, current)
+            issue = (f"{who}来源的买家号「{said}」与任务现有的指定「{kept}」不同，未采用；要改请在主来源里改，"
+                     "或在控制台改派（这条来源之后再改买家号，会按改后的应用）")
+            event = {"stated": _pair_out(first), "previous": None, "current": _pair_out(current)}
+    if (apply is None or apply == current) and issue is None:
+        return {}, None, None
     if _has_real_success(conn, order):
-        return {}, None
-    if rejected:
-        return {}, (f"{_kind_zh(source.kind)}来源的买家号「{designation.label_or_empty(*now)}」与任务现有的指定"
-                    f"「{designation.label_or_empty(*current)}」不同，未采用（要改请在主来源里改，或在控制台改派）")
-    return {col: [old, new] for col, old, new in zip(designation.ORDER_COLUMNS, current, apply) if old != new}, None
+        return {}, None, None
+    if issue is not None:
+        return {}, issue, event
+    return ({col: [old, new] for col, old, new in zip(designation.ORDER_COLUMNS, current, apply) if old != new},
+            None, None)
 
 
 def _drop_superseded_fields(c: dict[str, Any] | None, touched: set[str], source_kind: str) -> dict[str, Any] | None:

@@ -1,5 +1,6 @@
-"""来源指定买家号，从来源到分配的整条路（方案 v2 修订二）：飞书读取（改买家号、清空、找不到买家号列、占位写法、
-表格错误值）、文件导入与预览、导出再导入、规范化规则、待登记的买家号并入来源指定的 ID、概览计数。全部数据虚构。"""
+"""来源指定买家号，从来源到分配的整条路（方案 v2 修订二）：飞书读取（改买家号、清空、找不到买家号列时新记录暂不
+接收且另一列照常读取、取消一个字段的对应、没采用时留事件、占位写法、表格错误值）、文件导入与预览、导出再导入
+（指定一列不丢）、规范化规则、待登记的买家号并入来源指定的 ID、概览计数。全部数据虚构。"""
 
 from __future__ import annotations
 
@@ -14,10 +15,12 @@ from services import feishu_connections as fc
 from services import overview as overview_svc
 from services import sheet_io
 from tests import factories as f
-from tests.fake_feishu import DEMO_APP, DEMO_TABLE, FakeFeishuClient, create_demo_connection, order_fields, text
+from tests.fake_feishu import (DEMO_APP, DEMO_PURCHASER, DEMO_TABLE, ORDER_TABLE_FIELDS, TEXT, FakeFeishuClient,
+                               create_demo_connection, order_fields, text)
 
 NOW = datetime(2026, 11, 18, 2, 0, tzinfo=timezone.utc)   # 北京 2026-11-18 10:00
 ID_A, ID_B = "A1DEMO0000", "A1DEMO0001"
+ADVICE = "未采用；要改请在主来源里改，或在控制台改派（这条来源之后再改买家号，会按改后的应用）"
 
 
 @pytest.fixture(autouse=True)
@@ -68,10 +71,34 @@ def _rename_column(fake, old, new):
             rec[new] = rec.pop(old)
 
 
+def _delete_column(fake, name):
+    """模拟有人在飞书里把一列删了：字段清单与每条记录里都没有它了。"""
+    table = fake.apps[DEMO_APP][DEMO_TABLE]
+    table["fields"] = [fdef for fdef in table["fields"] if fdef["field_name"] != name]
+    for rec in table["records"].values():
+        rec.pop(name, None)
+
+
 def _accounts(conn, ws):
     a = f.make_account(conn, ws, name="环境-DEMO-A", amazon_customer_id=ID_A)
     b = f.make_account(conn, ws, name="环境-DEMO-B", amazon_customer_id=ID_B, priority=9)
     return a, b
+
+
+def _events(conn, ws, no, kind):
+    return conn.execute("SELECT detail FROM procure.events WHERE workspace_id = %s AND order_id = %s AND kind = %s "
+                        "ORDER BY id", (ws, _order(conn, ws, no)["id"], kind)).fetchall()
+
+
+def _connection(conn, ws, cid):
+    return conn.execute("SELECT last_error, last_stats FROM procure.feishu_connections WHERE workspace_id = %s "
+                        "AND id = %s", (ws, cid)).fetchone()
+
+
+def _missing(col):
+    """连接级问题与新记录跳过原因（契约 §6；{cols} = 「列名」用顿号连接）。"""
+    return (f"来源表里找不到买家号列「{col}」，这一列的指定保持上次读到的内容，新记录暂不接收",
+            f"来源表里找不到买家号列「{col}」，读不出这一行有没有指定买家号，暂不接收；恢复这一列或改字段对应后会自动接收")
 
 
 # ── 飞书 ─────────────────────────────────────────────────────────────────────
@@ -127,9 +154,15 @@ def test_feishu_missing_buyer_column_does_not_clear_designations_and_is_reported
     _rename_column(fake, "买家号id", "买家号ID（亚马逊）")
     runs = f.count(conn, "allocation_runs", "workspace_id = %s", (ws,))
     out = _run(conn, ws, c["id"], fake)
-    assert out["problems"][0] == {"record_id": None, "upstream_order_no": "买家号列", "verdict": "skipped",
-                                  "reason": "来源表里找不到买家号列「买家号id」，本次没有更新指定", "scope": "connection"}
+    notice = {"record_id": None, "upstream_order_no": "买家号列", "verdict": "skipped",
+              "reason": _missing("买家号id")[0], "scope": "connection"}
+    assert out["problems"] == [notice]
     assert (out["read"], out["unchanged"], out["update"], out["skipped"]) == (2, 2, 0, 0)     # 不计入跳过
+    # 连接卡片要看得到（WEB-1）：连接级问题带在 last_stats.problems 里，计数照旧，last_error 不置位
+    stored = _connection(conn, ws, c["id"])
+    assert stored["last_error"] is None and stored["last_stats"]["problems"] == [notice]
+    assert {k: v for k, v in stored["last_stats"].items() if k != "problems"} == {
+        k: out[k] for k in feishu_intake.STAT_KEYS}
     assert out["allocation"] is None and f.count(conn, "allocation_runs", "workspace_id = %s", (ws,)) == runs
     for no in ("PO-DEMO-J01", "PO-DEMO-J02"):
         assert _where(conn, ws, no) == ("assigned", a["id"], "source")
@@ -152,9 +185,100 @@ def test_feishu_missing_buyer_column_does_not_clear_designations_and_is_reported
     _edit(fake, "recDEMO0001", 买家号id=None)
     out = _run(conn, ws, c["id"], fake)
     assert all(p.get("scope") != "connection" for p in out["problems"])
+    assert "problems" not in _connection(conn, ws, c["id"])["last_stats"]          # 列找回来了：卡片上的提醒随之消失
     assert out["update"] == 1 and _order(conn, ws, "PO-DEMO-J01")["designated_customer_id"] is None
     assert _where(conn, ws, "PO-DEMO-J01")[2] == "auto"
     assert _where(conn, ws, "PO-DEMO-J02") == ("assigned", a["id"], "source")
+
+
+def test_missing_buyer_column_never_turns_a_new_row_into_an_auto_task(conn, workspace, fake):
+    """ING-1 / DOC-1（铁律 12）：来源表里找不到配着的买家号列时，读不出一条**新记录**有没有指定买家号——不能建成
+    没有指定的任务让它落进自动分配（别的账号的插件就能领走）。新记录暂不接收并写明原因，列恢复后自动接收、按指定分配。
+    读没读到按列算：还在的「买家号」列里的修改照常应用。带可信 AMZ 订单号的行照常按历史采购接收。"""
+    ws = workspace["id"]
+    a, b = _accounts(conn, ws)                                                     # B 优先级高：自动分配会落到 B
+    _add(fake, "recDEMO0001", "PO-DEMO-K01", 买家号=text("环境-DEMO-A"))
+    c = create_demo_connection(conn, ws, fake, admission={"purchaser_values": [DEMO_PURCHASER],
+                                                          "import_historical": True})
+    _run(conn, ws, c["id"], fake)
+    assert _where(conn, ws, "PO-DEMO-K01") == ("assigned", a["id"], "source")
+
+    _rename_column(fake, "买家号id", "买家号ID（亚马逊）")
+    _add(fake, "recDEMO0002", "PO-DEMO-K02", 买家号=text("环境-DEMO-A"))             # 指定写在还读得到的那一列
+    _add(fake, "recDEMO0003", "PO-DEMO-K03", **{"买家号ID（亚马逊）": text(ID_A)})    # 指定写在改了名的那一列
+    _add(fake, "recDEMO0004", "PO-DEMO-K04")                                        # 两列都没写（读不出来有没有写）
+    _add(fake, "recDEMO0005", "PO-DEMO-K05", AMZ订单号=text("111-0000000-0000905"), 买家号=text("环境-DEMO-B"),
+         采购状态="已拍单")                                                          # 历史采购：不涉及指定
+    _edit(fake, "recDEMO0001", 买家号=text("环境-DEMO-B"))                           # 已有任务：读得到的那一列改了
+    connection_reason, row_reason = _missing("买家号id")
+
+    preview = fc.preview(conn, ws, app_token=DEMO_APP, table_id=DEMO_TABLE, field_map=c["field_map"],
+                         admission=c["admission"], client=fake)                     # 样本预览给出同样的结论
+    assert {r["upstream_order_no"]: (r["verdict"], r["reason"]) for r in preview["records"]
+            if r["upstream_order_no"] in ("PO-DEMO-K02", "PO-DEMO-K03", "PO-DEMO-K04")} == {
+        no: ("skipped", row_reason) for no in ("PO-DEMO-K02", "PO-DEMO-K03", "PO-DEMO-K04")}
+
+    out = _run(conn, ws, c["id"], fake)
+    assert out["problems"][0]["scope"] == "connection" and out["problems"][0]["reason"] == connection_reason
+    assert (out["read"], out["new"], out["update"], out["historical"], out["skipped"]) == (5, 0, 1, 1, 3)
+    assert {p["upstream_order_no"]: (p["verdict"], p["reason"]) for p in out["problems"][1:]} == {
+        no: ("skipped", row_reason) for no in ("PO-DEMO-K02", "PO-DEMO-K03", "PO-DEMO-K04")}
+    for no in ("PO-DEMO-K02", "PO-DEMO-K03", "PO-DEMO-K04"):
+        assert _order(conn, ws, no) is None, no                                     # 没有建任务
+    assert _where(conn, ws, "PO-DEMO-K01") == ("assigned", b["id"], "source")       # 读得到的那一列照常应用
+    assert _order(conn, ws, "PO-DEMO-K05")["status"] == "purchased"
+    assert f.count(conn, "purchase_orders", "workspace_id = %s AND assignment_kind = 'auto'", (ws,)) == 0
+    assert _connection(conn, ws, c["id"])["last_stats"]["problems"] == [out["problems"][0]]
+
+    again = _run(conn, ws, c["id"], fake)                                           # 列还没恢复：照样不接收
+    assert (again["skipped"], again["new"], again["allocation"]) == (3, 0, None)
+
+    _rename_column(fake, "买家号ID（亚马逊）", "买家号id")                            # 列改回来：下一次读取自动接收
+    out = _run(conn, ws, c["id"], fake)
+    assert out["new"] == 3 and all(p.get("scope") != "connection" for p in out["problems"])
+    assert _where(conn, ws, "PO-DEMO-K02") == _where(conn, ws, "PO-DEMO-K03") == ("assigned", a["id"], "source")
+    assert _where(conn, ws, "PO-DEMO-K04")[2] == "auto"                             # 确实没写的才自动分配
+
+
+def test_deleting_only_a_fallback_buyer_column_also_holds_new_rows(conn, workspace, monkeypatch):
+    """ING-1 的变体：字段对应里「买家号」配了回退列（买家号、买家号1），只删掉回退列「买家号1」。少了一列候选就说不准
+    「买家号」该取哪个值：这个字段算没读到，新记录暂不接收（之前会被建成没有指定的任务自动分给别的账号）；
+    已有任务的指定保持不变，「买家号 ID」那一列照常读取。"""
+    ws = workspace["id"]
+    a, b = _accounts(conn, ws)
+    fake = FakeFeishuClient()
+    fake.add_table(DEMO_APP, DEMO_TABLE, "采购订单DEMO", [*ORDER_TABLE_FIELDS, ("买家号1", TEXT)])
+    monkeypatch.setattr(fc, "make_client", lambda: fake)
+    _add(fake, "recDEMO0001", "PO-DEMO-K11", 买家号=text("环境-DEMO-A"))
+    _add(fake, "recDEMO0002", "PO-DEMO-K12", 买家号1=text("环境-DEMO-A"))             # 写在回退列里
+    c = create_demo_connection(conn, ws, fake)
+    assert c["field_map"]["external_buyer_account"] == ["买家号", "买家号1"]
+    _run(conn, ws, c["id"], fake)
+    assert _where(conn, ws, "PO-DEMO-K11") == _where(conn, ws, "PO-DEMO-K12") == ("assigned", a["id"], "source")
+
+    _delete_column(fake, "买家号1")
+    _add(fake, "recDEMO0003", "PO-DEMO-K13", 买家号=text("环境-DEMO-A"), 买家号id=text(ID_A))   # 两个真正的列都在
+    _edit(fake, "recDEMO0001", 买家号id=text(ID_B))                                  # 还读得到的「买家号 ID」列改了
+    connection_reason, row_reason = _missing("买家号1")
+    out = _run(conn, ws, c["id"], fake)
+    assert out["problems"] == [
+        {"record_id": None, "upstream_order_no": "买家号列", "verdict": "skipped", "reason": connection_reason,
+         "scope": "connection"},
+        {"record_id": "recDEMO0003", "upstream_order_no": "PO-DEMO-K13", "verdict": "skipped", "reason": row_reason}]
+    assert _order(conn, ws, "PO-DEMO-K13") is None
+    assert f.count(conn, "purchase_orders", "workspace_id = %s AND assignment_kind = 'auto'", (ws,)) == 0
+    k12 = _order(conn, ws, "PO-DEMO-K12")                                           # 回退列里写的指定：没读到不等于清空
+    assert (k12["designated_buyer_name"], k12["assigned_account_id"]) == ("环境-DEMO-A", a["id"])
+    k11 = _order(conn, ws, "PO-DEMO-K11")                                           # ID 列照常应用，名称那一半保持
+    assert (k11["designated_customer_id"], k11["designated_buyer_name"]) == (ID_B, "环境-DEMO-A")
+    assert k11["status"] == "queued" and "不是同一个账号" in k11["status_reason"]     # 两列指向不同账号：不分配
+
+    # 所有者改了字段对应（不再读「买家号1」）：提示消失，新记录下一次读取接收并按指定分配
+    fixed = {**c["field_map"], "external_buyer_account": "买家号"}
+    fc.update(conn, ws, c["id"], {"field_map": fixed}, None, client=fake)
+    out = _run(conn, ws, c["id"], fake)
+    assert out["new"] == 1 and all(p.get("scope") != "connection" for p in out["problems"])
+    assert _where(conn, ws, "PO-DEMO-K13") == ("assigned", a["id"], "source")
 
 
 def test_feishu_unmapping_both_buyer_fields_does_not_clear_designations(conn, workspace, fake):
@@ -190,6 +314,117 @@ def test_feishu_unmapping_both_buyer_fields_does_not_clear_designations(conn, wo
     assert _where(conn, ws, "PO-DEMO-U02") == ("assigned", a["id"], "source")
 
 
+def test_feishu_unmapping_one_buyer_field_keeps_designations_made_through_it(conn, workspace, fake):
+    """ING-2：只取消「买家号 ID」一个字段的对应（「买家号id」列被删之后，这是唯一能让提示消失的做法）。之前经这一列
+    写下的指定不能被整批清掉：那个字段算没读到，沿用上次读到的值；还对应着的「买家号」列照常读取。取消对应是所有者
+    自己的设置：不报问题，也不挡新记录。"""
+    ws = workspace["id"]
+    a, b = _accounts(conn, ws)
+    _add(fake, "recDEMO0001", "PO-DEMO-W01", 买家号id=text(ID_A))                     # 只经 ID 列指定
+    _add(fake, "recDEMO0002", "PO-DEMO-W02", 买家号id=text(ID_A), 买家号=text("环境-DEMO-A"))
+    c = create_demo_connection(conn, ws, fake)
+    _run(conn, ws, c["id"], fake)
+    assert _where(conn, ws, "PO-DEMO-W01") == _where(conn, ws, "PO-DEMO-W02") == ("assigned", a["id"], "source")
+
+    _delete_column(fake, "买家号id")                                                  # 先是列被删：提示，任务不动
+    out = _run(conn, ws, c["id"], fake)
+    assert out["problems"][0]["reason"] == _missing("买家号id")[0] and out["unchanged"] == 2
+    name_only = {k: v for k, v in c["field_map"].items() if k != "external_buyer_customer_id"}
+    wb_map = {k: v for k, v in c["writeback_map"].items() if v != "买家号id"}
+    fc.update(conn, ws, c["id"], {"field_map": name_only, "writeback_map": wb_map}, None, client=fake)
+    _add(fake, "recDEMO0003", "PO-DEMO-W03", 买家号=text("环境-DEMO-A"))               # 新记录：照常接收
+    out = _run(conn, ws, c["id"], fake)
+    assert out["problems"] == [] and (out["new"], out["update"], out["unchanged"]) == (1, 0, 2)
+    for no in ("PO-DEMO-W01", "PO-DEMO-W02", "PO-DEMO-W03"):
+        assert _where(conn, ws, no) == ("assigned", a["id"], "source"), no
+    w1, w2 = _order(conn, ws, "PO-DEMO-W01"), _order(conn, ws, "PO-DEMO-W02")
+    assert (w1["designated_customer_id"], w1["designated_buyer_name"]) == (ID_A, None)
+    assert (w2["designated_customer_id"], w2["designated_buyer_name"]) == (ID_A, "环境-DEMO-A")
+    assert f.count(conn, "events", "workspace_id = %s AND kind = 'order.designation_changed'", (ws,)) == 0
+    assert f.count(conn, "purchase_orders", "workspace_id = %s AND assignment_kind = 'auto'", (ws,)) == 0
+
+    _edit(fake, "recDEMO0002", 买家号=text("环境-DEMO-B"))                            # 还对应着的那一列改了：照常应用
+    out = _run(conn, ws, c["id"], fake)
+    assert out["update"] == 1
+    w2 = _order(conn, ws, "PO-DEMO-W02")
+    assert (w2["designated_customer_id"], w2["designated_buyer_name"]) == (ID_A, "环境-DEMO-B")
+    assert _where(conn, ws, "PO-DEMO-W01") == ("assigned", a["id"], "source")
+
+
+def test_withdrawing_a_never_adopted_feishu_value_keeps_the_primary_designation(conn, workspace, fake):
+    """ING-3 / ING-4（整条路）：文件为主的任务指定了 A；飞书里同一笔订单写了 B → 不采用，任务时间线上留一条
+    order.designation_not_adopted（定时读取没有人看预览）。之后飞书把这个没被采用的 B 清空 → 不能把文件写的 A 清掉、
+    让任务落进自动分配。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    a, b = _accounts(conn, ws)
+    bid, _ = _upload(conn, ws, uid, [_file_row("PO-DEMO-N01", 买家号ID=ID_A)])
+    imports.commit(conn, ws, bid, uid)
+    assert _where(conn, ws, "PO-DEMO-N01") == ("assigned", a["id"], "source")
+
+    _add(fake, "recDEMO0001", "PO-DEMO-N01", 买家号=text("环境-DEMO-B"))
+    c = create_demo_connection(conn, ws, fake)
+    out = _run(conn, ws, c["id"], fake)
+    assert (out["read"], out["unchanged"]) == (1, 1) and out["allocation"] is None
+    assert _where(conn, ws, "PO-DEMO-N01") == ("assigned", a["id"], "source")
+    not_adopted = _events(conn, ws, "PO-DEMO-N01", "order.designation_not_adopted")
+    assert len(not_adopted) == 1
+    assert not_adopted[0]["detail"] == {
+        "source": {"kind": "feishu", "connection_id": c["id"], "record_id": "recDEMO0001"},
+        "stated": {"customer_id": None, "name": "环境-DEMO-B"}, "previous": None,
+        "current": {"customer_id": ID_A, "name": None}}
+    assert _order(conn, ws, "PO-DEMO-N01")["needs_attention"] is False
+    out = _run(conn, ws, c["id"], fake)                                             # 再读一次：不重复记
+    assert out["unchanged"] == 1 and len(_events(conn, ws, "PO-DEMO-N01", "order.designation_not_adopted")) == 1
+
+    _edit(fake, "recDEMO0001", 买家号=None)                                          # 撤回那个没被采用的 B
+    preview = fc.preview(conn, ws, app_token=DEMO_APP, table_id=DEMO_TABLE, field_map=c["field_map"],
+                         admission=c["admission"], client=fake)
+    assert preview["records"][0]["issues"] == [
+        "飞书来源清空了买家号「环境-DEMO-B」，任务现有的指定「A1DEMO0000」不是这条来源写的，保持不变"]
+    out = _run(conn, ws, c["id"], fake)
+    assert (out["update"], out["unchanged"]) == (0, 1) and out["allocation"] is None
+    o = _order(conn, ws, "PO-DEMO-N01")
+    assert (o["designated_customer_id"], o["designated_buyer_name"]) == (ID_A, None)
+    assert _where(conn, ws, "PO-DEMO-N01") == ("assigned", a["id"], "source")
+    events = _events(conn, ws, "PO-DEMO-N01", "order.designation_not_adopted")
+    assert len(events) == 2 and events[1]["detail"]["previous"] == {"customer_id": None, "name": "环境-DEMO-B"}
+    assert events[1]["detail"]["stated"] == {"customer_id": None, "name": None}
+    assert _events(conn, ws, "PO-DEMO-N01", "order.designation_changed") == []
+    out = _run(conn, ws, c["id"], fake)                                             # 之后没有变化：走快速路径
+    assert out["unchanged"] == 1 and len(_events(conn, ws, "PO-DEMO-N01", "order.designation_not_adopted")) == 2
+
+
+def test_feishu_link_first_read_without_the_buyer_column_does_not_override_later(conn, workspace, fake):
+    """ING-3 变体（整条路）：文件为主的任务指定了 A；飞书记录第一次关联时「买家号」列读不到。列恢复后第一次读到的 B
+    按首次关联对待（不采用、留事件），不能凭「与上次读到的空不同」盖掉主来源的指定。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    a, b = _accounts(conn, ws)
+    bid, _ = _upload(conn, ws, uid, [_file_row("PO-DEMO-N02", 买家号ID=ID_A)])
+    imports.commit(conn, ws, bid, uid)
+    _add(fake, "recDEMO0001", "PO-DEMO-N02", 买家号=text("环境-DEMO-B"))
+    c = create_demo_connection(conn, ws, fake)
+    _rename_column(fake, "买家号", "买家号（旧）")
+    out = _run(conn, ws, c["id"], fake)                                             # 关联建立时读不到这一列
+    assert out["unchanged"] == 1 and out["problems"][0]["scope"] == "connection"
+    link = conn.execute("SELECT normalized FROM procure.order_sources WHERE workspace_id = %s AND kind = 'feishu'",
+                        (ws,)).fetchone()["normalized"]
+    assert link["external_buyer_account"] is None and link["buyer_unread"] == ["external_buyer_account"]
+    assert _events(conn, ws, "PO-DEMO-N02", "order.designation_not_adopted") == []
+
+    _rename_column(fake, "买家号（旧）", "买家号")
+    out = _run(conn, ws, c["id"], fake)                                             # 第一次读到 B
+    assert (out["update"], out["unchanged"]) == (0, 1) and out["allocation"] is None
+    assert _where(conn, ws, "PO-DEMO-N02") == ("assigned", a["id"], "source")
+    assert _order(conn, ws, "PO-DEMO-N02")["designated_customer_id"] == ID_A
+    events = _events(conn, ws, "PO-DEMO-N02", "order.designation_not_adopted")
+    assert len(events) == 1 and events[0]["detail"]["stated"] == {"customer_id": None, "name": "环境-DEMO-B"}
+    link = conn.execute("SELECT normalized FROM procure.order_sources WHERE workspace_id = %s AND kind = 'feishu'",
+                        (ws,)).fetchone()["normalized"]
+    assert link["external_buyer_account"] == "环境-DEMO-B" and "buyer_unread" not in link
+    out = _run(conn, ws, c["id"], fake)
+    assert out["unchanged"] == 1 and len(_events(conn, ws, "PO-DEMO-N02", "order.designation_not_adopted")) == 1
+
+
 def test_feishu_placeholders_are_not_designations_and_error_values_are_not_blanks(conn, workspace, fake):
     """验收 修订二 第 4 条：占位写法（无、—）按没写处理 → 自动分配；表格错误值不当成留空 → 留在待分配，不自动分配。"""
     ws = workspace["id"]
@@ -205,11 +440,18 @@ def test_feishu_placeholders_are_not_designations_and_error_values_are_not_blank
     assert (o1["designated_customer_id"], o1["designated_buyer_name"]) == (None, None)
     o2, o3 = _order(conn, ws, "PO-DEMO-L02"), _order(conn, ws, "PO-DEMO-L03")
     assert (o2["status"], o2["assigned_account_id"], o2["designated_buyer_name"]) == ("queued", None, "#N/A")
-    assert o2["status_reason"].startswith("来源指定的买家号「#N/A」没有同名账号")
+    assert o2["status_reason"] == "来源的买家号是表格错误值 #N/A，读不出指定的买家号；在来源里改正后会重新分配"
     assert (o3["status"], o3["assigned_account_id"], o3["designated_customer_id"]) == ("queued", None, "#REF!")
-    assert o3["status_reason"].startswith("来源指定的买家号 ID「#REF!」格式不对")
+    assert o3["status_reason"] == "来源的买家号 ID 是表格错误值 #REF!，读不出指定的买家号；在来源里改正后会重新分配"
     assert out["allocation"]["stats"] == {"considered": 3, "assigned": 1, "coverage": 1, "fill": 0, "designated": 0,
                                           "unassigned": 2}
+    # WEB-8：原因不再建议「新建同名账号」；真有一个叫 #N/A 的账号也接不走读不出指定的任务
+    assert "同名账号" not in o2["status_reason"]
+    f.make_account(conn, ws, name="#N/A", amazon_customer_id="A1DEMO0008")
+    again = allocation.allocate(conn, ws, trigger="manual")
+    assert again["stats"]["unassigned"] == 2
+    assert _where(conn, ws, "PO-DEMO-L02") == ("queued", None, None)
+    assert _order(conn, ws, "PO-DEMO-L02")["status_reason"] == o2["status_reason"]
 
 
 # ── 规范化 ───────────────────────────────────────────────────────────────────
@@ -331,9 +573,35 @@ def test_second_upload_previews_the_designation_change_and_blank_keeps_it(conn, 
                         sales_po_no=None, order_line_id=None, sales_total=None, ship_method=None, order_time=None,
                         ship_days=None, suggested_purchase_date=clock.bj_today(), external_buyer_customer_id=ID_A)
     out = orders.ingest(conn, ws, rec, f.feishu_source(conn, ws, "recDEMO-R01"))
-    assert out.issues == ["飞书来源的买家号「A1DEMO0000」与任务现有的指定「环境-DEMO-B」不同，未采用"
-                          "（要改请在主来源里改，或在控制台改派）"]
+    assert out.issues == [f"飞书来源的买家号「A1DEMO0000」与任务现有的指定「环境-DEMO-B」不同，{ADVICE}"]
     assert _order(conn, ws, "PO-DEMO-R01")["designated_customer_id"] is None
+
+
+def test_file_without_one_buyer_column_leaves_that_half_of_the_designation_alone(conn, workspace):
+    """文件来源读没读到也按列算：批次的列对应里没有「买家号ID」这一列 → 那个字段没读到，不等于清空。任务指定是
+    「ID + 名称」，重新上传一份只有「买家号」列、名称相同的文件 → 不变（之前会被改写成只有名称）。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    a, b = _accounts(conn, ws)
+    bid, _ = _upload(conn, ws, uid, [_file_row("PO-DEMO-R02", 买家号ID=ID_A, 买家号="环境-DEMO-A"),
+                                     _file_row("PO-DEMO-R03", 买家号ID=ID_A, 买家号="环境-DEMO-A")])
+    imports.commit(conn, ws, bid, uid)
+    name_only = [h for h in HEADERS if h != "买家号ID"]
+    bid2, pv = _upload(conn, ws, uid, [_file_row("PO-DEMO-R02", 买家号="环境-DEMO-A"),
+                                       _file_row("PO-DEMO-R03", 买家号="环境-DEMO-B"),
+                                       _file_row("PO-DEMO-R04", 买家号="环境-DEMO-B")],
+                       headers=name_only, filename="demo-orders-name-only.xlsx")
+    assert "external_buyer_customer_id" not in pv["batch"]["mapping"].values()
+    rows = {r["upstream_order_no"]: r for r in imports.rows(conn, ws, bid2, page_size=50)["rows"]}
+    assert (rows["PO-DEMO-R02"]["verdict"], rows["PO-DEMO-R02"]["issues"]) == ("unchanged", [])
+    assert rows["PO-DEMO-R03"]["verdict"] == "update" and rows["PO-DEMO-R04"]["verdict"] == "new"
+    imports.commit(conn, ws, bid2, uid)
+    r2, r3, r4 = (_order(conn, ws, no) for no in ("PO-DEMO-R02", "PO-DEMO-R03", "PO-DEMO-R04"))
+    assert (r2["designated_customer_id"], r2["designated_buyer_name"]) == (ID_A, "环境-DEMO-A")       # 一列不丢
+    assert (r3["designated_customer_id"], r3["designated_buyer_name"]) == (None, "环境-DEMO-B")       # 改了：整组替换
+    assert (r4["designated_customer_id"], r4["designated_buyer_name"]) == (None, "环境-DEMO-B")       # 新任务：读到的那一列
+    assert _where(conn, ws, "PO-DEMO-R02") == ("assigned", a["id"], "source")
+    assert _where(conn, ws, "PO-DEMO-R03") == _where(conn, ws, "PO-DEMO-R04") == ("assigned", b["id"], "source")
+    assert _events(conn, ws, "PO-DEMO-R02", "order.designation_changed") == []
 
 
 def _sheet(data):
@@ -360,15 +628,17 @@ def test_export_keeps_auto_and_designated_apart_and_reimport_does_not_designate(
     f.set_status(conn, done["id"], "purchased", purchased_attempt_id=att["id"])
     data = exports.orders_xlsx(conn, ws, batch_id=bid)
     values, col = _sheet(data)
-    assert list(values[0]) == exports.EXPORT_HEADERS and values[0][col["买家号"] + 1] == "分配账号"
+    assert list(values[0]) == exports.EXPORT_HEADERS
+    assert list(values[0][col["买家号"]:col["买家号"] + 3]) == ["买家号", "买家号ID", "分配账号"]
     by_no = {v[0]: v for v in values[1:]}
-    assert [(by_no[n][col["买家号"]], by_no[n][col["分配账号"]]) for n in
+    assert [(by_no[n][col["买家号"]], by_no[n][col["买家号ID"]], by_no[n][col["分配账号"]]) for n in
             ("PO-DEMO-X01", "PO-DEMO-X02", "PO-DEMO-X03", "PO-DEMO-X04")] == [
-        (None, "环境-DEMO-B"), ("环境-DEMO-A", "环境-DEMO-A"), (None, "环境-DEMO-A"), ("环境-DEMO-B", "环境-DEMO-B")]
+        (None, None, "环境-DEMO-B"), ("环境-DEMO-A", None, "环境-DEMO-A"), (None, ID_A, "环境-DEMO-A"),
+        ("环境-DEMO-B", ID_B, "环境-DEMO-B")]                       # 有采购结果：采购账号的名称与它登记的买家号 ID
 
     mapping = file_mapping.suggest_mapping(exports.EXPORT_HEADERS)
     assert mapping["买家号"] == "external_buyer_account" and mapping["分配账号"] is None
-    assert "external_buyer_customer_id" not in mapping.values()
+    assert mapping["买家号ID"] == "external_buyer_customer_id"
 
     before = {r["upstream_order_no"]: (r["designated_customer_id"], r["designated_buyer_name"], r["assignment_kind"])
               for r in conn.execute("SELECT * FROM procure.purchase_orders WHERE workspace_id = %s", (ws,)).fetchall()}
@@ -380,6 +650,48 @@ def test_export_keeps_auto_and_designated_apart_and_reimport_does_not_designate(
              for r in conn.execute("SELECT * FROM procure.purchase_orders WHERE workspace_id = %s", (ws,)).fetchall()}
     assert after == before
     assert before["PO-DEMO-X01"] == (None, None, "auto") and before["PO-DEMO-X03"] == (ID_A, None, "source")
+
+
+_KEPT = ("designated_customer_id", "designated_buyer_name", "status", "status_reason", "assigned_account_id",
+         "assignment_kind", "assignment_note")
+
+
+@pytest.mark.parametrize("cid, name, where", [
+    (ID_B, "店铺小号-DEMO", "assigned"),         # ID 命中 B，名称谁也对不上：按 ID 分给 B，说明里注明名称不同
+    (ID_B, "环境-DEMO-A", "queued"),            # ID 与名称指向不同账号：不分配
+    (ID_B, "环境-DEMO-B", "assigned"),          # 最平常的写法：ID 与名称都是 B
+    (ID_B, None, "assigned"),                   # 只有 ID
+    (None, "环境-DEMO-B", "assigned"),          # 只有名称
+    (None, None, "assigned"),                   # 自动分配
+    ("12345", None, "queued"),                  # 格式不对的 ID
+    (None, "#N/A", "queued"),                   # 表格错误值
+])
+def test_export_then_reupload_unchanged_keeps_every_designation(conn, workspace, cid, name, where):
+    """ALLOC-1：导出文件原样重新上传，任务的指定、状态、账号、分配方式、说明都不变，不产生 order.designation_changed。
+    之前导出没有「买家号ID」列，「ID + 名称」的指定重新上传后被改写成只有名称：任务被从 ID 的账号上拉下来，
+    或者落到名称指向的另一个账号上。"""
+    ws, uid = workspace["id"], workspace["user_id"]
+    _accounts(conn, ws)
+    bid, _ = _upload(conn, ws, uid, [_file_row("PO-DEMO-Y01", 买家号ID=cid, 买家号=name)])
+    imports.commit(conn, ws, bid, uid)
+    before = _order(conn, ws, "PO-DEMO-Y01")
+    assert (before["designated_customer_id"], before["designated_buyer_name"], before["status"]) == (cid, name, where)
+
+    data = exports.orders_xlsx(conn, ws, view="all")
+    values, col = _sheet(data)
+    assert (values[1][col["买家号ID"]], values[1][col["买家号"]]) == (cid, name)
+    up = imports.upload(conn, ws, filename="demo-export-back.xlsx", data=data, actor_user_id=uid)
+    assert up["suggested_mapping"]["买家号ID"] == "external_buyer_customer_id"
+    assert up["suggested_mapping"]["买家号"] == "external_buyer_account"
+    imports.preview(conn, ws, up["batch_id"])
+    row = imports.rows(conn, ws, up["batch_id"], page_size=50)["rows"][0]
+    assert row["verdict"] == "unchanged" and not (row["reason"] or "").startswith("来源指定的买家号由")
+    out = imports.commit(conn, ws, up["batch_id"], uid)
+    assert out["stats"]["update"] == 0 and out["stats"]["unchanged"] == 1
+    after = _order(conn, ws, "PO-DEMO-Y01")
+    assert {k: after[k] for k in _KEPT} == {k: before[k] for k in _KEPT}
+    assert _events(conn, ws, "PO-DEMO-Y01", "order.designation_changed") == []
+    assert _events(conn, ws, "PO-DEMO-Y01", "order.designation_not_adopted") == []
 
 
 # ── 待登记的买家号、概览 ──────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
-"""来源指定买家号的接收规则（orders.ingest，方案 v2 修订二 §C）：新任务与已有任务、首次关联与已关联、主次来源、
-逐字比较、任何状态都写且不进「采购开始后修改 / 冲突 / 关注」、人工改派、写回读回、同意重采、读不到买家号列、
-以及不该动指定的那些动作。全部数据虚构。"""
+"""来源指定买家号的接收规则（orders.ingest，方案 v2 修订二 §C；契约 §2.1）：新任务与已有任务、首次关联与已关联、
+主次来源、逐字比较、任何状态都写且不进「采购开始后修改 / 冲突 / 关注」、人工改派、写回读回、同意重采、读没读到买家号
+按列算（没读到的那一列不动、关联上的「从来没读到过」标记）、没采用时的说明与事件，以及不该动指定的那些动作。
+全部数据虚构。"""
 
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from tests import factories as f
 NOW = datetime(2026, 11, 18, 2, 0, tzinfo=timezone.utc)   # 北京 2026-11-18 10:00
 ID_A, ID_B = "A1DEMO0000", "A1DEMO0001"
 EVENT = "order.designation_changed"
+NOT_ADOPTED = "order.designation_not_adopted"
+K_ID, K_NAME = designation.RECORD_KEYS          # external_buyer_customer_id, external_buyer_account
+ADVICE = "未采用；要改请在主来源里改，或在控制台改派（这条来源之后再改买家号，会按改后的应用）"
 
 
 @pytest.fixture(autouse=True)
@@ -179,6 +183,35 @@ def test_same_feishu_record_sets_changes_and_clears_the_designation(conn, worksp
     assert row["needs_attention"] is False and row["conflict"] is None and row["status"] == "queued"
     assert len(_events(conn, oid, EVENT)) == 4
     assert "order.upstream_changed_after_start" not in _kinds(conn, oid)
+    assert NOT_ADOPTED not in _kinds(conn, oid)
+
+
+def test_reason_shows_the_name_when_only_the_name_changed(conn, workspace):
+    """ING-7：只有名称变了（ID 没变）时，原因不能写成「由「A1DEMO0000」改为「A1DEMO0000」」——这种修改正好会把任务
+    从账号上拉下来（名称指向别的账号 → 解析不了），文案得看得出改了什么。两边显示成同一个标签时写成 名称（ID）。"""
+    ws = workspace["id"]
+    a = f.make_account(conn, ws, name="环境-DEMO-A", amazon_customer_id=ID_A)
+    f.make_account(conn, ws, name="环境-DEMO-B", amazon_customer_id=ID_B, priority=9)
+    src = f.feishu_source(conn, ws, "recE05")
+    oid = _ingest(conn, ws, src, "PO-DEMO-E05", cid=ID_A).order_id
+    allocation.allocate(conn, ws, trigger="intake")
+    assert _row(conn, ws, oid)["assigned_account_id"] == a["id"]
+    out = _ingest(conn, ws, src, "PO-DEMO-E05", cid=ID_A, buyer="环境-DEMO-B")
+    assert out.verdict == "update" and out.changes == {"designated_buyer_name": [None, "环境-DEMO-B"]}
+    assert "由「A1DEMO0000」改为「A1DEMO0000」" not in out.reason
+    assert out.reason == "来源指定的买家号由「A1DEMO0000」改为「环境-DEMO-B（A1DEMO0000）」"
+    row = _row(conn, ws, oid)                                                 # 名称指向另一个账号：解除分配回待分配
+    assert (row["status"], row["assigned_account_id"]) == ("queued", None)
+    out = _ingest(conn, ws, src, "PO-DEMO-E05", cid=ID_A, buyer="环境-DEMO-A")   # 名称又改了一次：两边都带名称
+    assert out.reason == "来源指定的买家号由「环境-DEMO-B（A1DEMO0000）」改为「环境-DEMO-A（A1DEMO0000）」"
+    out = _ingest(conn, ws, src, "PO-DEMO-E05", cid=ID_B, buyer="环境-DEMO-A")   # ID 变了：照常只写 ID
+    assert out.reason == "来源指定的买家号由「A1DEMO0000」改为「A1DEMO0001」"
+
+    # 「未采用」的说明同理：另一种来源首次关联，ID 相同、名称不同
+    other = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-E05", cid=ID_B, buyer="环境-DEMO-C")
+    assert other.issues == [f"文件来源的买家号「环境-DEMO-C（A1DEMO0001）」与任务现有的指定"
+                            f"「环境-DEMO-A（A1DEMO0001）」不同，{ADVICE}"]
+    assert not any("「A1DEMO0001」与任务现有的指定「A1DEMO0001」" in i for i in other.issues)
 
 
 def test_comparison_is_exact_so_a_case_only_correction_applies(conn, workspace):
@@ -332,21 +365,75 @@ def test_first_link_of_another_kind_does_not_override_an_existing_designation(co
     oid = _ingest(conn, ws, f.feishu_source(conn, ws, "recF02"), "PO-DEMO-F02", cid=ID_A).order_id
     out = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F02", buyer="环境-DEMO-B")
     assert out.verdict == "unchanged" and out.changes == {}
-    assert out.issues == ["文件来源的买家号「环境-DEMO-B」与任务现有的指定「A1DEMO0000」不同，未采用"
-                          "（要改请在主来源里改，或在控制台改派）"]
+    assert out.issues == [f"文件来源的买家号「环境-DEMO-B」与任务现有的指定「A1DEMO0000」不同，{ADVICE}"]
     assert _des(conn, ws, oid) == (ID_A, None) and _events(conn, oid, EVENT) == []
-    # 写的是同一个指定：没有什么可说的
+    # 写的是同一个指定：没有什么可说的，也不留「未采用」的事件
     same = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F02", cid=ID_A)
     assert same.verdict == "unchanged" and same.issues == []
+    assert len(_events(conn, oid, NOT_ADOPTED)) == 1
 
 
 def test_feishu_first_link_does_not_override_a_file_primary_designation(conn, workspace):
     ws = workspace["id"]
     oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F03", buyer="环境-DEMO-A").order_id
     out = _ingest(conn, ws, f.feishu_source(conn, ws, "recF03"), "PO-DEMO-F03", cid=ID_B)
-    assert out.issues == ["飞书来源的买家号「A1DEMO0001」与任务现有的指定「环境-DEMO-A」不同，未采用"
-                          "（要改请在主来源里改，或在控制台改派）"]
+    assert out.issues == [f"飞书来源的买家号「A1DEMO0001」与任务现有的指定「环境-DEMO-A」不同，{ADVICE}"]
     assert _des(conn, ws, oid) == (None, "环境-DEMO-A")
+
+
+def test_a_designation_that_is_not_adopted_leaves_one_event(conn, workspace):
+    """ING-4：首次关联的买家号没被采用时，除了问题里的说明，还要在任务的时间线上留一条 order.designation_not_adopted
+    （定时读取没有人看预览，之后这条关联就「已关联、没有变化」，再也没有地方能看到这句话）。同一条关联只记一次；
+    预演不记。"""
+    ws = workspace["id"]
+    oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F06", cid=ID_A).order_id      # 文件为主，指定 A
+    feishu = f.feishu_source(conn, ws, "recF06")
+    dry = _ingest(conn, ws, feishu, "PO-DEMO-F06", buyer="环境-DEMO-B", dry_run=True)
+    assert dry.verdict == "unchanged" and len(dry.issues) == 1 and _events(conn, oid, NOT_ADOPTED) == []
+    out = _ingest(conn, ws, feishu, "PO-DEMO-F06", buyer="环境-DEMO-B")
+    assert out.verdict == "unchanged" and out.issues == dry.issues
+    ev = _events(conn, oid, NOT_ADOPTED)
+    assert len(ev) == 1 and ev[0]["actor_kind"] == "source"
+    assert ev[0]["detail"] == {
+        "source": {"kind": "feishu", "connection_id": feishu.connection_id, "record_id": "recF06"},
+        "stated": {"customer_id": None, "name": "环境-DEMO-B"}, "previous": None,
+        "current": {"customer_id": ID_A, "name": None}}
+    row = _row(conn, ws, oid)
+    assert row["needs_attention"] is False and row["conflict"] is None and _des(conn, ws, oid) == (ID_A, None)
+    # 第二次读取：这条关联说的与上次相同 → 没有新的说明，也没有第二条事件
+    again = _ingest(conn, ws, feishu, "PO-DEMO-F06", buyer="环境-DEMO-B")
+    assert again.verdict == "unchanged" and again.issues == []
+    assert len(_events(conn, oid, NOT_ADOPTED)) == 1 and _events(conn, oid, EVENT) == []
+    assert designation.EVENT_NOT_ADOPTED == NOT_ADOPTED
+
+
+def test_first_link_that_agrees_on_the_columns_it_read_changes_nothing(conn, workspace):
+    """ALLOC-1 的另一半保险：首次关联只读到其中一列、读到的这一列与任务现有的指定相同 → 不处理，没读到的那一列保持
+    任务现值（不会把「ID + 名称」的指定改写成只有名称）。读到的列不同 → 主来源种类照常整组替换。"""
+    ws = workspace["id"]
+    oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F07", cid=ID_A, buyer="环境-DEMO-A").order_id
+
+    def name_only(row_no):                                                     # 一份没有「买家号ID」列的文件
+        src = f.file_source(conn, ws, row_no)
+        return SourceRef(kind="file", snapshot=src.snapshot, batch_id=src.batch_id, row_no=src.row_no,
+                         buyer_unread=(K_ID,))
+
+    same = _ingest(conn, ws, name_only(2), "PO-DEMO-F07", buyer="环境-DEMO-A")
+    assert same.verdict == "unchanged" and same.changes == {} and same.issues == []
+    assert _des(conn, ws, oid) == (ID_A, "环境-DEMO-A") and _events(conn, oid, EVENT) == []
+    blank = _ingest(conn, ws, name_only(3), "PO-DEMO-F07")                     # 读到的这一列空着：首次关联的空不清除
+    assert blank.verdict == "unchanged" and _des(conn, ws, oid) == (ID_A, "环境-DEMO-A")
+    moved = _ingest(conn, ws, name_only(4), "PO-DEMO-F07", buyer="环境-DEMO-B")  # 读到的这一列不同：主来源整组替换
+    assert moved.changes == {"designated_customer_id": [ID_A, None],
+                             "designated_buyer_name": ["环境-DEMO-A", "环境-DEMO-B"]}
+    assert _des(conn, ws, oid) == (None, "环境-DEMO-B")
+    # 另一种来源同样只读到一列、而且不同 → 不采用；相同 → 没有什么可说的
+    feishu = f.feishu_source(conn, ws, "recF07")
+    one = SourceRef(kind="feishu", snapshot={}, connection_id=feishu.connection_id, record_id="recF07",
+                    buyer_unread=(K_ID,))
+    out = _ingest(conn, ws, one, "PO-DEMO-F07", buyer="环境-DEMO-C")
+    assert out.issues == [f"飞书来源的买家号「环境-DEMO-C」与任务现有的指定「环境-DEMO-B」不同，{ADVICE}"]
+    assert _des(conn, ws, oid) == (None, "环境-DEMO-B")
 
 
 def test_new_file_batch_of_the_primary_kind_replaces_but_blank_does_not_clear(conn, workspace):
@@ -379,6 +466,50 @@ def test_a_linked_record_of_any_kind_applies_its_own_change(conn, workspace):
     assert _ingest(conn, ws, feishu, "PO-DEMO-F05").verdict == "unchanged"
     assert _ingest(conn, ws, file_src, "PO-DEMO-F05", buyer="环境-DEMO-A").verdict == "unchanged"
     assert _des(conn, ws, oid) == (None, None)
+    assert _events(conn, oid, NOT_ADOPTED) == []                                           # 撤回的是它自己写的：照常清空
+
+
+def test_withdrawing_a_value_that_was_never_adopted_does_not_clear_the_designation(conn, workspace):
+    """ING-3：次要来源写的买家号当初没被采用（任务的指定是主来源写的）；它把这个格子清空，不能把主来源的指定清掉。
+    说明里写明保持不变，记一条 order.designation_not_adopted（previous = 它上次写的）。之后它再写别的买家号，
+    按「这条来源自己改了」应用——首次关联的说明里已经这样告知。"""
+    ws = workspace["id"]
+    oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F08", cid=ID_A).order_id      # 文件为主，指定 A
+    feishu = f.feishu_source(conn, ws, "recF08")
+    first = _ingest(conn, ws, feishu, "PO-DEMO-F08", buyer="环境-DEMO-B")                      # 没被采用
+    assert first.issues == [f"飞书来源的买家号「环境-DEMO-B」与任务现有的指定「A1DEMO0000」不同，{ADVICE}"]
+
+    dry = _ingest(conn, ws, feishu, "PO-DEMO-F08", dry_run=True)
+    out = _ingest(conn, ws, feishu, "PO-DEMO-F08")                                             # 清空了那个没被采用的 B
+    assert (dry.verdict, dry.changes, dry.issues) == (out.verdict, out.changes, out.issues)
+    assert out.verdict == "unchanged" and out.changes == {}
+    assert out.issues == ["飞书来源清空了买家号「环境-DEMO-B」，任务现有的指定「A1DEMO0000」不是这条来源写的，保持不变"]
+    assert _des(conn, ws, oid) == (ID_A, None) and _events(conn, oid, EVENT) == []
+    ev = _events(conn, oid, NOT_ADOPTED)
+    assert len(ev) == 2
+    assert ev[1]["detail"] == {
+        "source": {"kind": "feishu", "connection_id": feishu.connection_id, "record_id": "recF08"},
+        "stated": {"customer_id": None, "name": None}, "previous": {"customer_id": None, "name": "环境-DEMO-B"},
+        "current": {"customer_id": ID_A, "name": None}}
+    again = _ingest(conn, ws, feishu, "PO-DEMO-F08")                                           # 再读：没有变化，只记一次
+    assert again.verdict == "unchanged" and again.issues == [] and len(_events(conn, oid, NOT_ADOPTED)) == 2
+
+    out = _ingest(conn, ws, feishu, "PO-DEMO-F08", cid=ID_B)                                   # 之后改成别的：应用
+    assert out.verdict == "update" and _des(conn, ws, oid) == (ID_B, None)
+    out = _ingest(conn, ws, feishu, "PO-DEMO-F08")                                             # 撤回它自己写的：清空
+    assert out.verdict == "update" and _des(conn, ws, oid) == (None, None)
+    assert len(_events(conn, oid, NOT_ADOPTED)) == 2 and len(_events(conn, oid, EVENT)) == 2
+
+
+def test_clearing_the_cell_this_link_itself_set_still_clears(conn, workspace):
+    """对照：任务现有的指定正是这条来源上次写的 → 清空照常生效（不分主次来源）。"""
+    ws = workspace["id"]
+    oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-F09").order_id               # 文件为主，没有指定
+    feishu = f.feishu_source(conn, ws, "recF09")
+    assert _ingest(conn, ws, feishu, "PO-DEMO-F09", cid=ID_B).verdict == "update"             # 任务还没有指定：采用
+    out = _ingest(conn, ws, feishu, "PO-DEMO-F09")
+    assert out.verdict == "update" and out.issues == [] and _des(conn, ws, oid) == (None, None)
+    assert _events(conn, oid, NOT_ADOPTED) == []
 
 
 # ── 人工改派 ─────────────────────────────────────────────────────────────────
@@ -516,12 +647,51 @@ def test_existing_task_gaining_a_credible_order_number_keeps_its_designation(con
     assert "designated_customer_id" not in out.changes
 
 
+def test_blank_after_a_silent_reading_does_not_clear(conn, workspace):
+    """ING-6（上次不表态的那一半）：这条来源上次带可信单号（不表态），这次单号没了、买家号两列空着 → 不是「清空」，
+    指定保持不变。陷阱：把「上次不表态」当成「上次说的是空」的反面处理，会把指定清掉。"""
+    ws = workspace["id"]
+    src = f.feishu_source(conn, ws, "recS1")
+    oid = _ingest(conn, ws, src, "PO-DEMO-S1", cid=ID_A).order_id
+    silent = _ingest(conn, ws, src, "PO-DEMO-S1", cid=ID_B, buyer="环境-DEMO-B",
+                     external_amz_order_no="111-0000000-0000777")
+    assert silent.verdict == "historical" and _des(conn, ws, oid) == (ID_A, None)
+    out = _ingest(conn, ws, src, "PO-DEMO-S1")                                # 单号没了，买家号空着
+    assert "designated_customer_id" not in out.changes and "designated_buyer_name" not in out.changes
+    assert _des(conn, ws, oid) == (ID_A, None) and _events(conn, oid, EVENT) == []
+
+
+def test_named_buyer_after_a_silent_reading_applies(conn, workspace):
+    """ING-6（另一半）：原来按历史采购登记的行（带可信单号、不表态），后来单号去掉并写了买家号 → 指定生效。
+    陷阱：「上次不表态」一律不处理的话，这笔任务会被自动分配。"""
+    ws = workspace["id"]
+    src = f.feishu_source(conn, ws, "recS2")
+    hist = _ingest(conn, ws, src, "PO-DEMO-S2", buyer="环境-DEMO-B", cid=ID_B,
+                   external_amz_order_no="111-0000000-0000778")
+    oid = hist.order_id
+    assert hist.verdict == "historical" and _des(conn, ws, oid) == (None, None)
+    out = _ingest(conn, ws, src, "PO-DEMO-S2", cid=ID_A)
+    assert out.changes["designated_customer_id"] == [None, ID_A]
+    assert _des(conn, ws, oid) == (ID_A, None) and len(_events(conn, oid, EVENT)) == 1
+
+
 # ── 来源读不到买家号列 ────────────────────────────────────────────────────────
 
 
 def _unreadable(src: SourceRef) -> SourceRef:
     return SourceRef(kind=src.kind, snapshot=src.snapshot, connection_id=src.connection_id, record_id=src.record_id,
                      buyer_readable=False)
+
+
+def _without(src: SourceRef, *keys: str) -> SourceRef:
+    """同一条飞书来源，这次没读到 keys 这些买家号字段（列被改名、删除，或取消了对应）。"""
+    return SourceRef(kind=src.kind, snapshot=src.snapshot, connection_id=src.connection_id, record_id=src.record_id,
+                     buyer_unread=keys)
+
+
+def _stored(conn, oid, src: SourceRef) -> dict:
+    return conn.execute("SELECT normalized FROM procure.order_sources WHERE purchase_order_id = %s "
+                        "AND feishu_record_id = %s", (oid, src.record_id)).fetchone()["normalized"]
 
 
 def test_unreadable_buyer_columns_neither_set_nor_clear_and_remember_the_last_reading(conn, workspace):
@@ -548,8 +718,96 @@ def test_unreadable_buyer_columns_on_new_and_first_linked_records(conn, workspac
     src = f.feishu_source(conn, ws, "recU02")
     new = _ingest(conn, ws, _unreadable(src), "PO-DEMO-U02", cid=ID_A)        # 不表态：新任务不带指定
     assert new.verdict == "new" and _des(conn, ws, new.order_id) == (None, None)
-    out = _ingest(conn, ws, src, "PO-DEMO-U02", cid=ID_A)                     # 之后读得到了
+    assert _stored(conn, new.order_id, src)["buyer_unread"] == [K_ID, K_NAME]  # 这条关联两列都还没读到过
+    out = _ingest(conn, ws, src, "PO-DEMO-U02", cid=ID_A)                     # 之后读得到了：任务没有指定 → 采用
     assert out.verdict == "update" and _des(conn, ws, new.order_id) == (ID_A, None)
+    assert "buyer_unread" not in _stored(conn, new.order_id, src)             # 都读到过了：标记去掉
+
+
+def test_one_unread_column_keeps_its_part_while_the_other_column_still_applies(conn, workspace):
+    """ING-2 / DOC-1(b)：读没读到按列算。「买家号 ID」这一列没读到（被改名、删除，或取消了对应）时，它那一半指定保持
+    上次读到的内容，「买家号」那一列的修改照常应用；反过来也一样。列恢复后，期间清空的格子照样清除。"""
+    ws = workspace["id"]
+    src = f.feishu_source(conn, ws, "recU03")
+    oid = _ingest(conn, ws, src, "PO-DEMO-U03", cid=ID_A, buyer="环境-DEMO-A").order_id
+    out = _ingest(conn, ws, _without(src, K_ID), "PO-DEMO-U03", buyer="环境-DEMO-A")    # ID 列没读到，名称没变
+    assert out.verdict == "unchanged" and out.changes == {}
+    assert _des(conn, ws, oid) == (ID_A, "环境-DEMO-A")
+    stored = _stored(conn, oid, src)
+    assert (stored[K_ID], stored[K_NAME]) == (ID_A, "环境-DEMO-A") and "buyer_unread" not in stored
+    out = _ingest(conn, ws, _without(src, K_ID), "PO-DEMO-U03", buyer="环境-DEMO-B")    # 读得到的那一列改了
+    assert out.verdict == "update" and out.changes == {"designated_buyer_name": ["环境-DEMO-A", "环境-DEMO-B"]}
+    assert _des(conn, ws, oid) == (ID_A, "环境-DEMO-B")                                 # ID 那一半既不设置也不清除
+    out = _ingest(conn, ws, _without(src, K_ID), "PO-DEMO-U03")                         # 读得到的那一列清空了
+    assert out.changes == {"designated_buyer_name": ["环境-DEMO-B", None]} and _des(conn, ws, oid) == (ID_A, None)
+    out = _ingest(conn, ws, _without(src, K_NAME), "PO-DEMO-U03", cid=ID_B)             # 换成另一列没读到
+    assert out.changes == {"designated_customer_id": [ID_A, ID_B]} and _des(conn, ws, oid) == (ID_B, None)
+    out = _ingest(conn, ws, _without(src, K_ID), "PO-DEMO-U03")                         # ID 列又没读到：不清除
+    assert out.verdict == "unchanged" and _des(conn, ws, oid) == (ID_B, None)
+    out = _ingest(conn, ws, src, "PO-DEMO-U03")                                         # 都恢复了，格子已清空
+    assert out.verdict == "update" and _des(conn, ws, oid) == (None, None)
+    assert len(_events(conn, oid, EVENT)) == 4 and _events(conn, oid, NOT_ADOPTED) == []
+
+
+def test_link_marker_is_absent_unless_a_column_was_never_read(conn, workspace):
+    """关联上的「从来没读到过」标记：两列都读到过的关联不写这个键（已有关联的规范化记录逐字不变，升级不引发整表更新，
+    飞书的「与上次完全相同」快速路径照旧命中）；首次关联时没读到的字段记进去，读到一次就去掉，之后再读不到也不会回来。"""
+    ws = workspace["id"]
+    src = f.feishu_source(conn, ws, "recU04")
+    rec = f.make_record(upstream_order_no="PO-DEMO-U04", external_buyer_customer_id=ID_A)
+    oid = orders.ingest(conn, ws, rec, src).order_id
+    stored = _stored(conn, oid, src)
+    assert stored == rec.to_json() and "buyer_unread" not in stored
+    link = {"normalized": stored}
+    assert orders.link_normalized(rec, src, link) == stored                             # 快速路径用的比较
+    assert orders.link_normalized(rec, _without(src, K_NAME), link) == stored           # 没读到的那一列本来就是空
+    blank = f.make_record(upstream_order_no="PO-DEMO-U04")
+    assert orders.link_normalized(blank, _without(src, K_ID), link) == stored           # 没读到的 ID 沿用上次读到的
+    assert orders.link_normalized(blank, _unreadable(src), link) == stored
+    assert orders.link_normalized(blank, src, link) != stored                           # 读到了、而且清空了
+
+    first = orders.link_normalized(rec, _without(src, K_ID), None)                      # 首次关联：没读到的记进标记
+    assert first[K_ID] is None and first["buyer_unread"] == [K_ID]
+    still = orders.link_normalized(rec, _without(src, K_ID, K_NAME), {"normalized": first})
+    assert still["buyer_unread"] == [K_ID]                                              # 旧标记 ∩ 这次仍没读到的
+    assert orders.link_normalized(rec, _without(src, K_ID), {"normalized": first}) == first
+    seen = orders.link_normalized(rec, src, {"normalized": first})
+    assert seen[K_ID] == ID_A and "buyer_unread" not in seen
+    later = orders.link_normalized(blank, _without(src, K_ID), {"normalized": seen})
+    assert later[K_ID] == ID_A and "buyer_unread" not in later                          # 读到过：不再算「从来没读到」
+
+
+def test_first_reading_of_a_column_on_a_known_link_follows_the_first_link_rule(conn, workspace):
+    """ING-3 变体：飞书关联第一次建立时读不到买家号列（存下的两列是空的）。列恢复后第一次读到的买家号不是「这条来源
+    自己改了」，要按首次关联对待：任务以文件为主、已有指定 → 不采用并说明；不能凭「与上次不同」盖掉主来源的指定。"""
+    ws = workspace["id"]
+    oid = _ingest(conn, ws, f.file_source(conn, ws, 2), "PO-DEMO-U05", cid=ID_A).order_id      # 文件为主，指定 A
+    feishu = f.feishu_source(conn, ws, "recU05")
+    first = _ingest(conn, ws, _unreadable(feishu), "PO-DEMO-U05", cid=ID_B)                    # 关联时读不到
+    assert first.verdict == "unchanged" and first.issues == [] and _des(conn, ws, oid) == (ID_A, None)
+    out = _ingest(conn, ws, feishu, "PO-DEMO-U05", cid=ID_B)                                   # 第一次读到
+    assert out.verdict == "unchanged" and out.changes == {}
+    assert out.issues == [f"飞书来源的买家号「A1DEMO0001」与任务现有的指定「A1DEMO0000」不同，{ADVICE}"]
+    assert _des(conn, ws, oid) == (ID_A, None) and _events(conn, oid, EVENT) == []
+    assert len(_events(conn, oid, NOT_ADOPTED)) == 1
+    again = _ingest(conn, ws, feishu, "PO-DEMO-U05", cid=ID_B)                                 # 已经读到过：不再提
+    assert again.issues == [] and len(_events(conn, oid, NOT_ADOPTED)) == 1
+    out = _ingest(conn, ws, feishu, "PO-DEMO-U05", cid="A1DEMO0002")                           # 之后它自己改了：应用
+    assert out.verdict == "update" and _des(conn, ws, oid) == ("A1DEMO0002", None)
+
+    # 只有一列当时没读到：那一列第一次读到同样按首次关联；读到过的那一列的修改照常是「自己改了」
+    oid2 = _ingest(conn, ws, f.file_source(conn, ws, 3), "PO-DEMO-U06", buyer="环境-DEMO-A").order_id
+    f2 = f.feishu_source(conn, ws, "recU06")
+    _ingest(conn, ws, _without(f2, K_ID), "PO-DEMO-U06")                                       # 关联时名称读到了（空）
+    out = _ingest(conn, ws, f2, "PO-DEMO-U06", cid=ID_B)                                       # ID 列第一次读到
+    assert out.verdict == "unchanged" and len(out.issues) == 1 and _des(conn, ws, oid2) == (None, "环境-DEMO-A")
+    out = _ingest(conn, ws, f2, "PO-DEMO-U06", cid=ID_B, buyer="环境-DEMO-B")                  # 读到过的名称列改了
+    assert out.verdict == "update" and _des(conn, ws, oid2) == (ID_B, "环境-DEMO-B")
+    # 对照：首次关联读得到、而且任务还没有指定 → 第一次读到就采用
+    oid3 = _ingest(conn, ws, f.file_source(conn, ws, 4), "PO-DEMO-U07").order_id
+    f3 = f.feishu_source(conn, ws, "recU07")
+    _ingest(conn, ws, _unreadable(f3), "PO-DEMO-U07", cid=ID_B)
+    assert _ingest(conn, ws, f3, "PO-DEMO-U07", cid=ID_B).verdict == "update" and _des(conn, ws, oid3) == (ID_B, None)
 
 
 # ── 不该动指定的动作 ──────────────────────────────────────────────────────────
@@ -611,7 +869,8 @@ def test_fingerprint_and_record_shape_do_not_carry_the_designation(conn, workspa
     without = f.make_record(upstream_order_no="PO-DEMO-K03")
     assert with_buyer.execution_fingerprint() == without.execution_fingerprint()
     assert not any(k.startswith("designated") for k in with_buyer.to_json())
-    assert SourceRef(kind="file", snapshot={}, batch_id=1, row_no=2).buyer_readable is True
+    plain = SourceRef(kind="file", snapshot={}, batch_id=1, row_no=2)
+    assert plain.buyer_readable is True and plain.buyer_unread == () and designation.unread_keys(plain) == ()
 
 
 def test_dry_run_gives_the_same_verdict_without_writing(conn, workspace):
